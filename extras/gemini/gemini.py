@@ -26,7 +26,8 @@ async def _gemini_api(ctx: ToolContext, model: str, contents: list, generation_c
     """Make an authenticated Gemini API call."""
     api_key = ctx.vault.get("secrets/gemini-api-key") if ctx.vault else None
     if not api_key:
-        return {"error": "secrets/gemini-api-key not configured in vault"}
+        return {"error": "Gemini not configured. Add to the vault: "
+                         "secrets/gemini-api-key"}
 
     url = f"{GEMINI_API}/models/{model}:generateContent?key={api_key}"
     payload = {"contents": contents}

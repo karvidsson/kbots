@@ -3,11 +3,15 @@
 from pathlib import Path
 
 from src.core.base import resolve_config_file, resolve_vault_key_file
-from src.vault.fernet import FernetVault
+from src.vault.fernet import FernetVault, _normalise_key, describe_value_faults
 
 KEY_FILE = resolve_vault_key_file()
 
-# Common secrets for Core tools — deployments can add their own via "Custom key"
+# The canonical name for every secret Core tools read. Keep this in step with
+# the vault.get() call sites: a key missing from here is a key an operator has
+# to guess, and guessing is what this list exists to prevent. Deployments can
+# still add their own via "Custom key" — per-bot tokens like
+# "discord-token-atlas" are looked up dynamically and belong nowhere in here.
 ALL_KEYS = [
     # Discord (one per bot account)
     "discord-token",
@@ -18,13 +22,45 @@ ALL_KEYS = [
     "secrets/google-api-credentials.json",
     # Web search
     "secrets/tavily-api-key",
+    "secrets/serpapi-key",
     # Integrations
     "secrets/cloudflare-api-token",
     "secrets/notion-api-key",
     "secrets/trello-credentials.json",
+    # Messaging
+    "secrets/slack-bot-token",
+    "secrets/telegram-bot-token",
+    "secrets/twilio-account-sid",
+    "secrets/twilio-auth-token",
+    "secrets/twilio-from-number",
     # GitHub
     "github-token",
 ]
+
+
+def canonical_for(key: str) -> str | None:
+    """The canonical spelling of `key`, if it is a known secret spelt oddly.
+
+    Catches the mistake at the point it is made: someone types
+    "cloudflare-api-token", it saves fine, and days later every Cloudflare tool
+    says "not configured" while the value sits in the vault under a
+    near-identical name.
+
+    Note that a returned canonical name does NOT mean the typed one is dead.
+    Some — CLOUDFLARE_API_TOKEN, GITHUB_TOKEN — are read as explicit fallbacks
+    and work fine. They are still worth converging on one spelling, because two
+    live spellings is how you end up updating the copy nothing reads. Callers
+    must phrase this as "not canonical", never as "nothing reads this".
+
+    Deliberately narrow. It only fires when the typed name normalises to
+    exactly one entry in ALL_KEYS and differs from it, so genuinely custom keys
+    — per-bot tokens, deployment-specific secrets, anything looked up
+    dynamically — are never second-guessed.
+    """
+    if key in ALL_KEYS:
+        return None
+    matches = {k for k in ALL_KEYS if _normalise_key(k) == _normalise_key(key)}
+    return matches.pop() if len(matches) == 1 else None
 
 
 def get_vault():
@@ -77,8 +113,30 @@ def cmd_add(v):
         print("  No key provided, aborting.")
         return
 
-    existing = v.get(key)
-    if existing:
+    typed = key
+    canonical = canonical_for(key)
+    if canonical:
+        # Deliberately never claims "nothing reads this". Several of these names
+        # ARE read, as explicit fallbacks — cloudflare.py reads
+        # CLOUDFLARE_API_TOKEN, github.py reads GITHUB_TOKEN. Saying otherwise
+        # is both false and, worse, tells someone their working setup is broken.
+        print(f"\n  ⚠️  '{key}' is not the name Core looks up first — that is '{canonical}'.")
+        if canonical in v.list_keys():
+            # The dangerous case: both spellings hold a credential, and the one
+            # you are about to edit is not the one tools prefer.
+            print(f"      '{canonical}' is ALSO in the vault, and tools read it first.")
+            print(f"      Updating only '{key}' would leave the value actually in use")
+            print("      unchanged — the classic 'I fixed it and it is still broken'.")
+        else:
+            print("      Saving under the name you typed still works, but the canonical")
+            print("      name is the one every tool agrees on.")
+        if input(f"      Use '{canonical}' instead? [Y/n]: ").strip().lower() not in ("n", "no"):
+            key = canonical
+
+    # Exact, not v.get(): lookups fall back to a normalised match, so v.get()
+    # would report a differently-spelt key as "already exists" and then write a
+    # second one beside it.
+    if key in v.list_keys():
         confirm = input(f"  '{key}' already exists. Overwrite? [y/N]: ").strip().lower()
         if confirm != "y":
             print("  Skipped.")
@@ -91,6 +149,14 @@ def cmd_add(v):
 
     v.set(key, value)
     print(f"  Saved '{key}'. Total secrets: {len(v.list_keys())}")
+
+    # Renaming leaves the old spelling behind holding a stale credential, which
+    # is worth clearing: two keys that differ only in spelling are exactly what
+    # makes a lookup ambiguous later.
+    if key != typed and typed in v.list_keys():
+        if input(f"  Remove the old '{typed}'? [Y/n]: ").strip().lower() not in ("n", "no"):
+            v.delete(typed)
+            print(f"  Removed '{typed}'. Total secrets: {len(v.list_keys())}")
 
 
 def cmd_delete(v):
@@ -108,10 +174,73 @@ def cmd_delete(v):
 
 def cmd_check(v):
     key = input("  Key to check: ").strip()
-    if v.get(key):
-        print(f"  '{key}' = exists ({len(v.get(key))} chars)")
-    else:
+    val = v.get(key)
+    if not val:
         print(f"  '{key}' = NOT FOUND")
+        return
+    exact = "" if key in v.list_keys() else "  (resolved by name normalisation)"
+    print(f"  '{key}' = exists ({len(val)} chars){exact}")
+    # "Exists" is not the same as "works" — say so here rather than let a tool
+    # discover it later as a codec error.
+    for fault in describe_value_faults(val):
+        print(f"    ⚠️  {fault}")
+
+
+def cmd_health(v):
+    """Report keys that are misspelt, duplicated, or hold an unusable value.
+
+    Exists because these failures are invisible until a tool dies far away from
+    the vault: an unreadable name reports "not configured", a duplicate lets you
+    update the copy nothing reads, and a value containing non-ASCII kills the
+    HTTP request with a codec error that never mentions credentials. Values are
+    never printed — only their shape.
+    """
+    keys = sorted(v.list_keys())
+    problems = 0
+
+    groups: dict[str, list[str]] = {}
+    for k in keys:
+        groups.setdefault(_normalise_key(k), []).append(k)
+
+    dupes = {n: ks for n, ks in groups.items() if len(ks) > 1}
+    if dupes:
+        print("\n  Duplicate keys — these differ only in spelling:")
+        for norm, ks in sorted(dupes.items()):
+            problems += 1
+            print(f"    {norm}: {', '.join(ks)}")
+        print("    A lookup matching one exactly still works, but any lookup that")
+        print("    matches none of them exactly is ambiguous and returns nothing.")
+        print("    Worse, updating one leaves the others holding a stale credential.")
+        print("    Keep one and delete the rest.")
+
+    misnamed = [(k, canonical_for(k)) for k in keys]
+    misnamed = [(k, c) for k, c in misnamed if c]
+    if misnamed:
+        print("\n  Non-canonical names — Core looks up a different name first:")
+        for k, c in misnamed:
+            problems += 1
+            print(f"    {k}  ->  canonical is  {c}")
+        print("    Some of these are read as explicit fallbacks and work today.")
+        print("    They are worth renaming anyway: the fallback chains are the")
+        print("    reason nobody can tell which name is the real one.")
+
+    bad_values = [(k, describe_value_faults(v.get(k) or "")) for k in keys]
+    bad_values = [(k, f) for k, f in bad_values if f]
+    if bad_values:
+        print("\n  Malformed values — present and findable, but unusable:")
+        for k, faults in bad_values:
+            problems += 1
+            for fault in faults:
+                print(f"    {k}: {fault}")
+        print("    HTTP headers are latin-1, so a non-ASCII character stops the")
+        print("    request being built at all; stray whitespace usually surfaces")
+        print("    as a 401 that reads like a permissions problem. Re-paste, or")
+        print("    mint a fresh credential.")
+
+    if problems:
+        print(f"\n  {problems} problem(s) across {len(keys)} secrets.\n")
+    else:
+        print(f"\n  No problems found across {len(keys)} secrets.\n")
 
 
 def cmd_migrate_salt(v):
@@ -153,7 +282,8 @@ def main():
         print("  2) Add/update secret")
         print("  3) Check if secret exists")
         print("  4) Delete secret")
-        print("  5) Migrate vault salt")
+        print("  5) Check all keys and values for problems")
+        print("  6) Migrate vault salt")
         print("  q) Quit")
 
         try:
@@ -171,7 +301,9 @@ def main():
                 cmd_check(v)
             elif choice in ("4", "delete"):
                 cmd_delete(v)
-            elif choice in ("5", "migrate"):
+            elif choice in ("5", "health", "doctor"):
+                cmd_health(v)
+            elif choice in ("6", "migrate"):
                 cmd_migrate_salt(v)
             elif choice in ("q", "quit", "exit"):
                 print("  Done.")
