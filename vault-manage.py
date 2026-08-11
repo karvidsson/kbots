@@ -42,9 +42,15 @@ def canonical_for(key: str) -> str | None:
     """The canonical spelling of `key`, if it is a known secret spelt oddly.
 
     Catches the mistake at the point it is made: someone types
-    "cloudflare-api-token" (or "CLOUDFLARE_API_TOKEN"), it saves fine, and days
-    later every Cloudflare tool says "not configured" while the value sits in
-    the vault under a near-identical name.
+    "cloudflare-api-token", it saves fine, and days later every Cloudflare tool
+    says "not configured" while the value sits in the vault under a
+    near-identical name.
+
+    Note that a returned canonical name does NOT mean the typed one is dead.
+    Some — CLOUDFLARE_API_TOKEN, GITHUB_TOKEN — are read as explicit fallbacks
+    and work fine. They are still worth converging on one spelling, because two
+    live spellings is how you end up updating the copy nothing reads. Callers
+    must phrase this as "not canonical", never as "nothing reads this".
 
     Deliberately narrow. It only fires when the typed name normalises to
     exactly one entry in ALL_KEYS and differs from it, so genuinely custom keys
@@ -110,10 +116,21 @@ def cmd_add(v):
     typed = key
     canonical = canonical_for(key)
     if canonical:
-        print(f"\n  ⚠️  Nothing reads '{key}'. The name Core looks up is '{canonical}'.")
-        print("      Saving under the name you typed would appear to work and then")
-        print("      report 'not configured' at first use.")
-        if input(f"      Save as '{canonical}' instead? [Y/n]: ").strip().lower() not in ("n", "no"):
+        # Deliberately never claims "nothing reads this". Several of these names
+        # ARE read, as explicit fallbacks — cloudflare.py reads
+        # CLOUDFLARE_API_TOKEN, github.py reads GITHUB_TOKEN. Saying otherwise
+        # is both false and, worse, tells someone their working setup is broken.
+        print(f"\n  ⚠️  '{key}' is not the name Core looks up first — that is '{canonical}'.")
+        if canonical in v.list_keys():
+            # The dangerous case: both spellings hold a credential, and the one
+            # you are about to edit is not the one tools prefer.
+            print(f"      '{canonical}' is ALSO in the vault, and tools read it first.")
+            print(f"      Updating only '{key}' would leave the value actually in use")
+            print("      unchanged — the classic 'I fixed it and it is still broken'.")
+        else:
+            print("      Saving under the name you typed still works, but the canonical")
+            print("      name is the one every tool agrees on.")
+        if input(f"      Use '{canonical}' instead? [Y/n]: ").strip().lower() not in ("n", "no"):
             key = canonical
 
     # Exact, not v.get(): lookups fall back to a normalised match, so v.get()
@@ -172,10 +189,11 @@ def cmd_check(v):
 def cmd_health(v):
     """Report keys that are misspelt, duplicated, or hold an unusable value.
 
-    Exists because both failure modes are invisible until a tool dies far away
-    from the vault: a name nothing reads reports "not configured", and a value
-    containing non-ASCII kills the HTTP request with a codec error that never
-    mentions credentials. Values are never printed — only their shape.
+    Exists because these failures are invisible until a tool dies far away from
+    the vault: an unreadable name reports "not configured", a duplicate lets you
+    update the copy nothing reads, and a value containing non-ASCII kills the
+    HTTP request with a codec error that never mentions credentials. Values are
+    never printed — only their shape.
     """
     keys = sorted(v.list_keys())
     problems = 0
@@ -198,10 +216,13 @@ def cmd_health(v):
     misnamed = [(k, canonical_for(k)) for k in keys]
     misnamed = [(k, c) for k, c in misnamed if c]
     if misnamed:
-        print("\n  Keys nothing reads — the name Core looks up differs:")
+        print("\n  Non-canonical names — Core looks up a different name first:")
         for k, c in misnamed:
             problems += 1
-            print(f"    {k}  ->  should be  {c}")
+            print(f"    {k}  ->  canonical is  {c}")
+        print("    Some of these are read as explicit fallbacks and work today.")
+        print("    They are worth renaming anyway: the fallback chains are the")
+        print("    reason nobody can tell which name is the real one.")
 
     bad_values = [(k, describe_value_faults(v.get(k) or "")) for k in keys]
     bad_values = [(k, f) for k, f in bad_values if f]

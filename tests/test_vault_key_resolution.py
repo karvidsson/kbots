@@ -139,6 +139,48 @@ def test_canonical_keys_are_the_ones_core_actually_reads():
         assert expected in vault_manage.ALL_KEYS
 
 
+def _drive_add(monkeypatch, capsys, vault, answers):
+    """Run cmd_add with canned keyboard input, return what it printed."""
+    it = iter(answers)
+    monkeypatch.setattr("builtins.input", lambda *_: next(it))
+    vault_manage.cmd_add(vault)
+    return capsys.readouterr().out
+
+
+def test_add_never_claims_a_read_alias_is_unread(monkeypatch, capsys):
+    """CLOUDFLARE_API_TOKEN *is* read, as an explicit fallback in cloudflare.py.
+
+    Telling someone their working key is unread is false, and it reads as
+    "your setup is broken" when it isn't.
+    """
+    v = _vault(**{"CLOUDFLARE_API_TOKEN": "old"})
+    out = _drive_add(monkeypatch, capsys, v,
+                     ["CLOUDFLARE_API_TOKEN", "n", "y", "new-token"])
+    assert "Nothing reads" not in out
+    assert "not configured" not in out
+    assert "not the name Core looks up first" in out
+
+
+def test_add_warns_when_the_canonical_copy_also_exists(monkeypatch, capsys):
+    """The dangerous case: editing the copy tools don't prefer."""
+    v = _vault(**{"CLOUDFLARE_API_TOKEN": "old",
+                  "secrets/cloudflare-api-token": "the-one-in-use"})
+    out = _drive_add(monkeypatch, capsys, v,
+                     ["CLOUDFLARE_API_TOKEN", "n", "y", "replacement"])
+    assert "ALSO in the vault" in out
+    assert "read it first" in out
+    # Declining must honour the choice and write where the user asked.
+    assert v._secrets["CLOUDFLARE_API_TOKEN"] == "replacement"
+    assert v._secrets["secrets/cloudflare-api-token"] == "the-one-in-use"
+
+
+def test_add_renames_and_clears_the_duplicate(monkeypatch, capsys):
+    """Accepting the suggestion should leave exactly one spelling behind."""
+    v = _vault(**{"CLOUDFLARE_API_TOKEN": "old"})
+    _drive_add(monkeypatch, capsys, v, ["CLOUDFLARE_API_TOKEN", "", "fresh-token", ""])
+    assert v._secrets == {"secrets/cloudflare-api-token": "fresh-token"}
+
+
 # --- malformed values ------------------------------------------------------
 #
 # The adjacent failure: a correctly-named key holding a value that cannot work.
