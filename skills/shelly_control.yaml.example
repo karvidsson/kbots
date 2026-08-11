@@ -1,0 +1,23 @@
+# Shelly smart-home control on the LOCAL model — rename to .yaml to enable.
+# Needs: Ollama/LM Studio running (docs/LOCAL_MODELS.md), shelly.devices in
+# config.yaml, and the shelly tools in this agent's tools list.
+# Usage: /shelly-control request:"turn off the office lights"
+name: shelly_control
+description: Control Shelly smart-home devices (runs on the local model)
+parameters:
+  request:
+    type: string
+    description: What to do, e.g. "turn off the office lights"
+    required: true
+prompt: |
+  You control Shelly smart-home devices. Request: {request}
+  Rules:
+  - If unsure of a device name, call shelly_devices first.
+  - Use shelly_switch(device, state) with state 'on', 'off', or 'toggle'.
+  - Confirm what you did in one short sentence. Do nothing else.
+tools: [shelly_devices, shelly_switch, shelly_status]
+restrict_tools: true
+max_rounds: 4
+llm:
+  provider: local
+  model: qwen3.5:9b

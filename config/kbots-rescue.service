@@ -1,0 +1,29 @@
+# Rescue Bot — standalone systemd service (unsandboxed)
+# Install: sudo cp config/kbots-rescue.service /etc/systemd/system/ && sudo systemctl daemon-reload
+
+[Unit]
+Description=kbots Rescue Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kbots
+Group=kbots
+WorkingDirectory=/opt/kbots
+ExecStart=/usr/local/bin/uv run --no-sync python -m src.main --profile rescue
+Restart=always
+RestartSec=10
+# HOME and PATH are set dynamically by setup.sh based on the service account
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# NO sandbox — Rescue Bot needs full system access for dev/ops tasks
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kbots-rescue
+
+[Install]
+WantedBy=multi-user.target

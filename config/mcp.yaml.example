@@ -1,0 +1,23 @@
+# MCP Server definitions — source of truth for all MCP connections.
+# .mcp.json files are generated from this file (run setup or install_mcp).
+#
+# Supported transports:
+#   stdio  — local subprocess (command + args)
+#   sse    — remote Server-Sent Events (url + optional headers)
+
+servers:
+  kbots-tools:
+    transport: stdio
+    command: /opt/kbots/.venv/bin/python3
+    args: ["-m", "src.mcp_server"]
+    cwd: /opt/kbots
+    # env:                          # Optional: per-server env vars
+    #   KBOTS_PROFILE: rescue
+
+  # Example: remote MCP server
+  # acme:
+  #   transport: sse
+  #   url: "https://mcp.example.com/mcp"
+  #   headers:
+  #     Authorization: "Bearer <token>"
+  #   description: "Acme data warehouse"

@@ -1,0 +1,16 @@
+name: team_graph
+description: Generate and send an interactive map of all agents (roles, skills, rights)
+tools:
+  - agent_graph
+  - send_discord_file
+prompt: |
+  The user wants an interactive map of the agent team.
+
+  1. Call `agent_graph` — it gathers every agent's tier, purpose, skills, and
+     rights and writes a self-contained interactive HTML file, returning its path.
+  2. Send that file to the user in THIS channel with
+     `send_discord_file(channel_id=<this channel>, file_path=<the path from step 1>)`,
+     plus a short note like "Here's the current agent map — open it in a browser
+     and click any node for that agent's purpose, skills, and rights."
+
+  The HTML file is the deliverable — don't try to describe the whole graph in text.

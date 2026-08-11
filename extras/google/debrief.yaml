@@ -1,0 +1,62 @@
+name: debrief
+description: Fetch meeting notes from Google and extract action items
+parameters:
+  meeting:
+    type: string
+    description: Meeting title to look up (optional — auto-finds most recent)
+    required: false
+  pick:
+    type: integer
+    description: If multiple transcripts found, pick this one (1, 2, 3...)
+    required: false
+  notes:
+    type: string
+    description: Paste notes directly instead of auto-fetching (optional)
+    required: false
+prompt: |
+  You are debriefing a meeting. Your job is to get the notes, extract action items, and route them.
+
+  Meeting title: {meeting}
+  Pick document: {pick}
+  Pasted notes: {notes}
+
+  **Step 1 — Get the notes**
+  If notes were pasted above, use those. Otherwise, call meet_notes to fetch from Google.
+  - If a meeting title was given, pass it as meeting_title
+  - If a pick number was given, pass it as pick
+  - If neither was given, meet_notes will auto-find the most recent meeting
+
+  If meet_notes returns multiple documents, list them and ask the user which one to debrief (they can reply with the number). Call meet_notes again with pick=N to read that one.
+
+  If no notes are found at all, tell the user and stop.
+
+  **Step 2 — Extract action items**
+  Read through the notes and list every action item, decision, or follow-up. Be specific and concrete.
+
+  **Step 3 — Clarify ambiguity**
+  For any action that is vague or missing details (who, what, when), ask the user to clarify. Do NOT proceed until confirmed.
+
+  **Step 4 — Assign and route**
+  Look up the team roster using memory_search (search for "team" or "roster") to find team members and their roles. Recommend an owner for each action based on their responsibilities. If no roster is found, ask the user who should own each action.
+
+  Ask the user to confirm or reassign.
+
+  **Step 5 — Execute**
+  Once confirmed, for each action item either:
+  - Create a Trello card (trello_create_card) with title, description, and due date
+  - Send a Discord message to the assigned person (send_message)
+  - Route to an agent (send_to_agent) for automated follow-up
+  - Note as decision/FYI needing no task
+
+  Summarise everything created at the end.
+tools:
+  - meet_notes
+  - trello_boards
+  - trello_lists
+  - trello_create_card
+  - send_message
+  - send_to_agent
+  - ask_agent
+  - memory_store
+  - memory_search
+  - calendar_create

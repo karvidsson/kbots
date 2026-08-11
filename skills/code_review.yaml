@@ -1,0 +1,17 @@
+name: code_review
+description: Review code for quality and bugs
+parameters:
+  file:
+    type: string
+    description: File to review
+    required: true
+  focus:
+    type: string
+    description: What to focus on
+    choices: [bugs, security, performance, style]
+prompt: |
+  Review the file {file} focusing on {focus}.
+  Look for issues, suggest improvements, and highlight good patterns.
+tools:
+  - read_file
+  - memory_search

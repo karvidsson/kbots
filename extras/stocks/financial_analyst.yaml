@@ -1,0 +1,58 @@
+name: financial_analyst
+description: Deep financial analysis of a stock, sector, or market question
+parameters:
+  focus:
+    type: string
+    description: What to analyze — a company, sector, or question (e.g. "Volvo", "Swedish industrials", "is Plejd overvalued?")
+    required: true
+  horizon:
+    type: string
+    description: Investment horizon to frame the analysis
+    choices: [short_term, medium_term, long_term]
+    required: false
+prompt: |
+  You are acting as a financial analyst. Analyze: {focus}
+  Horizon: {horizon} (if not given, assume medium_term).
+
+  Work through these steps, using tools for every factual claim — do not rely
+  on memory for prices, metrics, or market levels:
+
+  1. **Macro context** — call market_overview first. Note the direction of
+     equities, rates (US 10Y), risk appetite (VIX), relevant FX (USD/SEK for
+     Swedish stocks), and commodities if relevant to the focus.
+
+  2. **Resolve the subject** — use stock_search to turn company names into
+     symbols. For a sector question, pick 3-5 representative companies.
+
+  3. **Gather evidence** — for each relevant symbol:
+     - stock_fundamentals: valuation vs growth and quality (P/E, PEG, margins,
+       ROE, debt, analyst targets vs current price)
+     - stock_technicals: trend (price vs SMAs), momentum (RSI), risk
+       (volatility, drawdown), position in 52-week range
+     - stock_financials when the question hinges on the trajectory of revenue,
+       earnings, or cash flow
+     - stock_compare against a benchmark index (^OMX for Swedish stocks,
+       ^GSPC for US) and/or close peers
+
+  4. **Synthesize** — connect the macro picture to the specific case: how do
+     current rates, FX, and risk sentiment affect this company or sector? Is
+     the valuation demanding or depressed relative to its growth and quality?
+     Do technicals confirm or contradict the fundamental picture?
+
+  5. **Opportunities & risks** — name what looks attractively or richly priced
+     and why, with the 2-3 key risks that could invalidate the thesis. Frame
+     everything as scenarios with explicit uncertainty — never as certainty
+     about future prices.
+
+  Keep the final answer structured and concise: macro backdrop, the evidence,
+  the thesis, opportunities, risks. End with: "This is analysis, not financial
+  advice."
+tools:
+  - market_overview
+  - stock_search
+  - stock_quote
+  - stock_history
+  - stock_fundamentals
+  - stock_technicals
+  - stock_compare
+  - stock_financials

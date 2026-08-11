@@ -1,0 +1,88 @@
+agents:
+  rescue:
+    display_name: "Rescue Bot"
+    description: "Privileged system agent — full project access for dev/ops"
+    project_dir: ./agents/rescue
+    privileged: true
+    llm:
+      provider: claude_code
+      model: sonnet
+      # mcp_config: /path/to/mcp.yaml  # Optional: MCP server config for this agent
+      # Model-tier routing (optional, needs Ollama or LM Studio running): a tiny
+      # local model classifies each message; clearly-simple ones are answered by
+      # a local workhorse instead of Claude — saves subscription usage.
+      # Quality-first: attachments/code/long/uncertain always go to Claude.
+      # router:
+      #   enabled: true
+      #   router_model: qwen3.5:2b   # tiny classifier (see docs/LOCAL_MODELS.md)
+      #   local_model: qwen3.5:9b    # local workhorse for simple requests
+      #   confidence: 0.75           # min classifier confidence to stay local
+    tools: all
+    skills: all
+    # Block Claude Code's built-in file/shell tools. The agent still has full
+    # MCP tool access (memory, web, integrations, browse_url, etc.) but cannot
+    # edit source code, run arbitrary shell commands, or write files directly.
+    # Recommended default for coordinator- and assistant-tier agents.
+    disallow_builtins:
+      - Edit
+      - Write
+      - Bash
+      - MultiEdit
+    # compression:             # per-agent override (inherits from config.yaml defaults)
+    #   enabled: true
+    #   level: lite
+    routing:
+      discord:
+        account: main         # bot account (namespace — each bot routes independently)
+        channels: []          # empty = all channels (wildcard)
+        # categories: []      # Discord category IDs — all channels in category match
+        # guilds: []          # filter: restrict to specific servers (applies on top of scope)
+        # home_channel: ""    # where inter-agent send_to_agent messages are delivered;
+        #                     # defaults to channels[0], or (wildcard) the agent's most
+        #                     # recently active conversation channel
+        mentions: true        # filter: only respond when @mentioned
+        # Scope priority: specific channel > category > wildcard
+        # Filters (account, guilds, mentions) apply independently of scope
+
+  # Example: assistant-tier agent with a restricted tool whitelist
+  # assistant:
+  #   display_name: "Helper"
+  #   description: "Operations assistant — read-only access to core tools"
+  #   project_dir: ./agents/assistant
+  #   llm:
+  #     provider: claude_code
+  #     model: sonnet
+  #   tools:
+  #     - memory_search
+  #     - memory_semantic_search
+  #     - memory_store
+  #     - web_search
+  #     - read_url
+  #     - browse_url
+  #   disallow_builtins:
+  #     - Edit
+  #     - Write
+  #     - Bash
+  #     - MultiEdit
+  #   routing:
+  #     discord:
+  #       account: assistant
+  #       categories: ["ADMIN_CATEGORY_ID"]
+  #       mentions: false
+
+  # Example: privileged ops agent (keeps built-in tools for sysadmin work)
+  # ops:
+  #   display_name: "Ops Bot"
+  #   description: "System operations agent"
+  #   project_dir: .
+  #   privileged: true
+  #   llm:
+  #     provider: claude_code
+  #     model: opus
+  #   tools: all
+  #   routing:
+  #     discord:
+  #       account: ops
+  #       channels: ["OPS_CHANNEL_ID"]
+  #       guilds: ["GUILD_ID"]
+  #       mentions: true

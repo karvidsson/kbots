@@ -1,0 +1,174 @@
+"""Fernet vault — encrypted credential storage.
+
+Secrets are encrypted at rest in secrets.enc, decrypted once at startup
+into an in-memory dict. Passphrase is never stored.
+"""
+
+import base64
+import hashlib
+import json
+import logging
+import os
+from pathlib import Path
+
+from cryptography.fernet import Fernet, InvalidToken
+
+from src.core.base import VaultBackend
+
+logger = logging.getLogger(__name__)
+
+LEGACY_SALT = b"kagents-vault-salt"
+PBKDF2_ITERATIONS = 100_000
+
+
+class FernetVault(VaultBackend):
+    """Fernet-encrypted credential vault."""
+    name = "fernet"
+
+    def __init__(self, vault_path: str | Path | None = None):
+        if vault_path is None:
+            from src.core.base import resolve_config_file
+            vault_path = resolve_config_file("secrets.enc")
+        self._vault_path = Path(vault_path)
+        self._salt_path = self._vault_path.with_suffix(".salt")
+        self._secrets: dict[str, str] = {}
+        self._fernet: Fernet | None = None
+        self._unlocked = False
+
+    @property
+    def is_unlocked(self) -> bool:
+        return self._unlocked
+
+    def _load_salt(self) -> bytes:
+        """Load per-instance salt, or fall back to legacy hardcoded salt.
+
+        The legacy fallback exists only for vaults created before per-instance
+        salts; a brand-new vault (no secrets.enc yet) gets a random salt.
+        """
+        if self._salt_path.exists():
+            return self._salt_path.read_bytes()
+        if not self._vault_path.exists():
+            return self._generate_salt()
+        return LEGACY_SALT
+
+    def _generate_salt(self) -> bytes:
+        """Generate and persist a random per-instance salt."""
+        salt = os.urandom(32)
+        self._salt_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._salt_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(salt)
+        return salt
+
+    def unlock(self, passphrase: str) -> None:
+        """Decrypt the vault into memory. Passphrase is not retained."""
+        salt = self._load_salt()
+        key = self._derive_key(passphrase, salt)
+        self._fernet = Fernet(key)
+
+        if self._vault_path.exists():
+            encrypted = self._vault_path.read_bytes()
+            try:
+                decrypted = self._fernet.decrypt(encrypted)
+                self._secrets = json.loads(decrypted)
+                logger.info(f"Vault unlocked: {len(self._secrets)} secrets loaded")
+            except InvalidToken:
+                raise ValueError("Wrong passphrase — vault decrypt failed")
+            except json.JSONDecodeError:
+                raise ValueError("Vault data corrupted — not valid JSON after decryption")
+        else:
+            self._secrets = {}
+            logger.info("Vault file does not exist — starting with empty vault")
+
+        self._unlocked = True
+
+    def unlock_from_env(self) -> None:
+        """Load secrets from environment variables instead of vault.
+
+        Useful for development when you don't want to set up a vault.
+        Falls back to .env file if present.
+        """
+        env_file = Path(".env")
+        if env_file.exists():
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        key, _, value = line.partition("=")
+                        key = key.strip()
+                        value = value.strip()
+                        if value:
+                            self._secrets[key] = value
+
+        # Also load from actual environment
+        for key in os.environ:
+            if any(key.startswith(prefix) for prefix in (
+                "DISCORD_", "ANTHROPIC_", "GROQ_", "OPENAI_",
+                "TAVILY_", "TELEGRAM_", "SLACK_",
+            )):
+                self._secrets[key] = os.environ[key]
+
+        self._unlocked = True
+        logger.info(f"Vault loaded from environment: {len(self._secrets)} secrets")
+
+    def get(self, key: str) -> str | None:
+        """Get a secret by key."""
+        return self._secrets.get(key)
+
+    def set(self, key: str, value: str) -> None:
+        """Set a secret and persist to disk."""
+        self._secrets[key] = value
+        self._persist()
+
+    def delete(self, key: str) -> bool:
+        """Delete a secret. Returns True if it existed."""
+        if key in self._secrets:
+            del self._secrets[key]
+            self._persist()
+            return True
+        return False
+
+    def list_keys(self) -> list[str]:
+        """List all secret key names (not values)."""
+        return list(self._secrets.keys())
+
+    def _persist(self) -> None:
+        """Re-encrypt and write vault to disk."""
+        if not self._fernet:
+            logger.warning("Cannot persist vault — no encryption key (env-only mode)")
+            return
+
+        payload = json.dumps(self._secrets).encode()
+        encrypted = self._fernet.encrypt(payload)
+
+        self._vault_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._vault_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(encrypted)
+
+    def migrate_salt(self, passphrase: str) -> None:
+        """Migrate from legacy hardcoded salt to per-instance random salt.
+
+        Decrypts with old salt, generates new salt, re-encrypts with new salt.
+        Must be called while vault is unlocked.
+        """
+        if not self._unlocked:
+            raise RuntimeError("Vault must be unlocked before migrating salt")
+        if self._salt_path.exists():
+            raise RuntimeError("Per-instance salt already exists — already migrated")
+
+        # Generate new salt and re-derive key
+        new_salt = self._generate_salt()
+        new_key = self._derive_key(passphrase, new_salt)
+        self._fernet = Fernet(new_key)
+
+        # Re-encrypt with new key
+        self._persist()
+        logger.info(f"Vault salt migrated to per-instance salt at {self._salt_path}")
+
+    @staticmethod
+    def _derive_key(passphrase: str, salt: bytes) -> bytes:
+        """Derive a Fernet key from a passphrase using PBKDF2."""
+        return base64.urlsafe_b64encode(hashlib.pbkdf2_hmac(
+            "sha256", passphrase.encode(), salt, PBKDF2_ITERATIONS, dklen=32
+        ))

@@ -1,0 +1,25 @@
+# Scheduled report compilation on the LOCAL model — rename to .yaml to enable.
+# The heavy lifting is the deterministic compile_report tool; the local model
+# just runs it and relays the result. Author the spec once with your main
+# (Claude) agent, then: schedule_task(cron='0 8 * * 1', skill='compile_report',
+#   skill_params='{"spec": "reports/weekly-sales.yaml"}')
+# (Or skip the model entirely: schedule_task(..., tool='compile_report',
+#   tool_args='{"spec_file": "reports/weekly-sales.yaml"}', narrate=true))
+name: compile_report
+description: Compile a report from a saved spec (runs on the local model)
+parameters:
+  spec:
+    type: string
+    description: Path to the report spec YAML (see compile_report tool)
+    required: true
+prompt: |
+  Compile the report defined in {spec}.
+  Steps:
+  1. Call compile_report with spec_file={spec}.
+  2. Reply with one short sentence: where the report landed and its key stats.
+tools: [compile_report]
+restrict_tools: true
+max_rounds: 3
+llm:
+  provider: local
+  model: qwen3.5:9b

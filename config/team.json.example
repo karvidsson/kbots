@@ -1,0 +1,20 @@
+{
+  "humans": [
+    {
+      "id": "you",
+      "name": "Your Name",
+      "type": "human",
+      "access": "owner",
+      "role": "Founder",
+      "responsibilities": ["Everything"],
+      "context": "Your context here.",
+      "contact": {
+        "discord": "YOUR_DISCORD_USER_ID"
+      },
+      "preferences": {
+        "timezone": "UTC"
+      }
+    }
+  ],
+  "agents": []
+}

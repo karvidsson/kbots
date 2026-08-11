@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" fill="none">
+  <!-- Agent avatar variant: ring eyes, violet accent -->
+  <rect x="9" y="9" width="142" height="142" rx="36" fill="#0a0a0f" stroke="#7d8695" stroke-width="7"/>
+  <circle cx="58" cy="80" r="12.5" stroke="#a78bfa" stroke-width="8"/>
+  <circle cx="103" cy="80" r="12.5" stroke="#a78bfa" stroke-width="8"/>
+</svg>

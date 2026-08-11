@@ -1,0 +1,38 @@
+# Template: a single-tool "specialist" skill — the unit for per-tool model training.
+# Rename to <your_tool>_specialist.yaml, swap `your_tool` for one real tool, and set
+# a unique `name`. See docs/TRAINING.md → "Specialized models — one model per tool".
+#
+# Why this shape:
+#   restrict_tools: true + one tool  → every turn is scoped to ONE tool and tagged
+#                                      `skill: <name>`, so the collector produces a
+#                                      clean, sliceable per-tool corpus.
+#   llm.provider: local + fallback   → BEFORE you train, `fallback: true` runs the
+#                                      turn on Claude (collecting correct usage to
+#                                      learn from). AFTER you train, point `model` at
+#                                      your fine-tuned specialist and it runs locally.
+#
+# The loop: enable training_collection → use this skill + react 👍/👎 → export just
+# this tool's data:
+#     uv run python scripts/export_training_data.py --dir <data_dir>/training \
+#         --skill tool_specialist --successful-only --format mlx
+#   → LoRA a small base (Qwen2.5-1.5B/3B) → mlx_lm.fuse → serve → set `model` below.
+name: tool_specialist
+description: Single-tool specialist (scoped toolset, runs on the local model)
+parameters:
+  request:
+    type: string
+    description: What to do with the tool, in plain language
+    required: true
+prompt: |
+  You perform one job using a single tool. Request: {request}
+  Rules:
+  - Call `your_tool` with the right arguments. Do not use any other tool.
+  - If required arguments are missing, ask one short clarifying question.
+  - Confirm what you did in one short sentence. Do nothing else.
+tools: [your_tool]
+restrict_tools: true
+max_rounds: 3
+llm:
+  provider: local
+  model: your-tool-specialist   # your fine-tuned model; until trained, fallback → Claude
+  fallback: true

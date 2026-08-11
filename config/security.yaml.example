@@ -1,0 +1,52 @@
+# Security configuration — add these fields to your config.yaml under 'security:'
+#
+# All fields are optional. Missing fields disable that feature.
+# This file is a reference — do not load it directly.
+
+security:
+  # Discord channel for all security/ops alerts (behavior, content safety, etc.)
+  # Set per-deployment in Layer 3 config.yaml
+  alert_channel: ""
+
+  # Bot account used to send alerts (must have access to alert_channel)
+  # Maps to vault key: discord-{alert_bot}
+  alert_bot: ""
+
+  # Permission watch — runtime detection of rights failures (root-owned Claude
+  # config, mid-session tool denials, wrong file ownership) with escalation to
+  # a main agent, which verifies and tells the owner exactly what to run and
+  # what access it needs (SSH vs. physical). See docs/PERMISSIONS.md.
+  permission_watch:
+    enabled: true
+    agent: ""            # main agent to brief (e.g. your coordinator agent)
+    connector: discord
+    channel: ""          # channel the briefing + owner report land in
+    interval: 300        # seconds between rights sweeps
+    cooldown: 3600       # seconds before the same issue is re-reported
+
+  # HITL approval (already exists — shown for reference)
+  hitl:
+    channel: ""
+    approvers: []
+    timeout: 1800
+    fail_mode: closed
+    gated_tools:
+      - send_email
+      - install_mcp
+
+  # Rate limiting
+  rate_limits:
+    mode: enforce
+    defaults:
+      max_per_hour: 50
+
+  # Access control
+  access_control:
+    safe_tools:
+      - memory_search
+      - memory_semantic_search
+      - memory_store
+      - memory_forget
+      - web_search
+      - team_get
+      - team_list

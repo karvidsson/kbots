@@ -1,0 +1,13 @@
+[Unit]
+Description=kbots Memory Context Regen
+After=kbots.service
+
+[Service]
+Environment=KBOTS_HOME=/opt/kbots
+Type=oneshot
+User=kbots
+Group=kbots
+WorkingDirectory=/opt/kbots
+ExecStart=/opt/kbots/scripts/regen-memory-context.sh
+StandardOutput=append:/var/log/kbots-context.log
+StandardError=append:/var/log/kbots-context.log

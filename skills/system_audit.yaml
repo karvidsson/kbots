@@ -1,0 +1,4 @@
+name: system_audit
+description: Run a full system health audit — services, timers, resources, security, memory, vault, MCP, tools, git state
+command: scripts/health-audit.sh --report
+prompt: Run the system_audit tool. The script posts the full report directly to the ops-alert Discord channel as a file — just relay the confirmation message to the user.

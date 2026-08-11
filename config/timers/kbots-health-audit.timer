@@ -1,0 +1,10 @@
+[Unit]
+Description=kbots Health Audit (every 12 hours)
+
+[Timer]
+OnBootSec=20min
+OnCalendar=*-*-* 00,12:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=kbots Memory Context Regen + Decay
+After=kbots.service
+
+[Service]
+Type=oneshot
+User=kbots
+Group=kbots
+WorkingDirectory=/opt/kbots
+ExecStart=/opt/kbots/scripts/memory-decay.sh

@@ -1,0 +1,42 @@
+name: android_task
+description: Drive the Android device (phone or emulator) through a task, carefully
+parameters:
+  - name: task
+    type: string
+    required: true
+    description: What to accomplish on the device
+prompt: |
+  Drive the Android device to accomplish this task: {task}
+
+  Use the android_device tool with a strict look → act → verify loop:
+
+  1. Start with action='status' to see which device you have (physical phone
+     vs emulator) and whether it is free — if it is reserved by another
+     agent, stop and report; do not wait in a loop.
+  2. action='screenshot', then Read the saved image. The screenshot is the
+     only source of truth for what is on screen right now.
+  3. Take ONE action based on what you actually see — tap the center of the
+     target (coordinates are in full device resolution; the tool reports the
+     screen size). To type, first tap the input field, verify the keyboard
+     appeared, then action='type'.
+  4. Screenshot again to verify the result before your next step. If you see
+     a spinner or half-loaded screen, wait a few seconds and re-screenshot
+     instead of tapping.
+  5. If a step fails 3 times, stop. Report what is on screen, what you
+     tried, and what you would need — do not thrash.
+
+  Recovery: action='key' with 'back' closes dialogs and wrong screens;
+  'home' plus action='launch' restarts an app flow cleanly.
+
+  Real-device rules: on a physical phone every action is real — posts
+  publish, messages send. Confirm with the user before anything public or
+  irreversible unless the task already authorizes it. Verification codes
+  (SMS) arrive on the phone itself — read them from the notification shade
+  (swipe down from the top) instead of asking the user to relay them.
+
+  When done: action='release' so other agents can use the device, then
+  report the outcome first, with evidence from your final screenshot.
+tools:
+  - android_device
+  - memory_search
+  - memory_store

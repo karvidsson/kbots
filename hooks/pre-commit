@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# kbots — pre-commit hook for the Core repo
+#
+# Blocks direct commits to main. All changes to Core must go through
+# a feature branch and PR. This protects the framework from accidental
+# commits by both humans and agents.
+#
+# Installed by: setup.sh (Step 2) or manually:
+#   cp hooks/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)"
+
+if [ "$BRANCH" = "main" ]; then
+    cat >&2 <<'EOF'
+
+  ╔══════════════════════════════════════════════════════════╗
+  ║  COMMIT BLOCKED — direct commits to main are not        ║
+  ║  allowed in the kbots Core repo.                      ║
+  ╠══════════════════════════════════════════════════════════╣
+  ║                                                          ║
+  ║  All changes require a feature branch + pull request:    ║
+  ║                                                          ║
+  ║    git checkout -b fix/your-description                  ║
+  ║    git add ... && git commit ...                         ║
+  ║    git push -u origin fix/your-description               ║
+  ║    gh pr create                                          ║
+  ║                                                          ║
+  ║  If you're an agent: do NOT commit deployment-specific   ║
+  ║  files (agent configs, custom tools, personal data) to   ║
+  ║  this repo. Those belong in your overlay directory.      ║
+  ╚══════════════════════════════════════════════════════════╝
+
+EOF
+    exit 1
+fi

@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 320" fill="none">
+  <!-- kbots banner — arvidsson.tech style: near-black gradient, faint grid,
+       JetBrains Mono, red accents, // comment prefixes -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1280" y2="320" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0a0a0f"/>
+      <stop offset="0.5" stop-color="#12121a"/>
+      <stop offset="1" stop-color="#0d1117"/>
+    </linearGradient>
+    <radialGradient id="glowRed" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff3232" stop-opacity="0.13"/>
+      <stop offset="0.7" stop-color="#ff3232" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowOrange" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#ff6432" stop-opacity="0.08"/>
+      <stop offset="0.7" stop-color="#ff6432" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M 40 0 L 0 0 0 40" stroke="#ffffff" stroke-opacity="0.02" stroke-width="1" fill="none"/>
+    </pattern>
+    <clipPath id="frame"><rect width="1280" height="320" rx="14"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="1280" height="320" fill="url(#bg)"/>
+    <rect width="1280" height="320" fill="url(#grid)"/>
+    <ellipse cx="1120" cy="70" rx="420" ry="300" fill="url(#glowRed)"/>
+    <ellipse cx="140" cy="330" rx="380" ry="260" fill="url(#glowOrange)"/>
+
+    <!-- mascot: screen-headed bot, red-lit eyes -->
+    <g transform="translate(58 28)">
+      <path d="M120 112 L122 180" stroke="#7d8695" stroke-width="7" stroke-linecap="round"/>
+      <path d="M48 168 L119 159" stroke="#7d8695" stroke-width="7" stroke-linecap="round"/>
+      <path d="M125 156 L194 144" stroke="#7d8695" stroke-width="7" stroke-linecap="round"/>
+      <path d="M74 250 C 76 212 96 188 121 187 C 146 188 166 210 172 248" stroke="#7d8695" stroke-width="7" stroke-linecap="round"/>
+      <g transform="rotate(-2 120 72)">
+        <rect x="58" y="30" width="124" height="84" rx="20" fill="#0a0a0f" stroke="#7d8695" stroke-width="7"/>
+        <ellipse cx="100" cy="74" rx="17" ry="24" fill="#ff4444" opacity="0.13" transform="rotate(-5 100 74)"/>
+        <ellipse cx="140" cy="70" rx="17" ry="24" fill="#ff4444" opacity="0.13" transform="rotate(6 140 70)"/>
+        <ellipse cx="100" cy="74" rx="8.5" ry="13" fill="#ff4444" transform="rotate(-5 100 74)"/>
+        <ellipse cx="140" cy="70" rx="8.5" ry="13" fill="#ff6b6b" transform="rotate(6 140 70)"/>
+      </g>
+    </g>
+
+    <!-- text block -->
+    <g font-family="'JetBrains Mono','Fira Code','SF Mono',Menlo,Consolas,monospace">
+      <text x="330" y="96" font-size="19" letter-spacing="1">
+        <tspan fill="#ff4444">//</tspan><tspan fill="#666c76"> arvidsson-geins/kbots</tspan>
+      </text>
+      <text x="326" y="176" font-size="86" font-weight="700" letter-spacing="2">
+        <tspan fill="#ff4444">k</tspan><tspan fill="#ffffff">bots</tspan>
+      </text>
+
+      <!-- tagline as a principles-row -->
+      <rect x="330" y="204" width="612" height="52" fill="#ffffff" fill-opacity="0.03"/>
+      <rect x="330" y="204" width="3" height="52" fill="#ff4444"/>
+      <text x="356" y="237" font-size="21" letter-spacing="0.5">
+        <tspan fill="#ff4444">//</tspan><tspan fill="#e8eaed"> one process &#183; LLM-agnostic &#183; trains itself</tspan>
+      </text>
+    </g>
+  </g>
+</svg>

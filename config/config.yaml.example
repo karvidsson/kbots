@@ -1,0 +1,129 @@
+kbots:
+  name: "kbots"
+  log_level: info
+  data_dir: ./data
+  # Training-data collection (opt-in). Records each agent turn — assembled prompt,
+  # final response, full tool-call trace, and outcome — to <path>/turns.jsonl, plus
+  # 👍/👎 rewards to rewards.jsonl. Feeds scripts/export_training_data.py (nanoGPT
+  # corpus + SFT/LoRA JSONL). Off by default: it stores full conversation content
+  # locally (secrets are redacted). See docs/TRAINING.md.
+  training_collection:
+    enabled: false
+    include_tool_trace: true
+    # path: ./data/training   # defaults to <data_dir>/training
+    # Machine labels for collected turns (weak — human 👍/👎 always wins at
+    # export; see docs/TRAINING.md). Adapted from fable-method's judge (MIT).
+    judge:
+      enabled: false
+      provider: claude_code   # judge with a competent model even for local-agent turns
+      model: haiku
+      interval_hours: 6
+      max_turns_per_run: 50
+      min_age_minutes: 60     # give humans first shot at reacting
+
+connectors:
+  discord:
+    enabled: true
+    presence: true            # show a "🛠 Working…" status (red dot) while an agent is busy
+    # Bot-to-bot loop backstop: after this many consecutive bot-triggered turns
+    # in a channel with no human message, the bot goes quiet — but the chain
+    # self-heals after bot_chain_decay_seconds of quiet (no human needed), so
+    # genuine paused-then-resumed agent collaboration recovers on its own.
+    # bot_chain_limit: 12
+    # bot_chain_decay_seconds: 300
+    accounts:
+      main:
+        token_key: discord-token
+      # Add more bots:
+      # ops:
+      #   token_key: secrets/ops-bot-token
+  telegram:
+    enabled: false
+  http:
+    enabled: false
+    port: 8080
+  # Inbound event webhook — lets external systems (smart-home hubs, cron, CI)
+  # trigger agent actions. Agents register triggers with create_trigger, which
+  # returns a UNIQUE url + secret per registration: the hub POSTs to
+  # http://host:port/event/<trigger_id> with that trigger's X-Webhook-Secret.
+  # Kill all event-triggered inference instantly with `/admin triggers off`.
+  webhook:
+    enabled: false
+    host: "127.0.0.1"        # localhost only by default; use "0.0.0.0" for LAN (secure it!)
+    port: 8090
+
+defaults:
+  llm:
+    provider: claude_code
+    model: sonnet
+    max_tokens: 4096
+    # mcp_config: /path/to/mcp.yaml  # Optional: external MCP servers for all agents
+    # Local models (optional): any agent can run on a local model instead of
+    # Claude by setting `llm: {provider: local, model: qwen3.5:9b}` in agents.yaml.
+    # Works with Ollama and LM Studio (same OpenAI-compatible API) — leave
+    # base_url unset to auto-detect whichever is running. See docs/LOCAL_MODELS.md.
+    local:
+      model: qwen3.5:9b        # default local model (pick per your RAM — see docs)
+      # base_url: http://localhost:11434/v1   # unset = probe Ollama, then LM Studio
+      # api_key: ""            # only if your endpoint requires one
+      timeout: 180
+      auto_pull: true          # pull a missing model on first use (Ollama) instead of erroring
+  session:
+    max_history: 50
+    summarize_after: 30
+  memory:
+    backend: sqlite
+    semantic_search: false
+    decay_enabled: false
+    max_results: 10
+    # Reward-based working memory: agents save lessons (remember_lesson) and
+    # feedback (record_outcome / 👍👎). The reflector periodically consolidates
+    # them into each agent's LESSONS.md, injected at session start.
+    reflection:
+      enabled: true
+      model: haiku          # cheap model — reflection is a focused consolidation call
+      interval_hours: 24    # per-agent cadence
+      min_lessons: 3        # skip until an agent has at least this many lessons
+
+# Schedule oversight (optional): a dedicated channel where agents' scheduled
+# tasks are posted. React ❌ on a card to cancel it; use /schedules for the full
+# board. Leave channel empty to disable the board (scheduling still works).
+# You can also just ask the main agent to set this up — it creates/points a
+# channel and enables the board live (no restart) via the admin-only
+# set_schedule_board tool, which overrides the value below.
+schedules:
+  channel: ""                # e.g. "YOUR_SCHEDULES_CHANNEL_ID"
+  bot: ""                    # optional bot account to post as (default: first)
+
+# Loopback API for inter-agent calls (ask_agent / send_to_agent) from tool
+# subprocesses. Zero-config: binds 127.0.0.1 on an ephemeral port with a
+# per-boot token. Only set a port if a firewall needs a fixed one.
+internal_api:
+  port: 0                    # 0 = ephemeral
+
+security:
+  hitl:
+    connector: discord
+    enabled: true            # approval gate on/off; toggle live with /admin hitl
+    channel: "YOUR_OPS_CHANNEL_ID"
+    approvers: ["YOUR_DISCORD_USER_ID"]
+    timeout: 1800
+    fail_mode: closed
+    poll_interval: 3
+    gated_tools:
+      - send_email
+      - install_mcp
+      # Add any tools that need human approval
+
+  rate_limits:
+    mode: log    # switch to 'enforce' when ready
+    defaults:
+      max_per_hour: 100
+
+  compression:
+    enabled: false           # compress agent context files to reduce input tokens
+    level: standard          # lite (articles + filler) | standard (full compression)
+    # memory_recall: false   # compress memories at injection time (requires core wiring)
+
+admin_users:
+  discord: ["YOUR_DISCORD_USER_ID"]

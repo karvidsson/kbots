@@ -1,0 +1,89 @@
+name: add_agent
+description: Provision a new agent + its own Discord bot, driving the Developer Portal for you (macOS)
+parameters:
+  name:
+    type: string
+    description: Internal id for the new agent — lowercase, no spaces (e.g. "scout")
+    required: true
+  display_name:
+    type: string
+    description: The bot's display name shown in Discord (e.g. "Scout"). Defaults to a capitalized name.
+    required: false
+  role:
+    type: string
+    description: One-line role/purpose (e.g. "market research and lead sourcing")
+    required: false
+  tier:
+    type: string
+    description: Access tier for the new agent
+    choices: [assistant, coordinator, privileged]
+    required: false
+prompt: |
+  You are provisioning a NEW agent and its own Discord bot with minimal work for
+  the user. You are on macOS and have the chrome_browser tool, which drives a real
+  Chrome that is already logged into Discord (a separate debug profile seeded from
+  the user's own login).
+
+  Target: name={name}, display_name={display_name}, role={role}, tier={tier}.
+  If display_name is empty, use a capitalized {name}. If tier is empty, use "assistant".
+
+  Work through the steps IN ORDER. After each browser action, take a screenshot and
+  verify the result. If a step fails or the page looks unexpected: screenshot, tell
+  the user the single concrete step to do by hand in the visible window, wait for
+  them to confirm, then continue. Minimize the user's effort — do not abandon the
+  flow at the first hiccup.
+
+  1. SCAFFOLD CONFIG. Call create_agent with name={name}, display_name, a short
+     description derived from {role}, and tier. This registers the bot account
+     (vault key `discord-{name}`) and adds the agent to the roster. Note the bot
+     account name it reports back (normally {name}).
+
+  2. BROWSER PERMISSION. Tell the user you're about to drive their real Chrome to
+     set up the Discord application, then call chrome_browser(action='grant').
+
+  3. OPEN THE PORTAL. chrome_browser(action='open',
+     url='https://discord.com/developers/applications'). Screenshot. If a login
+     page appears, ask the user to log in in the visible window, then continue.
+
+  4. CREATE THE APP. Click "New Application" (visible text). Fill the name field
+     with the display_name, tick the terms checkbox if shown, click "Create".
+     Screenshot to confirm the app was created.
+
+  5. ENABLE INTENTS. Open the "Bot" section (click "Bot"). Turn ON both
+     "Message Content Intent" AND "Server Members Intent" under Privileged Gateway
+     Intents. The "Save Changes" bar only appears AFTER you toggle something —
+     click it once it shows. Screenshot to confirm both are enabled and saved.
+
+  6. REVEAL THE TOKEN — STOP FOR THE USER. On the Bot page click "Reset Token" and
+     confirm the dialog. Discord will require the user's 2FA/authenticator code —
+     you CANNOT do this step. Tell the user clearly: "Complete the 2FA prompt in
+     the window, then copy the revealed token and paste it to me — a DM is best."
+     Do NOT read, screenshot, or transcribe the token yourself. Wait for the paste.
+
+  7. STORE THE TOKEN. When the user pastes the token, call
+     vault_set_secret(key='discord-{name}', secret=<the pasted token>). Then tell
+     the user to delete their message containing the raw token. Never repeat it back.
+
+  8. INVITE TO THE SERVER — build the URL directly (the OAuth2 URL Generator's
+     checkboxes are fragile to automate, so do NOT use it):
+     - Get the Application ID from the app's URL. When you are inside the app you're
+       on `.../applications/<APP_ID>/information`; the chrome_browser result shows
+       the current URL — take the number after `/applications/`. (If unsure, click
+       "General Information" and read the "Application ID".)
+     - Permissions integer: use 117824 (View Channels, Send Messages, Read Message
+       History, Add Reactions, Attach Files, Embed Links). If tier is "privileged",
+       use 117840 instead (adds Manage Channels).
+     - Open the invite URL directly:
+       chrome_browser(action='open',
+       url='https://discord.com/oauth2/authorize?client_id=<APP_ID>&permissions=<PERMS>&scope=bot+applications.commands')
+     - On the authorize page make sure the right server is selected, click
+       "Authorize", and complete any captcha in the window. Screenshot to confirm
+       the bot appears in the server's member list.
+
+  9. FINISH. Give the user a short checklist of what was done, confirm the token is
+     stored as `discord-{name}`, and tell them to run /admin reboot to bring the new
+     bot online (a new bot only connects after a restart).
+tools:
+  - create_agent
+  - chrome_browser
+  - vault_set_secret

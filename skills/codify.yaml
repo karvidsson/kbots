@@ -1,0 +1,64 @@
+name: codify
+description: Review repetitive work and propose skills/tools that make it repeatable
+parameters:
+  focus:
+    type: string
+    description: A specific task or workflow to codify (optional — otherwise review recent work and lessons)
+    required: false
+tools:
+  - memory_search
+  - remember_lesson
+  - record_outcome
+  - create_skill
+  - create_tool
+  - list_capabilities
+prompt: |
+  Turn repetitive work into durable capabilities. Focus: {focus}
+
+  1. **Gather candidates.** If a focus was given, that is your candidate.
+     Otherwise: check the "## Codify" section of your lessons (LESSONS.md /
+     the injected <lessons> block), and call `memory_search` for procedural
+     lessons — pipelines, formats, fixed tool sequences you have run more
+     than once. Skip anything that was a one-off.
+
+  2. **Check for overlap.** Call `list_capabilities`. If an existing skill or
+     tool already covers a candidate, drop the candidate — or note what small
+     change to the existing one would close the gap instead.
+
+  3. **Draft each proposal.** For every surviving candidate, write the skill
+     spec before creating anything: name, parameters, tools it needs, numbered
+     steps, exact file paths, known gotchas, and what the finished output
+     looks like (format AND delivery — e.g. "PDF attached to the channel",
+     not "a report"). The test: could a fresh session with zero conversation
+     context reproduce the result from this prompt alone? If any step depends
+     on a template, stylesheet, or reference file, plan to copy it into your
+     own project directory first and reference that durable path — never
+     `$KBOTS_TMP` or scratch paths, which get cleaned.
+
+     **Default to a pipeline tool — code over prompt.** Robustness comes from
+     moving decisions out of the prompt and into code. Everything
+     deterministic in the procedure — parsing, validation, computation, chart
+     rendering, template filling, file naming — belongs in ONE `create_tool`
+     pipeline that either succeeds or fails loudly, never a prompt step. If
+     the output has written analysis, design the tool to accept it as input
+     (e.g. a `narrative` JSON poured into named template slots). Reserve the
+     skill for what is irreducibly judgment: writing that narrative from the
+     tool's validated output, and delivering the result. A draft where the
+     model re-derives a number, a chart, a layout, or a filename that code
+     could produce is not done. When the procedure fires on a recurring
+     event (a file arriving, a date), note in the proposal that a tool-direct
+     trigger or schedule can then run the pipeline with no model in the loop.
+
+  4. **Propose, don't install.** Present the drafts to the user: what keeps
+     recurring, what the skill would capture, what it would be called. Wait
+     for their answer. Do NOT create anything without approval.
+
+  5. **On approval:** pin the asset files (step 3), then call `create_skill`
+     for prompt pipelines, or `create_tool` for logic that needs real code
+     (deterministic parsing, calculations — it is HITL-gated, a human reviews
+     the source). Confirm to the user what was created and how to invoke it.
+
+  6. **Record the outcome.** Approved: `remember_lesson` noting the skill now
+     exists and should be used instead of redoing the work by hand. Declined:
+     `remember_lesson` noting the user declined codifying this, so you don't
+     re-propose it.

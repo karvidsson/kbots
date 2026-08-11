@@ -1,0 +1,13 @@
+[Unit]
+Description=kbots Health Audit
+After=kbots.service
+
+[Service]
+Environment=KBOTS_HOME=/opt/kbots
+Type=oneshot
+User=kbots
+Group=kbots
+WorkingDirectory=/opt/kbots
+ExecStart=/opt/kbots/scripts/health-audit.sh --report
+StandardOutput=append:/var/log/kbots-security.log
+StandardError=append:/var/log/kbots-security.log

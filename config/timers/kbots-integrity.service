@@ -1,0 +1,13 @@
+[Unit]
+Description=kbots File Integrity Monitoring
+After=kbots.service
+
+[Service]
+Type=oneshot
+Environment=KBOTS_HOME=/opt/kbots
+User=kbots
+Group=kbots
+WorkingDirectory=/opt/kbots
+ExecStart=/opt/kbots/scripts/monitor-integrity.sh
+StandardOutput=append:/var/log/kbots-security.log
+StandardError=append:/var/log/kbots-security.log

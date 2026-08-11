@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- kbots launchd unit (macOS). Rendered by setup.py — tokens in __CAPS__
+     are replaced with real paths at generation time. -->
+<plist version="1.0">
+<dict>
+    <key>ExitTimeOut</key>
+	<integer>90</integer>
+	<key>Label</key>
+    <string>com.kbots.agent</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__UV__</string>
+        <string>run</string>
+        <string>--no-sync</string>
+        <string>python</string>
+        <string>-m</string>
+        <string>src.main</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__ENGINE_ROOT__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>KBOTS_OVERLAY</key>
+        <string>__OVERLAY__</string>
+        <!-- __EXTRA_ENV__ -->
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__OVERLAY__/data/launchd.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__OVERLAY__/data/launchd.stderr.log</string>
+</dict>
+</plist>

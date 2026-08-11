@@ -1,0 +1,26 @@
+name: reflect
+description: Consolidate your saved lessons now and rewrite LESSONS.md
+tools:
+  - memory_search
+  - remember_lesson
+  - record_outcome
+prompt: |
+  Reflect on your accumulated lessons to get sharper — an on-demand version of
+  the nightly reflector.
+
+  1. Search your memory for your saved lessons (category "lesson"): call
+     `memory_search` with a broad query and category="lesson" (a few queries if
+     needed to cover topics).
+  2. Review them critically:
+     - Merge near-duplicates.
+     - For any lesson that has proven reliable, call
+       `record_outcome(lesson, "useful")` to promote it.
+     - For anything you now know is wrong or a dead end, call
+       `record_outcome(lesson, "dead_end")` (or "corrected" with the fix).
+     - Capture any new generalisable insight with `remember_lesson`.
+  3. Briefly summarise what you consolidated: what's now "preferred", what you
+     demoted, and any dead ends to avoid.
+
+  Keep lessons general and reusable — the goal is to answer better next time,
+  not to hoard one-off facts. The reflector will regenerate LESSONS.md from the
+  updated confidences on its next run.

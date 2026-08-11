@@ -1,0 +1,190 @@
+#!/usr/bin/env python3
+"""Manage the kbots vault — add, view, delete secrets."""
+from pathlib import Path
+
+from src.core.base import resolve_config_file, resolve_vault_key_file
+from src.vault.fernet import FernetVault
+
+KEY_FILE = resolve_vault_key_file()
+
+# Common secrets for Core tools — deployments can add their own via "Custom key"
+ALL_KEYS = [
+    # Discord (one per bot account)
+    "discord-token",
+    # AI / LLM
+    "secrets/gemini-api-key",
+    "secrets/groq-api-key",
+    # Google Workspace (OAuth2)
+    "secrets/google-api-credentials.json",
+    # Web search
+    "secrets/tavily-api-key",
+    # Integrations
+    "secrets/cloudflare-api-token",
+    "secrets/notion-api-key",
+    "secrets/trello-credentials.json",
+    # GitHub
+    "github-token",
+]
+
+
+def get_vault():
+    # Resolve the SAME vault the service reads (overlay → modules → core), not a
+    # CWD-relative path — otherwise secrets added from the wrong dir silently go
+    # to a stray secrets.enc the service never loads.
+    v = FernetVault(str(resolve_config_file("secrets.enc")))
+    v.unlock(KEY_FILE.read_text().strip())
+    return v
+
+
+def cmd_list(v):
+    keys = sorted(v.list_keys())
+    print(f"\n  Vault: {len(keys)} secrets\n")
+    for k in keys:
+        print(f"    {k}")
+    print()
+
+
+def cmd_add(v):
+    # Show every secret already in the vault (pick one to update), then the
+    # common keys not yet set (suggestions to add). Previously only the fixed
+    # ALL_KEYS template was listed, so existing custom secrets were invisible.
+    existing = sorted(v.list_keys())
+    suggested = [k for k in ALL_KEYS if k not in existing]
+    options = existing + suggested
+
+    print("\n  Keys (* = already set — pick a number to update, or add a suggested/custom key):")
+    for i, key in enumerate(options, 1):
+        mark = "  *" if key in existing else ""
+        print(f"    {i:>2}) {key}{mark}")
+    custom_num = len(options) + 1
+    print(f"    {custom_num:>2}) Custom key")
+
+    choice = input(f"\n  Pick [1-{custom_num}] or type key name: ").strip()
+
+    try:
+        idx = int(choice)
+        if idx == custom_num:
+            key = input("  Key name: ").strip()
+        elif 1 <= idx <= len(options):
+            key = options[idx - 1]
+        else:
+            print("  Invalid number.")
+            return
+    except ValueError:
+        key = choice  # typed a key name directly
+
+    if not key:
+        print("  No key provided, aborting.")
+        return
+
+    existing = v.get(key)
+    if existing:
+        confirm = input(f"  '{key}' already exists. Overwrite? [y/N]: ").strip().lower()
+        if confirm != "y":
+            print("  Skipped.")
+            return
+
+    value = input(f"  Paste value for '{key}': ").strip()
+    if not value:
+        print("  Empty value, aborting.")
+        return
+
+    v.set(key, value)
+    print(f"  Saved '{key}'. Total secrets: {len(v.list_keys())}")
+
+
+def cmd_delete(v):
+    key = input("  Key to delete: ").strip()
+    if not key:
+        return
+    if not v.get(key):
+        print(f"  '{key}' not found.")
+        return
+    confirm = input(f"  Delete '{key}'? [y/N]: ").strip().lower()
+    if confirm == "y":
+        v.delete(key)
+        print(f"  Deleted. Total secrets: {len(v.list_keys())}")
+
+
+def cmd_check(v):
+    key = input("  Key to check: ").strip()
+    if v.get(key):
+        print(f"  '{key}' = exists ({len(v.get(key))} chars)")
+    else:
+        print(f"  '{key}' = NOT FOUND")
+
+
+def cmd_migrate_salt(v):
+    salt_path = Path("config/secrets.salt")
+    if salt_path.exists():
+        print("  Per-instance salt already exists — already migrated.")
+        return
+    print("\n  This will migrate from the hardcoded vault salt to a random per-instance salt.")
+    print("  The vault will be re-encrypted. Your passphrase is needed to re-derive the key.")
+    confirm = input("\n  Proceed? [y/N]: ").strip().lower()
+    if confirm != "y":
+        print("  Aborted.")
+        return
+    passphrase = KEY_FILE.read_text().strip()
+    v.migrate_salt(passphrase)
+    print(f"  Salt migrated. New salt saved to {salt_path}")
+    print(f"  Vault re-encrypted with new key. Total secrets: {len(v.list_keys())}")
+
+
+def main():
+    import os
+    vault_path = resolve_config_file("secrets.enc")
+    if not os.environ.get("KBOTS_OVERLAY"):
+        print("\n  ⚠️  KBOTS_OVERLAY is not set — falling back to the vault inside the")
+        print(f"      engine checkout: {vault_path}")
+        print("      On an overlay-based install the service does NOT read this file,")
+        print("      so secrets saved here will never reach the bots. Set KBOTS_OVERLAY")
+        print("      to your overlay path and re-run unless this is intentional.")
+        if input("      Continue anyway? [y/N]: ").strip().lower() != "y":
+            return
+
+    v = get_vault()
+    print(f"\n  Vault: {vault_path}")
+
+    while True:
+        print("\n  kbots Vault Manager")
+        print("  ─────────────────────")
+        print("  1) List secrets")
+        print("  2) Add/update secret")
+        print("  3) Check if secret exists")
+        print("  4) Delete secret")
+        print("  5) Migrate vault salt")
+        print("  q) Quit")
+
+        try:
+            choice = input("\n  > ").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print("\n  Done.")
+            break
+
+        try:
+            if choice in ("1", "list"):
+                cmd_list(v)
+            elif choice in ("2", "add"):
+                cmd_add(v)
+            elif choice in ("3", "check"):
+                cmd_check(v)
+            elif choice in ("4", "delete"):
+                cmd_delete(v)
+            elif choice in ("5", "migrate"):
+                cmd_migrate_salt(v)
+            elif choice in ("q", "quit", "exit"):
+                print("  Done.")
+                break
+            else:
+                print("  Invalid choice.")
+        except (KeyboardInterrupt, EOFError):
+            # Ctrl-C / Ctrl-D mid-operation → abandon it, back to the menu.
+            print("\n  Cancelled — back to menu.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\n  Done.")

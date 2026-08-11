@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 264" fill="none">
+  <!-- kbots mascot: screen-headed bot on a stick body with a dome base -->
+  <!-- neck -->
+  <path d="M120 112 L122 180" stroke="#7d8695" stroke-width="7" stroke-linecap="round"/>
+  <!-- arms (slightly askew) -->
+  <path d="M48 168 L119 159" stroke="#7d8695" stroke-width="7" stroke-linecap="round"/>
+  <path d="M125 156 L194 144" stroke="#7d8695" stroke-width="7" stroke-linecap="round"/>
+  <!-- dome base -->
+  <path d="M74 250 C 76 212 96 188 121 187 C 146 188 166 210 172 248" stroke="#7d8695" stroke-width="7" stroke-linecap="round"/>
+  <!-- screen head, tilted a touch -->
+  <g transform="rotate(-2 120 72)">
+    <rect x="58" y="30" width="124" height="84" rx="20" fill="#0a0a0f" stroke="#7d8695" stroke-width="7"/>
+    <ellipse cx="100" cy="74" rx="8.5" ry="13" fill="#ff4444" transform="rotate(-5 100 74)"/>
+    <ellipse cx="140" cy="70" rx="8.5" ry="13" fill="#ff6b6b" transform="rotate(6 140 70)"/>
+  </g>
+</svg>

@@ -1,0 +1,32 @@
+name: meet
+description: Create an instant Google Meet and share the link
+parameters:
+  topic:
+    type: string
+    description: What the meeting is about (optional)
+    required: false
+  attendees:
+    type: string
+    description: Who to invite — names or emails, comma-separated (optional)
+    required: false
+  duration:
+    type: string
+    description: Duration in minutes (default 60)
+    required: false
+prompt: |
+  Create an instant Google Meet using the meet_create tool.
+
+  Meeting topic: {topic}
+  Attendees: {attendees}
+  Duration: {duration}
+
+  If no topic was given, use "Quick Meeting". If no duration given, default to 60.
+
+  IMPORTANT: Only invite attendees that the user explicitly listed. Do NOT add anyone the user did not name. If no attendees were specified, pass an empty attendees string — do not guess or auto-invite anyone.
+
+  If attendees were given as names (not emails), resolve their emails from the team roster via memory_search. If you cannot find an email, tell the user rather than guessing.
+
+  Call meet_create with the appropriate parameters. Share the Meet join link in your response. That's it — nothing else.
+tools:
+  - meet_create
+  - memory_search

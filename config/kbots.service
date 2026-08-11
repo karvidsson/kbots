@@ -1,0 +1,48 @@
+# kbots — systemd service template
+
+[Unit]
+Description=kbots Agent System
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+TimeoutStopSec=90
+Type=simple
+User=kbots
+Group=kbots
+WorkingDirectory=/opt/kbots
+ExecStart=/usr/local/bin/uv run --no-sync python -m src.main
+Restart=always
+RestartSec=10
+# HOME and PATH are set dynamically by setup.sh based on the service account
+Environment=HOME=%h
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# Sandboxing
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateDevices=true
+PrivateTmp=false
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+UMask=0077
+RestrictNamespaces=true
+RestrictRealtime=true
+SystemCallArchitectures=native
+SystemCallFilter=~@mount @reboot @swap @debug @obsolete @cpu-emulation @raw-io
+CapabilityBoundingSet=
+LockPersonality=true
+RemoveIPC=true
+ReadWritePaths=/opt/kbots/data /opt/kbots/agents /opt/kbots/config /tmp %h/.cache %h/.claude
+ReadOnlyPaths=/opt/kbots
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kbots
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,49 @@
+name: rotate_token
+description: Reset a Discord bot's token in the Developer Portal and store the new one (macOS)
+parameters:
+  bot:
+    type: string
+    description: The bot account whose token to rotate, as named under connectors.discord.accounts in config.yaml
+    required: true
+prompt: |
+  Rotate (reset) the Discord bot token for account "{bot}" and store the new value.
+  You are on macOS with the chrome_browser tool, which drives a real Chrome already
+  logged into Discord.
+
+  IMPORTANT — vault key: the key to store under is the account's `token_key` as
+  declared in config.yaml (`connectors.discord.accounts.{bot}.token_key`). Read it
+  from the config FIRST — storing under any other key means the connector never
+  sees the new token. Use that exact key below.
+
+  Steps, IN ORDER — screenshot and verify after each browser action; if a step
+  fails, screenshot and hand the user that single step, then continue:
+
+  1. Tell the user you'll drive their Chrome to reset the token, then call
+     chrome_browser(action='grant').
+
+  2. chrome_browser(action='open',
+     url='https://discord.com/developers/applications'). Screenshot. If not logged
+     in, ask the user to log in in the visible window.
+
+  3. Open the application for "{bot}". NOTE: the app's display name in the Portal is
+     often NOT the bare account name — deployments commonly prefix or restyle app
+     names — and a partial-text click may not navigate. First read the visible app
+     tile names (get_text), pick the one matching "{bot}", then click its EXACT name
+     and confirm the URL changed to `.../applications/<id>/...`. If you can't tell
+     which app maps to this bot, ask the user to click the right one in the visible
+     window, then continue.
+
+  4. Open "Bot", click "Reset Token", confirm the dialog. Discord requires the
+     user's 2FA/authenticator code — you CANNOT do this. Tell the user: "Complete
+     the 2FA prompt, then copy the NEW token and paste it to me — a DM is best."
+     Do NOT read the token off the page yourself. Wait for the paste.
+
+  5. When the user pastes the new token, call vault_set_secret with the correct key
+     (the account's `token_key` from config.yaml — see the vault-key note above)
+     and secret=<the pasted token>. Tell the user to delete their message.
+
+  6. Tell the user to run /admin reboot so the bot reconnects with the new token.
+     (The old token is now invalid, so the bot is offline until the reboot.)
+tools:
+  - chrome_browser
+  - vault_set_secret
