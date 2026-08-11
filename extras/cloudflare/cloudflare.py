@@ -1,6 +1,6 @@
 """Cloudflare API tools — DNS, Workers, zones.
 
-API key from vault: CLOUDFLARE_API_TOKEN
+API token from vault: secrets/cloudflare-api-token
 All mutations are HITL-gated.
 """
 
@@ -23,7 +23,8 @@ async def _cf_api(ctx: ToolContext, path: str, method: str = "GET",
     token = (ctx.vault.get("secrets/cloudflare-api-token")
              or ctx.vault.get("CLOUDFLARE_API_TOKEN")) if ctx.vault else None
     if not token:
-        return {"error": "CLOUDFLARE_API_TOKEN not configured in vault"}
+        return {"error": "Cloudflare not configured. Add to the vault: "
+                         "secrets/cloudflare-api-token"}
 
     url = f"{CF_API}{path}"
     headers = {

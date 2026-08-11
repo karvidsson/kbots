@@ -20,9 +20,11 @@ NOTION_VERSION = "2022-06-28"
 async def _notion_api(ctx: ToolContext, path: str, method: str = "GET",
                       data: dict | None = None) -> dict:
     """Make an authenticated Notion API call."""
-    api_key = (ctx.vault.get("secrets/notion-api-key") or ctx.vault.get("NOTION_API_KEY")) if ctx.vault else None
+    api_key = (ctx.vault.get("secrets/notion-api-key")
+               or ctx.vault.get("NOTION_API_KEY")) if ctx.vault else None
     if not api_key:
-        return {"error": "NOTION_API_KEY not configured in vault"}
+        return {"error": "Notion not configured. Add to the vault: "
+                         "secrets/notion-api-key"}
 
     url = f"{NOTION_API}{path}"
     headers = {
