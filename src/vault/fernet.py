@@ -21,6 +21,28 @@ LEGACY_SALT = b"kagents-vault-salt"
 PBKDF2_ITERATIONS = 100_000
 
 
+def _normalise_key(key: str) -> str:
+    """Reduce a vault key to a canonical form for fallback lookups.
+
+    The vault is a flat dict — `secrets/` is part of the key string, not a
+    namespace or a path. Nothing enforces a convention and the codebase
+    genuinely uses three (`secrets/cloudflare-api-token`, `github-token`,
+    `CLOUDFLARE_API_TOKEN`), so an operator cannot infer the right name from
+    the ones they can see. They save `cloudflare-api-token`, every Cloudflare
+    tool reports "not configured", and the value is sitting in the vault the
+    whole time under a near-identical name — in a store you cannot easily
+    inspect. That cost two agents ~20 minutes each before it was diagnosed.
+
+    Normalising on *lookup* rather than on save means existing vaults are
+    fixed without being rewritten, and no secret is ever re-encrypted or moved
+    to repair a name.
+    """
+    k = key.strip()
+    if k.casefold().startswith("secrets/"):
+        k = k[len("secrets/"):]
+    return k.casefold().replace("_", "-")
+
+
 class FernetVault(VaultBackend):
     """Fernet-encrypted credential vault."""
     name = "fernet"
@@ -112,8 +134,43 @@ class FernetVault(VaultBackend):
         logger.info(f"Vault loaded from environment: {len(self._secrets)} secrets")
 
     def get(self, key: str) -> str | None:
-        """Get a secret by key."""
-        return self._secrets.get(key)
+        """Get a secret by key, preferring an exact match.
+
+        Falls back to a normalised match, so `cloudflare-api-token`,
+        `CLOUDFLARE_API_TOKEN` and `secrets/cloudflare-api-token` all resolve to
+        the same secret. See `_normalise_key` for why that is worth doing.
+
+        An exact match always wins, so this can only ever turn a miss into a
+        hit — it never changes which value an already-working lookup returns.
+        """
+        value = self._secrets.get(key)
+        if value is not None:
+            return value
+
+        target = _normalise_key(key)
+        matches = [k for k in self._secrets if _normalise_key(k) == target]
+
+        if len(matches) == 1:
+            logger.info(
+                f"Vault: '{key}' not found, resolved to '{matches[0]}' by name "
+                f"normalisation. Rename it to '{key}' to silence this.")
+            return self._secrets[matches[0]]
+
+        if len(matches) > 1:
+            # Two distinct stored keys normalise the same (e.g. 'github-token'
+            # and 'secrets/github-token'). Picking one would risk handing out
+            # the wrong credential silently, so refuse and name them both. This
+            # is not a regression: the exact lookup already missed, so the
+            # caller was getting None either way — now they get a reason.
+            logger.warning(
+                f"Vault: '{key}' not found, and {len(matches)} stored keys are "
+                f"ambiguous matches ({', '.join(sorted(matches))}). Refusing to "
+                f"guess — rename one of them to '{key}'.")
+            return None
+
+        logger.debug(
+            f"Vault: '{key}' not found (vault holds {len(self._secrets)} keys)")
+        return None
 
     def set(self, key: str, value: str) -> None:
         """Set a secret and persist to disk."""

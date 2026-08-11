@@ -3,11 +3,15 @@
 from pathlib import Path
 
 from src.core.base import resolve_config_file, resolve_vault_key_file
-from src.vault.fernet import FernetVault
+from src.vault.fernet import FernetVault, _normalise_key
 
 KEY_FILE = resolve_vault_key_file()
 
-# Common secrets for Core tools — deployments can add their own via "Custom key"
+# The canonical name for every secret Core tools read. Keep this in step with
+# the vault.get() call sites: a key missing from here is a key an operator has
+# to guess, and guessing is what this list exists to prevent. Deployments can
+# still add their own via "Custom key" — per-bot tokens like
+# "discord-token-atlas" are looked up dynamically and belong nowhere in here.
 ALL_KEYS = [
     # Discord (one per bot account)
     "discord-token",
@@ -18,13 +22,39 @@ ALL_KEYS = [
     "secrets/google-api-credentials.json",
     # Web search
     "secrets/tavily-api-key",
+    "secrets/serpapi-key",
     # Integrations
     "secrets/cloudflare-api-token",
     "secrets/notion-api-key",
     "secrets/trello-credentials.json",
+    # Messaging
+    "secrets/slack-bot-token",
+    "secrets/telegram-bot-token",
+    "secrets/twilio-account-sid",
+    "secrets/twilio-auth-token",
+    "secrets/twilio-from-number",
     # GitHub
     "github-token",
 ]
+
+
+def canonical_for(key: str) -> str | None:
+    """The canonical spelling of `key`, if it is a known secret spelt oddly.
+
+    Catches the mistake at the point it is made: someone types
+    "cloudflare-api-token" (or "CLOUDFLARE_API_TOKEN"), it saves fine, and days
+    later every Cloudflare tool says "not configured" while the value sits in
+    the vault under a near-identical name.
+
+    Deliberately narrow. It only fires when the typed name normalises to
+    exactly one entry in ALL_KEYS and differs from it, so genuinely custom keys
+    — per-bot tokens, deployment-specific secrets, anything looked up
+    dynamically — are never second-guessed.
+    """
+    if key in ALL_KEYS:
+        return None
+    matches = {k for k in ALL_KEYS if _normalise_key(k) == _normalise_key(key)}
+    return matches.pop() if len(matches) == 1 else None
 
 
 def get_vault():
@@ -77,8 +107,19 @@ def cmd_add(v):
         print("  No key provided, aborting.")
         return
 
-    existing = v.get(key)
-    if existing:
+    typed = key
+    canonical = canonical_for(key)
+    if canonical:
+        print(f"\n  ⚠️  Nothing reads '{key}'. The name Core looks up is '{canonical}'.")
+        print("      Saving under the name you typed would appear to work and then")
+        print("      report 'not configured' at first use.")
+        if input(f"      Save as '{canonical}' instead? [Y/n]: ").strip().lower() not in ("n", "no"):
+            key = canonical
+
+    # Exact, not v.get(): lookups fall back to a normalised match, so v.get()
+    # would report a differently-spelt key as "already exists" and then write a
+    # second one beside it.
+    if key in v.list_keys():
         confirm = input(f"  '{key}' already exists. Overwrite? [y/N]: ").strip().lower()
         if confirm != "y":
             print("  Skipped.")
@@ -91,6 +132,14 @@ def cmd_add(v):
 
     v.set(key, value)
     print(f"  Saved '{key}'. Total secrets: {len(v.list_keys())}")
+
+    # Renaming leaves the old spelling behind holding a stale credential, which
+    # is worth clearing: two keys that differ only in spelling are exactly what
+    # makes a lookup ambiguous later.
+    if key != typed and typed in v.list_keys():
+        if input(f"  Remove the old '{typed}'? [Y/n]: ").strip().lower() not in ("n", "no"):
+            v.delete(typed)
+            print(f"  Removed '{typed}'. Total secrets: {len(v.list_keys())}")
 
 
 def cmd_delete(v):
