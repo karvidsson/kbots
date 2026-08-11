@@ -269,7 +269,7 @@ main() {
     log "✅ migration complete — install: $INSTALL"
     log "   backup kept at: $BACKUP (delete once you're confident)"
     log "   NOTE: re-point your git remote after the GitHub repo rename:"
-    log "   git remote set-url origin https://github.com/arvidsson-geins/kbots.git"
+    log "   git remote set-url origin https://github.com/karvidsson/kbots.git"
 }
 
 main "$@"

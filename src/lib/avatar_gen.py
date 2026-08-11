@@ -143,7 +143,7 @@ def upload_discord_avatar(png_path: Path, token: str) -> tuple[bool, str]:
         headers={
             "Authorization": f"Bot {token}",
             "Content-Type": "application/json",
-            "User-Agent": "kbots (https://github.com/arvidsson-geins/kbots, 1.0)",
+            "User-Agent": "kbots (https://github.com/karvidsson/kbots, 1.0)",
         },
         method="PATCH",
     )

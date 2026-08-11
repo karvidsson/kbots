@@ -45,7 +45,7 @@
     <!-- text block -->
     <g font-family="'JetBrains Mono','Fira Code','SF Mono',Menlo,Consolas,monospace">
       <text x="330" y="96" font-size="19" letter-spacing="1">
-        <tspan fill="#ff4444">//</tspan><tspan fill="#666c76"> arvidsson-geins/kbots</tspan>
+        <tspan fill="#ff4444">//</tspan><tspan fill="#666c76"> karvidsson/kbots</tspan>
       </text>
       <text x="326" y="176" font-size="86" font-weight="700" letter-spacing="2">
         <tspan fill="#ff4444">k</tspan><tspan fill="#ffffff">bots</tspan>

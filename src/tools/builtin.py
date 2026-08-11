@@ -129,7 +129,7 @@ async def send_message(ctx: ToolContext, channel_id: str, content: str, bot: str
             headers = {
                 "Authorization": f"Bot {token}",
                 "Content-Type": "application/json",
-                "User-Agent": "DiscordBot (https://github.com/arvidsson-geins/kbots, 1.0)",
+                "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
             }
             # Split long messages (Discord 2000 char limit)
             chunks = [content[i:i+2000] for i in range(0, len(content), 2000)]
