@@ -12,7 +12,7 @@ import importlib
 
 import pytest
 
-from src.vault.fernet import FernetVault, _normalise_key
+from src.vault.fernet import FernetVault, _normalise_key, describe_value_faults
 
 vault_manage = importlib.import_module("vault-manage")
 
@@ -137,3 +137,103 @@ def test_canonical_keys_are_the_ones_core_actually_reads():
                      "secrets/serpapi-key", "secrets/slack-bot-token",
                      "secrets/telegram-bot-token", "discord-token", "github-token"):
         assert expected in vault_manage.ALL_KEYS
+
+
+# --- malformed values ------------------------------------------------------
+#
+# The adjacent failure: a correctly-named key holding a value that cannot work.
+# The real case was a Cloudflare token containing U+0442 CYRILLIC SMALL LETTER
+# TE — HTTP headers are latin-1, so the request could not be built and the tool
+# died with a codec error that never mentioned credentials.
+
+# The reported shape: 53 chars, Cyrillic 'т' at index 5.
+_CORRUPT_TOKEN = "abcdeт" + "x" * 47
+
+
+def test_a_good_token_has_no_faults():
+    for fine in ("cf-abc123_XYZ-456", "ghp_" + "a" * 36, "{}", "a"):
+        assert describe_value_faults(fine) == []
+
+
+def test_the_reported_cyrillic_token_is_flagged():
+    faults = describe_value_faults(_CORRUPT_TOKEN)
+    assert len(faults) == 1
+    assert "non-ASCII" in faults[0]
+    assert "index 5" in faults[0]
+    assert "CYRILLIC SMALL LETTER TE" in faults[0]
+
+
+def test_fault_reports_never_contain_the_secret():
+    """This has to be safe to log and safe to paste, or it will not get run."""
+    secret = "  sk-live-SUPERSECRETтVALUE  "
+    blob = " ".join(describe_value_faults(secret))
+    assert blob                                        # sanity: it did report
+    for leak in ("SUPERSECRET", "sk-live", secret.strip()):
+        assert leak not in blob
+
+
+def test_trailing_newline_is_flagged():
+    """The classic copy-paste fault — surfaces as a 401 that reads as perms."""
+    faults = describe_value_faults("cf-token-abc\n")
+    assert len(faults) == 1 and "trailing whitespace" in faults[0]
+
+    both = describe_value_faults("  cf-token-abc  ")
+    assert "leading and trailing" in both[0]
+
+
+def test_many_bad_characters_are_summarised_not_transcribed():
+    """A mostly-non-ASCII value must not be spelt out char by char in a log."""
+    faults = describe_value_faults("абвгдежзий")
+    assert "10 non-ASCII" in faults[0]
+    assert "and 7 more" in faults[0]
+    assert faults[0].count("index ") == 3
+
+
+def test_get_warns_once_about_a_malformed_value(caplog):
+    v = _vault(**{"secrets/cloudflare-api-token": _CORRUPT_TOKEN})
+    with caplog.at_level("WARNING"):
+        assert v.get("secrets/cloudflare-api-token") == _CORRUPT_TOKEN
+    assert "CYRILLIC" in caplog.text
+    assert caplog.text.count("CYRILLIC") == 1
+
+    # Repeated lookups must not repeat the warning — a warning on a hot path is
+    # a warning people filter out.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        for _ in range(5):
+            v.get("secrets/cloudflare-api-token")
+    assert caplog.text == ""
+
+
+def test_malformed_value_is_still_returned_intact():
+    """Flag it, never silently repair or withhold it."""
+    v = _vault(**{"k": "  tokт  "})
+    assert v.get("k") == "  tokт  "
+
+
+def test_warning_survives_resolution_by_normalisation(caplog):
+    """Both new checks must compose: wrong name AND bad value."""
+    v = _vault(**{"cloudflare-api-token": _CORRUPT_TOKEN})
+    with caplog.at_level("INFO"):
+        assert v.get("secrets/cloudflare-api-token") == _CORRUPT_TOKEN
+    assert "normalisation" in caplog.text        # name was rescued
+    assert "CYRILLIC" in caplog.text             # value still flagged
+
+
+def test_set_warns_and_still_stores(caplog):
+    v = _vault()
+    with caplog.at_level("WARNING"):
+        v.set("secrets/cloudflare-api-token", _CORRUPT_TOKEN)
+    assert "CYRILLIC" in caplog.text
+    assert v._secrets["secrets/cloudflare-api-token"] == _CORRUPT_TOKEN
+
+
+def test_set_reruns_the_check_after_a_fix(caplog):
+    """Correcting a value must not be silently masked by the warn-once cache."""
+    v = _vault(**{"k": _CORRUPT_TOKEN})
+    v.get("k")                                   # warns, caches
+    v.set("k", "clean-token")
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        assert v.get("k") == "clean-token"
+    assert caplog.text == ""                     # clean value, nothing to say

@@ -3,7 +3,7 @@
 from pathlib import Path
 
 from src.core.base import resolve_config_file, resolve_vault_key_file
-from src.vault.fernet import FernetVault, _normalise_key
+from src.vault.fernet import FernetVault, _normalise_key, describe_value_faults
 
 KEY_FILE = resolve_vault_key_file()
 
@@ -157,10 +157,69 @@ def cmd_delete(v):
 
 def cmd_check(v):
     key = input("  Key to check: ").strip()
-    if v.get(key):
-        print(f"  '{key}' = exists ({len(v.get(key))} chars)")
-    else:
+    val = v.get(key)
+    if not val:
         print(f"  '{key}' = NOT FOUND")
+        return
+    exact = "" if key in v.list_keys() else "  (resolved by name normalisation)"
+    print(f"  '{key}' = exists ({len(val)} chars){exact}")
+    # "Exists" is not the same as "works" — say so here rather than let a tool
+    # discover it later as a codec error.
+    for fault in describe_value_faults(val):
+        print(f"    ⚠️  {fault}")
+
+
+def cmd_health(v):
+    """Report keys that are misspelt, duplicated, or hold an unusable value.
+
+    Exists because both failure modes are invisible until a tool dies far away
+    from the vault: a name nothing reads reports "not configured", and a value
+    containing non-ASCII kills the HTTP request with a codec error that never
+    mentions credentials. Values are never printed — only their shape.
+    """
+    keys = sorted(v.list_keys())
+    problems = 0
+
+    groups: dict[str, list[str]] = {}
+    for k in keys:
+        groups.setdefault(_normalise_key(k), []).append(k)
+
+    dupes = {n: ks for n, ks in groups.items() if len(ks) > 1}
+    if dupes:
+        print("\n  Duplicate keys — these differ only in spelling:")
+        for norm, ks in sorted(dupes.items()):
+            problems += 1
+            print(f"    {norm}: {', '.join(ks)}")
+        print("    A lookup matching one exactly still works, but any lookup that")
+        print("    matches none of them exactly is ambiguous and returns nothing.")
+        print("    Worse, updating one leaves the others holding a stale credential.")
+        print("    Keep one and delete the rest.")
+
+    misnamed = [(k, canonical_for(k)) for k in keys]
+    misnamed = [(k, c) for k, c in misnamed if c]
+    if misnamed:
+        print("\n  Keys nothing reads — the name Core looks up differs:")
+        for k, c in misnamed:
+            problems += 1
+            print(f"    {k}  ->  should be  {c}")
+
+    bad_values = [(k, describe_value_faults(v.get(k) or "")) for k in keys]
+    bad_values = [(k, f) for k, f in bad_values if f]
+    if bad_values:
+        print("\n  Malformed values — present and findable, but unusable:")
+        for k, faults in bad_values:
+            problems += 1
+            for fault in faults:
+                print(f"    {k}: {fault}")
+        print("    HTTP headers are latin-1, so a non-ASCII character stops the")
+        print("    request being built at all; stray whitespace usually surfaces")
+        print("    as a 401 that reads like a permissions problem. Re-paste, or")
+        print("    mint a fresh credential.")
+
+    if problems:
+        print(f"\n  {problems} problem(s) across {len(keys)} secrets.\n")
+    else:
+        print(f"\n  No problems found across {len(keys)} secrets.\n")
 
 
 def cmd_migrate_salt(v):
@@ -202,7 +261,8 @@ def main():
         print("  2) Add/update secret")
         print("  3) Check if secret exists")
         print("  4) Delete secret")
-        print("  5) Migrate vault salt")
+        print("  5) Check all keys and values for problems")
+        print("  6) Migrate vault salt")
         print("  q) Quit")
 
         try:
@@ -220,7 +280,9 @@ def main():
                 cmd_check(v)
             elif choice in ("4", "delete"):
                 cmd_delete(v)
-            elif choice in ("5", "migrate"):
+            elif choice in ("5", "health", "doctor"):
+                cmd_health(v)
+            elif choice in ("6", "migrate"):
                 cmd_migrate_salt(v)
             elif choice in ("q", "quit", "exit"):
                 print("  Done.")

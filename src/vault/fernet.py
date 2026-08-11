@@ -43,6 +43,63 @@ def _normalise_key(key: str) -> str:
     return k.casefold().replace("_", "-")
 
 
+# How many bad characters to name individually before summarising the rest. A
+# token with one stray character wants that character pinpointed; a value that
+# is mostly non-ASCII wants a count, not a transcript of itself in the logs.
+_MAX_REPORTED_CHARS = 3
+
+
+def describe_value_faults(value: str) -> list[str]:
+    """Faults that make a stored secret unusable, described without leaking it.
+
+    A correctly-named key can still hold a value that cannot work. One real
+    case: a Cloudflare token containing U+0442 CYRILLIC SMALL LETTER TE. HTTP
+    headers must be latin-1, so the request could not even be constructed — the
+    tool died with "'latin-1' codec can't encode character 'т' in position 12"
+    four calls away from anything mentioning the vault. The credential was
+    present, correctly named, and found; it was simply unusable.
+
+    Reported faults are limited to the shape of the value — length, positions,
+    codepoint names — which identifies the problem while revealing essentially
+    nothing about the secret. That is the point: this has to be safe to log and
+    safe to print, or it will not be run when it is needed.
+
+    Warnings, never refusals. The vault is a general-purpose store; some keys
+    legitimately hold JSON credential blobs that may contain non-ASCII, and
+    locking an operator out of saving a value is worse than telling them it
+    looks wrong.
+    """
+    import unicodedata
+
+    faults: list[str] = []
+
+    if value != value.strip():
+        where = []
+        if value != value.lstrip():
+            where.append("leading")
+        if value != value.rstrip():
+            where.append("trailing")
+        # The classic copy-paste newline. Silent, and it surfaces as a 401 that
+        # reads like a permissions problem rather than a formatting one.
+        faults.append(f"{' and '.join(where)} whitespace "
+                      f"(length {len(value)}, {len(value.strip())} once stripped)")
+
+    non_ascii = [(i, c) for i, c in enumerate(value) if ord(c) > 127]
+    if non_ascii:
+        shown = ", ".join(
+            f"index {i}: {hex(ord(c))} {unicodedata.name(c, 'UNNAMED')}"
+            for i, c in non_ascii[:_MAX_REPORTED_CHARS])
+        more = len(non_ascii) - _MAX_REPORTED_CHARS
+        if more > 0:
+            shown += f", and {more} more"
+        # No API token, account id or bot token legitimately contains one. It is
+        # a typed-not-pasted tell, or a homoglyph substitution, and HTTP headers
+        # cannot carry it at all.
+        faults.append(f"{len(non_ascii)} non-ASCII character(s) — {shown}")
+
+    return faults
+
+
 class FernetVault(VaultBackend):
     """Fernet-encrypted credential vault."""
     name = "fernet"
@@ -56,6 +113,9 @@ class FernetVault(VaultBackend):
         self._secrets: dict[str, str] = {}
         self._fernet: Fernet | None = None
         self._unlocked = False
+        # Keys already reported as malformed, so a bad value is flagged once per
+        # process instead of on every lookup on a hot path.
+        self._warned_faults: set[str] = set()
 
     @property
     def is_unlocked(self) -> bool:
@@ -142,10 +202,14 @@ class FernetVault(VaultBackend):
 
         An exact match always wins, so this can only ever turn a miss into a
         hit — it never changes which value an already-working lookup returns.
+
+        The value is also checked for faults on first use, because existing
+        vaults already hold malformed secrets that nothing has ever complained
+        about.
         """
         value = self._secrets.get(key)
         if value is not None:
-            return value
+            return self._checked(key, value)
 
         target = _normalise_key(key)
         matches = [k for k in self._secrets if _normalise_key(k) == target]
@@ -154,7 +218,7 @@ class FernetVault(VaultBackend):
             logger.info(
                 f"Vault: '{key}' not found, resolved to '{matches[0]}' by name "
                 f"normalisation. Rename it to '{key}' to silence this.")
-            return self._secrets[matches[0]]
+            return self._checked(matches[0], self._secrets[matches[0]])
 
         if len(matches) > 1:
             # Two distinct stored keys normalise the same (e.g. 'github-token'
@@ -172,9 +236,32 @@ class FernetVault(VaultBackend):
             f"Vault: '{key}' not found (vault holds {len(self._secrets)} keys)")
         return None
 
+    def _checked(self, stored_key: str, value: str) -> str:
+        """Return `value`, reporting a malformed one the first time it is used.
+
+        Once per key per process: a caller on a hot path should not pay for this
+        check repeatedly, and a repeated warning is a warning people filter out.
+        """
+        if stored_key in self._warned_faults:
+            return value
+        self._warned_faults.add(stored_key)
+        for fault in describe_value_faults(value):
+            logger.warning(
+                f"Vault: the stored value for '{stored_key}' has {fault}. "
+                f"Tools using it will fail somewhere that does not mention the "
+                f"vault at all.")
+        return value
+
     def set(self, key: str, value: str) -> None:
-        """Set a secret and persist to disk."""
+        """Set a secret and persist to disk.
+
+        A malformed value is flagged, not rejected — see `describe_value_faults`.
+        """
+        for fault in describe_value_faults(value):
+            logger.warning(f"Vault: value for '{key}' has {fault}. This is "
+                           f"stored as given, but it is very unlikely to work.")
         self._secrets[key] = value
+        self._warned_faults.discard(key)
         self._persist()
 
     def delete(self, key: str) -> bool:
