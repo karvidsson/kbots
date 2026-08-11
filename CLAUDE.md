@@ -93,7 +93,7 @@ No output means the tree is clean; anything listed needs `sudo chown -R kbots:kb
 This repository holds **Layer 1 (Core)**: the open-source engine that every deployment loads.
 
 ```
-Layer 1: arvidsson-geins/kbots      (this repo, public)  — Core engine + generic tools
+Layer 1: karvidsson/kbots      (this repo, public)  — Core engine + generic tools
 Layer 2: (private repo)                           — Domain-specific tools/skills
 Layer 3: (private repo)                           — Per-deployment config, agents, data
 ```

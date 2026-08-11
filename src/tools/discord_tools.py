@@ -37,7 +37,7 @@ def _discord_headers(vault, bot: str = "") -> dict | None:
         return None
     return {
         "Authorization": f"Bot {token}",
-        "User-Agent": "DiscordBot (https://github.com/arvidsson-geins/kbots, 1.0)",
+        "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
     }
 
 
@@ -284,7 +284,7 @@ async def send_discord_file(
 
     headers = {
         "Authorization": f"Bot {token}",
-        "User-Agent": "DiscordBot (https://github.com/arvidsson-geins/kbots, 1.0)",
+        "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
     }
 
     async with aiohttp.ClientSession() as session:

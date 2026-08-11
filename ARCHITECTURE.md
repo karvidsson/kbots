@@ -97,7 +97,7 @@ Layer 3 (Overlay): $KBOTS_OVERLAY        ← This deployment's config, agents, d
 For anyone who isn't a maintainer, running `setup.py` after cloning Core rewires git: the `origin` remote becomes `upstream` and its push URL is disabled. With no pushable remote left, neither an agent nor a user can accidentally publish deployment data to the public Core repo.
 
 ```
-origin  → upstream (fetch: github.com/arvidsson-geins/kbots, push: blocked)
+origin  → upstream (fetch: github.com/karvidsson/kbots, push: blocked)
 origin  → (unset — nothing to push to by default)
 ```
 
@@ -117,7 +117,7 @@ There are two ways to lay out a kbots deployment, and both keep Core untouched. 
 This is the minimal setup: the engine lives in one repo, and a second repo (or plain directory) holds everything unique to the install — config, agents, custom tools and skills, systemd units, and data.
 
 ```
-Layer 1 (Core):    /opt/kbots              ← git clone of arvidsson-geins/kbots (or your fork)
+Layer 1 (Core):    /opt/kbots              ← git clone of karvidsson/kbots (or your fork)
 Layer 3 (Overlay): /opt/kbots-myproject    ← your private repo with config + agents + tools
 ```
 
