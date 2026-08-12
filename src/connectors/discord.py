@@ -51,6 +51,8 @@ class DiscordConnector(Connector):
         self._skills: dict[str, Any] = {}
         # Duplicate message detection: channel_id -> (content, timestamp)
         self._recent_sends: dict[str, tuple[str, float]] = {}
+        # Outgoing mention resolution: (guild_id, name_lower) -> (markup|None, timestamp)
+        self._mention_cache: dict[tuple[int, str], tuple[str | None, float]] = {}
 
     def set_agent_configs(self, agent_configs: dict[str, dict]) -> None:
         """Set agent configs so the connector knows which agents route to which bots."""
@@ -159,6 +161,11 @@ class DiscordConnector(Connector):
                     else:
                         logger.warning(f"File not found for attachment: {fpath}")
 
+        # Linkify plain-text @Name into real mention markup. Agents write
+        # natural "@Data.Bot can you…" — as plain text that never pings, and a
+        # mentions-only bot never hears it. Resolve names against the guild.
+        content = await self._linkify_mentions(content, channel)
+
         # Auto-mention: when replying to a bot, prepend @mention so they can hear us
         if reply_to and isinstance(reply_to, discord.Message) and reply_to.author.bot:
             mention = f"<@{reply_to.author.id}>"
@@ -192,6 +199,87 @@ class DiscordConnector(Connector):
                 first_msg = sent
 
         return first_msg
+
+    # Plain-text mention token: one or two words after @ (covers names like
+    # "Data.Bot" and "Engineer Bot"). Not preceded by a word char or '<', so
+    # emails and existing <@id> markup never match.
+    _MENTION_TOKEN = re.compile(r"(?<![\w<])@([\w.\-]+(?: [\w.\-]+)?)")
+    _CODE_SPAN = re.compile(r"(```.*?```|`[^`\n]*`)", re.DOTALL)
+    _MENTION_NEG_TTL = 300.0  # retry failed lookups — members join mid-conversation
+
+    async def _linkify_mentions(self, content: str, channel) -> str:
+        """Convert plain-text @Name tokens to real <@id>/<@&id> markup.
+
+        LLM output addresses people as "@Data.Bot" — literal text Discord never
+        turns into a ping. Names are resolved against guild roles and members;
+        unresolvable tokens are left untouched. Code blocks are skipped.
+        """
+        guild = getattr(channel, "guild", None)
+        if not guild or "@" not in content:
+            return content
+        out = []
+        for part in self._CODE_SPAN.split(content):
+            if part.startswith("`"):
+                out.append(part)
+            else:
+                out.append(await self._linkify_segment(part, guild))
+        return "".join(out)
+
+    async def _linkify_segment(self, text: str, guild) -> str:
+        result: list[str] = []
+        last = 0
+        for m in self._MENTION_TOKEN.finditer(text):
+            token = m.group(1)
+            # Try the full (possibly two-word) capture, then the first word
+            candidates = [token]
+            if " " in token:
+                candidates.append(token.split(" ", 1)[0])
+            for cand in candidates:
+                if cand.lower() in ("everyone", "here"):
+                    break
+                markup = await self._resolve_mention(guild, cand)
+                if markup:
+                    result.append(text[last:m.start()])
+                    result.append(markup)
+                    last = m.start() + 1 + len(cand)  # +1 for the '@'
+                    break
+        result.append(text[last:])
+        return "".join(result)
+
+    async def _resolve_mention(self, guild, name: str) -> str | None:
+        """Name -> mention markup via roles, member cache, then HTTP search."""
+        low = name.lower()
+        key = (guild.id, low)
+        cached = self._mention_cache.get(key)
+        if cached:
+            markup, ts = cached
+            if markup is not None or (time.monotonic() - ts) < self._MENTION_NEG_TTL:
+                return markup
+        markup = None
+        for role in getattr(guild, "roles", []):
+            if role.name.lower() == low:
+                markup = f"<@&{role.id}>"
+                break
+        if markup is None:
+            for member in getattr(guild, "members", []):
+                if member.display_name.lower() == low or member.name.lower() == low:
+                    markup = f"<@{member.id}>"
+                    break
+        if markup is None and hasattr(guild, "search_members"):
+            # HTTP prefix search — works without the privileged members intent,
+            # which this client does not request (member cache is disabled).
+            try:
+                for member in await guild.search_members(name, limit=10):
+                    if member.display_name.lower() == low or member.name.lower() == low:
+                        markup = f"<@{member.id}>"
+                        break
+            except Exception as e:
+                logger.debug(f"Member search for {name!r} failed: {e}")
+                return None  # transient failure — don't negative-cache
+        if len(self._mention_cache) > 512:
+            self._mention_cache.clear()
+        self._mention_cache[key] = (markup, time.monotonic())
+        return markup
 
     async def _send_interaction_response(
         self, interaction: discord.Interaction, content: str, ephemeral: bool
