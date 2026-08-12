@@ -26,6 +26,10 @@ git push -u origin fix/short-description
 gh pr create
 ```
 
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/):
+`type(scope): summary`, with types `feat`, `fix`, `docs`, `chore`, `refactor`,
+`test`, `perf`, `ci` — matching the branch-name prefixes above.
+
 For engine changes, a quick way to test end-to-end without touching a live
 install is the dev harness: `uv run python scripts/dev.py chat --mock`.
 

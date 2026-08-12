@@ -135,6 +135,9 @@ gh pr create                           # PR for cross-review
 
 ### Commit rules
 
+- Commit messages follow **Conventional Commits**: `type(scope): summary` — types are
+  `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `ci`. Scope is optional;
+  summary is imperative and lowercase (e.g. `feat(discord): thread replies in approvals`)
 - Every change lands through a **cross-reviewed PR** approved by a maintainer
 - Never use `--no-verify` to sidestep the pre-commit hook guarding `main`
 - Check the diff for personal names, company names, and numeric IDs before every commit
