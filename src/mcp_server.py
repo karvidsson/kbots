@@ -113,7 +113,7 @@ class MCPHitlGate:
         headers = {
             "Authorization": f"Bot {token}",
             "Content-Type": "application/json",
-            "User-Agent": "DiscordBot (https://github.com/arvidsson-geins/kbots, 1.0)",
+            "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
         }
         api = "https://discord.com/api/v10"
 

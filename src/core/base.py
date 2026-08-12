@@ -70,6 +70,8 @@ class IncomingMessage:
     user_id: str
     user_name: str
     content: str
+    # Human-readable channel name, when the platform has one (None for DMs)
+    channel_name: str | None = None
     attachments: list[Attachment] = field(default_factory=list)
     reply_to: str | None = None
     raw: Any = None

@@ -437,6 +437,9 @@ class AgentManager:
 
         # Inject channel context
         channel_context = f"<channel id=\"{message.channel_id}\" connector=\"{message.connector}\""
+        if message.channel_name:
+            safe_name = message.channel_name.replace("&", "&amp;").replace('"', "&quot;")
+            channel_context += f" name=\"{safe_name}\""
         if message.bot_account:
             channel_context += f" bot=\"{message.bot_account}\""
         channel_context += " />"

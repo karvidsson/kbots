@@ -211,7 +211,7 @@ def validate_discord_token(token: str) -> dict | None:
             "https://discord.com/api/v10/users/@me",
             headers={
                 "Authorization": f"Bot {token.strip()}",
-                "User-Agent": "DiscordBot (https://github.com/arvidsson-geins/kbots, 1.0)",
+                "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
             },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
