@@ -590,6 +590,25 @@ class DiscordBot:
             return True
         return False
 
+    def _render_mentions(self, message: discord.Message) -> str:
+        """Replace raw mention markup with readable @names.
+
+        Discord delivers mentions as <@id>/<@!id>/<@&id>/<#id>; the numeric
+        IDs are opaque to the LLM. Resolve every mention this message carries
+        — including the bot's own, so multi-party sentences stay grammatical.
+        Mentions of users outside the resolved lists stay as raw markup.
+        """
+        content = message.content
+        for user in message.mentions:
+            name = getattr(user, "display_name", None) or user.name
+            for pattern in (f"<@{user.id}>", f"<@!{user.id}>"):
+                content = content.replace(pattern, f"@{name}")
+        for role in message.role_mentions:
+            content = content.replace(f"<@&{role.id}>", f"@{role.name}")
+        for channel in message.channel_mentions:
+            content = content.replace(f"<#{channel.id}>", f"#{channel.name}")
+        return content.strip()
+
     async def on_message(self, message: discord.Message) -> None:
         """Handle incoming Discord messages."""
         # Ignore own messages
@@ -668,14 +687,11 @@ class DiscordBot:
             logger.debug(f"[{self.account_name}] Skipping — mentions_only and not mentioned")
             return
 
-        # Strip the bot mention from the content (both @user and @role mentions)
-        content = message.content
-        if self.client.user:
-            content = content.replace(f"<@{self.client.user.id}>", "").strip()
-            content = content.replace(f"<@!{self.client.user.id}>", "").strip()
-        # Strip role mentions for the bot's role
-        for role in message.role_mentions:
-            content = content.replace(f"<@&{role.id}>", "").strip()
+        # Render mention markup as readable @names. Raw <@123…> IDs mean
+        # nothing to the LLM — in a multi-party message ("@A and @B are you
+        # both here?") stripping our own mention and leaving others as
+        # numeric IDs makes the agent guess who is being addressed.
+        content = self._render_mentions(message)
 
         # Build attachments
         attachments = [
@@ -692,6 +708,7 @@ class DiscordBot:
         await self.connector.emit(IncomingMessage(
             connector="discord",
             channel_id=str(message.channel.id),
+            channel_name=getattr(message.channel, "name", None),
             user_id=str(message.author.id),
             user_name=message.author.display_name,
             content=content,
@@ -1848,6 +1865,7 @@ class DiscordBot:
                 await _connector.emit(IncomingMessage(
                     connector="discord",
                     channel_id=str(interaction.channel_id),
+                    channel_name=getattr(interaction.channel, "name", None),
                     user_id=str(interaction.user.id),
                     user_name=interaction.user.display_name,
                     content="",

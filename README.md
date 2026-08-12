@@ -90,7 +90,7 @@ Prefer to do it by hand? Same steps:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh     # if you don't have uv yet
-git clone https://github.com/arvidsson-geins/kbots.git
+git clone https://github.com/karvidsson/kbots.git
 cd kbots
 uv sync && uv run python setup.py
 ```

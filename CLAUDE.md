@@ -93,7 +93,7 @@ No output means the tree is clean; anything listed needs `sudo chown -R kbots:kb
 This repository holds **Layer 1 (Core)**: the open-source engine that every deployment loads.
 
 ```
-Layer 1: arvidsson-geins/kbots      (this repo, public)  — Core engine + generic tools
+Layer 1: karvidsson/kbots      (this repo, public)  — Core engine + generic tools
 Layer 2: (private repo)                           — Domain-specific tools/skills
 Layer 3: (private repo)                           — Per-deployment config, agents, data
 ```
@@ -135,6 +135,9 @@ gh pr create                           # PR for cross-review
 
 ### Commit rules
 
+- Commit messages follow **Conventional Commits**: `type(scope): summary` — types are
+  `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `ci`. Scope is optional;
+  summary is imperative and lowercase (e.g. `feat(discord): thread replies in approvals`)
 - Every change lands through a **cross-reviewed PR** approved by a maintainer
 - Never use `--no-verify` to sidestep the pre-commit hook guarding `main`
 - Check the diff for personal names, company names, and numeric IDs before every commit
