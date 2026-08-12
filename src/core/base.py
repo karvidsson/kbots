@@ -72,6 +72,9 @@ class IncomingMessage:
     content: str
     # Human-readable channel name, when the platform has one (None for DMs)
     channel_name: str | None = None
+    # True when delivered only because the agent watches this channel —
+    # the message did not mention or address the agent directly
+    watched: bool = False
     attachments: list[Attachment] = field(default_factory=list)
     reply_to: str | None = None
     raw: Any = None
