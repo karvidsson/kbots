@@ -730,9 +730,29 @@ class DiscordBot:
                             is_mentioned = True
                             break
 
+        # Get routing config for this bot's agents (needed before the
+        # bot-author gate — a watched channel admits unmentioned bot messages)
+        has_category = hasattr(message.channel, 'category_id') and message.channel.category_id
+        category_id = str(message.channel.category_id) if has_category else None
+        agent_id = self.connector.get_agent_for_channel(
+            str(message.channel.id), self.account_name, category_id
+        )
+
+        if not agent_id:
+            return
+
+        agent_cfg = self.connector._agent_configs.get(agent_id, {})
+        routing = agent_cfg.get("routing", {}).get("discord", {})
+        mentions_only = routing.get("mentions", False)
+        # Watched channels: the agent hears every message here — human or bot,
+        # mentioned or not — so channel activity itself can drive its work.
+        watch_channels = {str(c) for c in (routing.get("watch_channels") or [])}
+        is_watched = str(message.channel.id) in watch_channels
+
         # Ignore bot messages unless this bot was @mentioned (user or role)
+        # or the channel is explicitly watched
         if message.author.bot:
-            if not is_mentioned:
+            if not (is_mentioned or is_watched):
                 return
 
             # Chain breaker — too many bot-triggered turns with no human around.
@@ -756,22 +776,8 @@ class DiscordBot:
             # A human spoke — the bot-to-bot chain in this channel is over.
             self._bot_chain_check(message.channel.id, from_bot=False, now=now)
 
-        # Get routing config for this bot's agents
-        has_category = hasattr(message.channel, 'category_id') and message.channel.category_id
-        category_id = str(message.channel.category_id) if has_category else None
-        agent_id = self.connector.get_agent_for_channel(
-            str(message.channel.id), self.account_name, category_id
-        )
-
-        if not agent_id:
-            return
-
-        # Check mentions-only routing
-        agent_cfg = self.connector._agent_configs.get(agent_id, {})
-        routing = agent_cfg.get("routing", {}).get("discord", {})
-        mentions_only = routing.get("mentions", False)
-
-        if mentions_only and not is_mentioned and not is_dm:
+        # Check mentions-only routing (watched channels are exempt)
+        if mentions_only and not is_mentioned and not is_dm and not is_watched:
             logger.debug(f"[{self.account_name}] Skipping — mentions_only and not mentioned")
             return
 
@@ -804,6 +810,7 @@ class DiscordBot:
             reply_to=str(message.reference.message_id) if message.reference else None,
             raw=message,
             bot_account=self.account_name,
+            watched=is_watched and not is_mentioned,
         ))
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
