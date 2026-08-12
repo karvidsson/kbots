@@ -476,6 +476,17 @@ class AgentManager:
                 "posted to the channel. When in doubt and there is real work to advance, "
                 "reply.</bot-sender-notice>"
             )
+        elif getattr(message, "watched", False):
+            # Watched-channel delivery from a human who didn't address the
+            # agent — give it a way to stay silent instead of butting in.
+            context_blocks.append(
+                "<channel-watch-notice>You received this because you watch this "
+                "channel — it was not necessarily addressed to you. Act on it or "
+                "reply when it moves your active tasks forward or clearly involves "
+                "you. Otherwise respond with exactly NO_REPLY and nothing else, "
+                "and that reply is dropped so nothing is posted to the "
+                "channel.</channel-watch-notice>"
+            )
 
         # Inject attachment info so the LLM knows about uploaded files
         # Include attachments from the current message AND any referenced (replied-to) message
