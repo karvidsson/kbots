@@ -174,6 +174,48 @@ def _extra_dir_args(extra_dirs) -> list[str]:
     return args
 
 
+def build_cli_prompt(messages: list[Message], resuming: bool = False) -> str:
+    """Flatten engine messages into a single prompt for a CLI-backed provider.
+
+    CLI agents hold their own conversation state: when resuming, only the
+    latest user message is sent. On a fresh session fed with replayed history
+    (session reset, or resume dropped), the discontinuity is made explicit —
+    otherwise the model confabulates continuity, claiming past/pending actions
+    succeeded (observed live: invented reboots and message relays).
+
+    System messages are excluded — each provider surfaces them its own way
+    (flag, identity file, or inline block).
+    """
+    if resuming:
+        for msg in reversed(messages):
+            if msg.role == MessageRole.USER:
+                return msg.content
+        return ""
+
+    parts = []
+    if any(m.role == MessageRole.ASSISTANT for m in messages):
+        parts.append(
+            "<session-note>\n"
+            "Fresh session: the conversation below is replayed from the message "
+            "store, not from your memory. Treat '[Previous response]' content as a "
+            "record that may contain unverified or mistaken claims. Do not state "
+            "that any action succeeded unless a tool result in THIS session "
+            "confirms it. If you lack a tool or the ability to do something, say "
+            "so plainly instead of describing success.\n"
+            "</session-note>"
+        )
+    for msg in messages:
+        if msg.role == MessageRole.SYSTEM:
+            continue
+        elif msg.role == MessageRole.USER:
+            parts.append(msg.content)
+        elif msg.role == MessageRole.ASSISTANT:
+            parts.append(f"[Previous response]: {msg.content}")
+        elif msg.role == MessageRole.TOOL:
+            parts.append(f"[Tool result ({msg.name})]: {msg.content}")
+    return "\n\n".join(parts)
+
+
 class ClaudeCodeProvider(LLMProvider):
     """LLM provider that uses Claude Code CLI.
 
@@ -181,6 +223,7 @@ class ClaudeCodeProvider(LLMProvider):
     Claude Code reads CLAUDE.md (stub importing AGENTS.md) for identity.
     """
     name = "claude_code"
+    reads_project_context = True
 
     def __init__(self, config: dict):
         super().__init__(config)
@@ -548,47 +591,8 @@ class ClaudeCodeProvider(LLMProvider):
             logger.warning(f"Token refresh attempt failed: {e}")
 
     def _build_prompt(self, messages: list[Message], resuming: bool = False) -> str:
-        """Build a prompt string from messages.
-
-        For Claude Code CLI, we send the user messages as the prompt.
-        System messages are handled via --system-prompt flag.
-
-        When resuming a session, only send the latest user message —
-        Claude Code already has the conversation history internally.
-        """
-        if resuming:
-            # Only the latest user message — CLI has the rest
-            for msg in reversed(messages):
-                if msg.role == MessageRole.USER:
-                    return msg.content
-            return ""
-
-        parts = []
-        # Fresh CLI session fed with replayed history (session reset, or --resume
-        # dropped): make the discontinuity explicit, or the model confabulates
-        # continuity — claiming past/pending actions succeeded (observed live:
-        # invented reboots and message relays after a session reset).
-        if any(m.role == MessageRole.ASSISTANT for m in messages):
-            parts.append(
-                "<session-note>\n"
-                "Fresh session: the conversation below is replayed from the message "
-                "store, not from your memory. Treat '[Previous response]' content as a "
-                "record that may contain unverified or mistaken claims. Do not state "
-                "that any action succeeded unless a tool result in THIS session "
-                "confirms it. If you lack a tool or the ability to do something, say "
-                "so plainly instead of describing success.\n"
-                "</session-note>"
-            )
-        for msg in messages:
-            if msg.role == MessageRole.SYSTEM:
-                continue  # handled via --system-prompt
-            elif msg.role == MessageRole.USER:
-                parts.append(msg.content)
-            elif msg.role == MessageRole.ASSISTANT:
-                parts.append(f"[Previous response]: {msg.content}")
-            elif msg.role == MessageRole.TOOL:
-                parts.append(f"[Tool result ({msg.name})]: {msg.content}")
-        return "\n\n".join(parts)
+        """Build a prompt string from messages (see build_cli_prompt)."""
+        return build_cli_prompt(messages, resuming=resuming)
 
     async def _stream_run(self, proc, prompt: str, progress_cb,
                           denial_sink: list[str] | None = None) -> tuple[str, str]:

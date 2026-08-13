@@ -251,6 +251,10 @@ class Connector(ABC):
 class LLMProvider(ABC):
     """Base class for LLM providers."""
     name: str
+    # True for CLI-backed providers that load the agent identity (AGENTS.md /
+    # CLAUDE.md) from the project directory themselves — the engine must not
+    # inject it as a system message on top.
+    reads_project_context: bool = False
 
     def __init__(self, config: dict):
         self.config = config
