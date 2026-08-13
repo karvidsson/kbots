@@ -1477,7 +1477,7 @@ class DiscordBot:
                 return
 
             try:
-                results = await memory.search(agent_id, query, limit=5)
+                results = await memory.search(query=query, agent_id=agent_id, limit=5)
                 if not results:
                     await interaction.followup.send(f"No results for: `{query}`", ephemeral=True)
                     return
