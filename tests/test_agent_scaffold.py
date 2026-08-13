@@ -1,11 +1,12 @@
 """Tests for src/core/agent_scaffold.py — shared by setup wizard and create_agent tool."""
 
 import json
+from pathlib import Path
 
 import pytest
 import yaml
 
-from src.core.agent_scaffold import cc_allow_for_tier, scaffold_agent
+from src.core.agent_scaffold import cc_allow_for_tier, default_claude_md, scaffold_agent
 
 
 @pytest.fixture
@@ -81,6 +82,81 @@ def test_tier_isolation_model(overlay):
         (overlay / "agents" / "worker" / ".claude" / "settings.json").read_text()
     )
     assert "Read(./**)" in settings["permissions"]["allow"]
+
+
+def test_assistant_can_reach_the_shared_temp_dir(overlay, tmp_path, monkeypatch):
+    """Regression: agents were told to write to $KBOTS_TMP but not allowed to read it.
+
+    The media tools (screenshots, generated images, charts) write there, and
+    viewing an image needs the native Read — so a folder-scoped agent could
+    call a tool successfully and then be denied the file it had just produced.
+    """
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("KBOTS_TMP", str(scratch))
+
+    scaffold_agent(overlay, "worker", "Worker", "Scoped agent", tier="assistant")
+    allow = json.loads(
+        (overlay / "agents" / "worker" / ".claude" / "settings.json").read_text()
+    )["permissions"]["allow"]
+
+    for verb in ("Read", "Write", "Edit", "MultiEdit", "Glob", "Grep"):
+        assert f"{verb}({scratch}/**)" in allow, f"{verb} on $KBOTS_TMP missing"
+    # Widening the scratch dir must not have widened anything else.
+    assert "Read(*)" not in allow
+    assert "Write(*)" not in allow
+
+
+def test_temp_dir_rules_are_derived_not_hardcoded(monkeypatch, tmp_path):
+    """The path must follow the environment — installs put the overlay anywhere.
+
+    Also covers the KBOTS_OVERLAY fallback, since most installs set only that.
+    """
+    monkeypatch.setenv("KBOTS_TMP", str(tmp_path / "explicit"))
+    assert f"Read({tmp_path / 'explicit'}/**)" in cc_allow_for_tier("assistant")
+
+    monkeypatch.delenv("KBOTS_TMP")
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path / "ovl"))
+    assert f"Read({tmp_path / 'ovl' / 'tmp'}/**)" in cc_allow_for_tier("assistant")
+
+
+def test_coordinator_gains_temp_writes_but_not_extra_reads(monkeypatch, tmp_path):
+    """Coordinator already reads everywhere; only the write side was missing."""
+    monkeypatch.setenv("KBOTS_TMP", str(tmp_path / "scratch"))
+    allow = cc_allow_for_tier("coordinator")
+    assert f"Write({tmp_path / 'scratch'}/**)" in allow
+    assert "Read(*)" in allow  # reads were never the gap
+
+
+def test_privileged_tier_needs_no_temp_rules(monkeypatch, tmp_path):
+    """Unrestricted already — adding scoped rules would only imply otherwise."""
+    monkeypatch.setenv("KBOTS_TMP", str(tmp_path / "scratch"))
+    assert not [r for r in cc_allow_for_tier("privileged") if "scratch" in r]
+
+
+def test_agent_brief_points_at_the_roster_tool_not_a_file(tmp_path):
+    """Regression: the brief named a roster path agents could never open.
+
+    It was relative, so it resolved inside the agent's own folder where no such
+    file exists, and the real one sits outside the sandbox. An agent that went
+    looking found nothing and started reading around outside its sandbox.
+    """
+    brief = default_claude_md("Worker", "Does things", tmp_path)
+    assert "team_list" in brief
+    assert "config/team.json" not in brief
+
+
+@pytest.mark.parametrize("module", ["src/core/agent_scaffold.py", "scripts/settings.py"])
+def test_no_template_still_points_at_the_roster_file(module):
+    """The brief template is duplicated across the two agent-creation paths.
+
+    scripts/settings.py (interactive setup) carries its own copy rather than
+    calling default_claude_md, so fixing one leaves the other handing new
+    agents the same dead path. Pin both until they are merged.
+    """
+    source = (Path(__file__).resolve().parent.parent / module).read_text()
+    assert "The team roster is at" not in source, (
+        f"{module} still points agents at a roster file path")
+    assert "team_list" in source, f"{module} does not mention the roster tool"
 
 
 def test_full_control_main_agent_is_privileged(overlay):

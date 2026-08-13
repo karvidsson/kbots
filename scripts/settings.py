@@ -916,8 +916,11 @@ Use your MCP tools for memory — do NOT use curl or HTTP calls.
 
 ## Team
 
-The team roster is at `config/team.json`. User context is injected before
-each message so you know who you're talking to.
+Call `team_list` for the roster — who your teammates are and how to reach
+them — and `team_get` for one member's detail. Use the tools rather than
+looking for a roster file: it lives outside your sandbox, so hunting for it
+only earns you a denied read. User context is injected before each message
+so you know who you're talking to.
 """
     from src.core.agent_scaffold import write_identity
     identity_written = write_identity(agent_dir, claude_md)
