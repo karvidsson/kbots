@@ -26,7 +26,8 @@ def test_scaffold_creates_all_files(overlay, tmp_path):
     agents_yaml = overlay / "config" / "agents.yaml"
     agent_dir = overlay / "agents" / "research"
     assert agents_yaml in written
-    assert (agent_dir / "CLAUDE.md") in written
+    assert (agent_dir / "AGENTS.md") in written
+    assert (agent_dir / "CLAUDE.md") in written  # thin stub importing AGENTS.md
     assert (agent_dir / ".mcp.json") in written
     assert (agent_dir / ".claude" / "settings.json") in written
 
@@ -39,7 +40,7 @@ def test_scaffold_creates_all_files(overlay, tmp_path):
     assert "privileged" not in entry
     assert entry["routing"]["discord"]["account"] == "main"
 
-    claude_md = (agent_dir / "CLAUDE.md").read_text()
+    claude_md = (agent_dir / "AGENTS.md").read_text()
     assert "Research Bot" in claude_md
     assert "Be curious" in claude_md
     assert "## How to work" in claude_md
@@ -113,7 +114,7 @@ def test_refuses_duplicate(overlay):
 
 def test_exist_ok_updates_yaml_but_keeps_files(overlay):
     scaffold_agent(overlay, "main", "Main", "Primary", model="sonnet")
-    claude_md = overlay / "agents" / "main" / "CLAUDE.md"
+    claude_md = overlay / "agents" / "main" / "AGENTS.md"
     original = claude_md.read_text()
 
     scaffold_agent(overlay, "main", "Main v2", "Primary", model="opus", exist_ok=True)
@@ -148,7 +149,8 @@ def test_custom_agents_file_and_profile(overlay):
     )
     assert (overlay / "config" / "agents.rescue.yaml").exists()
     assert not (overlay / "config" / "agents.yaml").exists()
-    assert (overlay / "agents" / "rescue" / "CLAUDE.md").read_text() == "# Custom rescue prompt\n"
+    assert (overlay / "agents" / "rescue" / "AGENTS.md").read_text() == "# Custom rescue prompt\n"
+    assert (overlay / "agents" / "rescue" / "CLAUDE.md").read_text().startswith("@AGENTS.md")
     mcp = json.loads((overlay / "agents" / "rescue" / ".mcp.json").read_text())
     assert mcp["mcpServers"]["kbots-tools"]["env"]["KBOTS_PROFILE"] == "rescue"
 
@@ -161,3 +163,28 @@ def test_routing_override(overlay):
     # The routing's account wins over the bot_account default in .mcp.json
     mcp = json.loads((overlay / "agents" / "router" / ".mcp.json").read_text())
     assert mcp["mcpServers"]["kbots-tools"]["env"]["KBOTS_BOT_ACCOUNT"] == "ops"
+
+
+def test_write_identity_creates_canonical_plus_stub(tmp_path):
+    from src.core.agent_scaffold import read_identity, write_identity
+    written = write_identity(tmp_path, "# Soul\n")
+    assert {p.name for p in written} == {"AGENTS.md", "CLAUDE.md"}
+    assert (tmp_path / "AGENTS.md").read_text() == "# Soul\n"
+    assert (tmp_path / "CLAUDE.md").read_text().startswith("@AGENTS.md")
+    # No overwrite without force
+    assert write_identity(tmp_path, "# Other\n") == []
+    assert (tmp_path / "AGENTS.md").read_text() == "# Soul\n"
+    # Force replaces both
+    write_identity(tmp_path, "# Other\n", force=True)
+    assert (tmp_path / "AGENTS.md").read_text() == "# Other\n"
+    assert read_identity(tmp_path) == "# Other\n"
+
+
+def test_read_identity_falls_back_to_legacy_claude_md(tmp_path):
+    from src.core.agent_scaffold import read_identity
+    assert read_identity(tmp_path) == ""
+    (tmp_path / "CLAUDE.md").write_text("# Legacy identity\n")
+    assert read_identity(tmp_path) == "# Legacy identity\n"
+    # AGENTS.md wins once present
+    (tmp_path / "AGENTS.md").write_text("# Canonical\n")
+    assert read_identity(tmp_path) == "# Canonical\n"

@@ -138,8 +138,8 @@ prompt is an *operating manual* for a small model, not an essay:
 - **For each `{param}`, name its valid values in the prompt text** (skill
   params are plain strings — the prompt is where the constraint lives).
 
-New agents get the same discipline baked into their scaffolded CLAUDE.md (the
-"How to work" loop). Existing agents' CLAUDE.md files live in the overlay and
+New agents get the same discipline baked into their scaffolded AGENTS.md (the
+"How to work" loop). Existing agents' identity files live in the overlay and
 are never rewritten by core — copy the section in by hand if you want it.
 
 *The method loop and prompt contract are adapted from

@@ -3,6 +3,7 @@
 Spawns Claude Code CLI sessions per agent in their project directory.
 Authenticates via the Claude Code CLI's own login (Pro/Max subscription —
 no API key needed — or --console API billing). Claude Code reads CLAUDE.md
+(a stub importing AGENTS.md)
 automatically and is sandboxed to the project dir.
 """
 
@@ -177,7 +178,7 @@ class ClaudeCodeProvider(LLMProvider):
     """LLM provider that uses Claude Code CLI.
 
     Each call spawns `claude --print` in the agent's project directory.
-    Claude Code reads CLAUDE.md automatically for identity/instructions.
+    Claude Code reads CLAUDE.md (stub importing AGENTS.md) for identity.
     """
     name = "claude_code"
 
@@ -259,7 +260,7 @@ class ClaudeCodeProvider(LLMProvider):
             # Don't inject system prompt on resume — session already has it
         else:
             # System prompt — only inject if there's an explicit system message
-            # (Claude Code reads CLAUDE.md automatically from project_dir)
+            # (Claude Code reads the identity files automatically from project_dir)
             system_msgs = [m for m in messages if m.role == MessageRole.SYSTEM and m.content]
             if system_msgs:
                 args.extend(["--system-prompt", system_msgs[0].content])

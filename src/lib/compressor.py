@@ -5,7 +5,7 @@ code blocks, config, paths, URLs, headings, tables, and technical terms.
 No LLM calls.  Conservative by design — only removes phrases that never
 carry meaning in LLM instruction files.
 
-Target: codex docs and skill prompts.  CLAUDE.md files (agent identity
+Target: codex docs and skill prompts.  Agent identity files (AGENTS.md
 prompts) should generally be excluded as they are carefully tuned.
 """
 

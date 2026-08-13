@@ -43,7 +43,7 @@ myagent:
 
 The agent gets the full kbots toolset — tool calls are executed by the engine with
 rate-limits, access control, and HITL enforced, same as Claude agents. History comes
-from SQLite; the agent's CLAUDE.md is injected as the system prompt.
+from SQLite; the agent's AGENTS.md is injected as the system prompt.
 
 ## Tier routing (save Claude usage, keep Claude quality)
 
