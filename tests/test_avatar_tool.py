@@ -55,6 +55,76 @@ async def test_bad_style_rejected(overlay):
     assert "Unknown eye style" in result
 
 
+@pytest.fixture
+def overlay_with_primary(tmp_path, monkeypatch):
+    """An overlay where the primary agent posts as the shared 'main' account.
+
+    This is the shape every install has: scaffolded agents get an account named
+    after themselves, but the first agent runs on 'main'.
+    """
+    import yaml
+
+    (tmp_path / "agents" / "atlas").mkdir(parents=True)
+    (tmp_path / "agents" / "milo").mkdir(parents=True)
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "agents.yaml").write_text(yaml.dump({"agents": {
+        "atlas": {"routing": {"discord": {"account": "main"}}},
+        "milo": {"routing": {"discord": {"account": "milo"}}},
+    }}))
+    (tmp_path / "config" / "config.yaml").write_text(yaml.dump({"connectors": {"discord": {
+        "accounts": {"main": {"token_key": "discord-token"},
+                     "milo": {"token_key": "discord-milo"}},
+    }}}))
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    return tmp_path
+
+
+def test_bot_account_comes_from_agent_routing(overlay_with_primary):
+    """Regression: the account was assumed to equal the agent name.
+
+    True for scaffolded agents, false for the primary one — it runs on 'main',
+    so the lookup went to a 'discord-atlas' key that was never created.
+    """
+    assert at._bot_account_for("atlas") == "main"
+    assert at._bot_account_for("milo") == "milo"
+    # No routing configured at all — keep the old behaviour rather than fail.
+    assert at._bot_account_for("stranger") == "stranger"
+
+
+def test_token_key_follows_the_resolved_account(overlay_with_primary):
+    assert at._token_key_for("main") == "discord-token"
+    assert at._token_key_for("milo") == "discord-milo"
+
+
+async def test_primary_agent_avatar_uses_the_main_account_token(
+    overlay_with_primary, monkeypatch
+):
+    """The end-to-end fix: setting the primary agent's avatar must succeed.
+
+    The vault deliberately holds *only* 'discord-token'. Under the old lookup
+    this asked for 'discord-atlas', found nothing, and reported 'no bot token
+    found' after having already written the files.
+    """
+    monkeypatch.setattr(at, "render_png", lambda svg, png, size: Path(png).write_bytes(b"png") or True)
+    uploaded = {}
+    monkeypatch.setattr(at, "upload_discord_avatar",
+                        lambda png, token: uploaded.update(token=token) or (True, "ok"))
+
+    result = await at.set_agent_avatar(_ctx(StubVault({"discord-token": "main-tok"})), "atlas")
+
+    assert "Avatar set on bot 'atlas'" in result
+    assert uploaded["token"] == "main-tok"
+
+
+async def test_missing_token_names_the_account_and_key(overlay_with_primary, monkeypatch):
+    """The old message named only the agent, which sent you looking for the
+    wrong vault key. Say which account and key were actually tried."""
+    monkeypatch.setattr(at, "render_png", lambda svg, png, size: Path(png).write_bytes(b"png") or True)
+    result = await at.set_agent_avatar(_ctx(StubVault({})), "atlas")
+    assert "no bot token" in result
+    assert "main" in result and "discord-token" in result
+
+
 def test_tool_is_discoverable():
     from src.core.tools import get_all_tools
     assert "set_agent_avatar" in get_all_tools()
