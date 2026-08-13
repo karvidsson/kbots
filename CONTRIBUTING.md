@@ -14,6 +14,12 @@ focused PRs are all welcome.
   `extras/`, not `src/tools/`.
 - **No secrets, names, or numeric IDs** in code, tests, or docs — use synthetic
   fixtures (`1000000000000000001`-style snowflakes, `example.com` addresses).
+  `tests/test_no_install_leaks.py` enforces this: it fails on real snowflakes,
+  email addresses, home-directory paths and tailnet hostnames anywhere in the
+  tree, and — when run on a machine with an overlay — on that deployment's own
+  agent names. Comments and test fixtures count; that is where it has leaked
+  before. A leaked name is an untidy comment, but a leaked account ID is a live
+  identifier that outlives any later cleanup of the working tree.
 
 ## Workflow
 
