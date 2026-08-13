@@ -36,8 +36,8 @@ def test_record_bot_identity_updates_and_resolves(tmp_path, monkeypatch):
 
 def test_bot_identity_matches_on_discord_id_not_derived_name(tmp_path, monkeypatch):
     """A bot whose Discord username differs from its config slug must not add a
-    second row. Regression: 'Data Bot' → 'data bot' duplicated 'data-bot' on every
-    startup, and reconcile_roster pruned it again each boot."""
+    second row. Regression: the stub was appended on every startup and
+    reconcile_roster pruned it again each boot."""
     tf = tmp_path / "team.json"
     tf.write_text(json.dumps({"humans": [], "agents": [
         {"id": "data-bot", "name": "Data.Bot", "type": "agent",
@@ -104,18 +104,18 @@ async def test_team_update_refuses_duplicate_discord_binding(tmp_path, monkeypat
 
     tf = tmp_path / "team.json"
     tf.write_text(json.dumps({"humans": [], "agents": [
-        {"id": "data-bot", "name": "Data.Bot", "type": "agent", "discord": "1537"},
+        {"id": "data-bot", "name": "Data.Bot", "type": "agent", "discord": "2002"},
         {"id": "data bot", "name": "Data Bot", "type": "agent"},
     ]}))
     monkeypatch.setattr(team, "TEAM_FILE", tf)
 
     fn = getattr(team.team_update, "fn", team.team_update)
     out = await fn(SimpleNamespace(agent_manager=None),
-                   id="data bot", field="discord", value="1537")
+                   id="data bot", field="discord", value="2002")
 
     assert "already bound" in out
     rows = json.loads(tf.read_text())["agents"]
-    assert [r.get("discord") for r in rows] == ["1537", None]
+    assert [r.get("discord") for r in rows] == ["2002", None]
 
 
 def test_roster_block_has_teammate_note(tmp_path, monkeypatch):
