@@ -1199,12 +1199,14 @@ def create_ops_instance():
     agent_dir = PROJECT_ROOT / "agents" / agent_name
     agent_dir.mkdir(parents=True, exist_ok=True)
 
-    template_path = PROJECT_ROOT / "config" / "templates" / "rescue-claude.md"
+    template_name = "ops-claude-macos.md" if sys.platform == "darwin" else "rescue-claude.md"
+    template_path = PROJECT_ROOT / "config" / "templates" / template_name
     if template_path.exists():
-        claude_md = template_path.read_text().format(display_name=display_name, agent_dir=agent_dir)
+        claude_md = template_path.read_text().format(
+            display_name=display_name, agent_dir=agent_dir, engine_root=PROJECT_ROOT)
     else:
-        claude_md = f"# {display_name}\n\nYou are {display_name} — the unsandboxed ops and dev agent.\n"
-        warn("Template not found at config/templates/rescue-claude.md — using minimal fallback")
+        claude_md = f"# {display_name}\n\nYou are {display_name} — the ops and dev agent.\n"
+        warn(f"Template not found at config/templates/{template_name} — using minimal fallback")
     claude_md_path = agent_dir / "CLAUDE.md"
     if claude_md_path.exists():
         warn("CLAUDE.md already exists — skipping (won't overwrite)")
