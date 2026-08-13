@@ -115,11 +115,15 @@ async def test_active_turns_counter_balances():
     am.active_turns = 0
     am._session_locks = {}
     am._session_key = lambda a, c: f"{a}:{c}"
+    am._inflight_turns = {}
+    am._inflight_seq = 0
 
     class Msg:
         channel_id = "c"
         raw = None
         connector = "discord"
+        user_id = "u"
+        bot_account = "main"
 
     with patch.object(AgentManager, "_handle_message_inner", new=AsyncMock()) as inner:
         await AgentManager.handle_message(am, "atlas", Msg())
