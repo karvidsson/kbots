@@ -39,11 +39,11 @@ def record_bot_identity(name: str, discord_id: str) -> None:
         # now; without this a rename would bind a second row to the same bot.
         if _find_by_discord(team, discord_id) is not None:
             return  # already bound to this bot
-        # Match on slugs, not raw lowercase. The Discord display name and the
-        # config id are written by different hands: 'Data Bot' lowercases to
-        # 'data bot', which equals neither the id 'data-bot' nor the name
-        # 'Data.Bot'. That near-miss is what appended a duplicate stub the first
-        # time each bot started.
+        # Match on slugs, not raw lowercase. A Discord display name and a config
+        # id are written by different hands and rarely agree on punctuation:
+        # 'Data Bot' lowercases to 'data bot', which equals neither the id
+        # 'data-bot' nor the name 'Data.Bot'. That near-miss is what appended a
+        # duplicate stub the first time a bot started.
         for a in agents:
             if _slug(a.get("id", "")) == aid or _slug(a.get("name", "")) == aid:
                 if a.get("discord") == discord_id:
@@ -135,8 +135,8 @@ def _save_team(data: dict) -> None:
 
 def _slug(value: str) -> str:
     """The roster-id form of a name: lowercase, non-alphanumerics collapsed to
-    single hyphens. 'Data Bot', 'Data.Bot' and 'data-bot' all reduce to 'data-bot',
-    so the same agent written three ways still matches one row.
+    single hyphens. 'Data Bot', 'Data.Bot' and 'data-bot' all reduce to
+    'data-bot', so the same agent written three ways still matches one row.
     """
     return re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
 
