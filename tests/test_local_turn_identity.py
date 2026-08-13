@@ -90,6 +90,9 @@ async def test_local_routed_turn_gets_identity_prompt(tmp_path, monkeypatch):
 
 async def test_claude_code_turn_gets_no_injected_prompt(tmp_path, monkeypatch):
     cc, local = RecordingProvider(), RecordingProvider()
+    # The stub stands in for the real CLI provider, which reads the identity
+    # file from the project dir itself (the engine keys off this attribute).
+    cc.reads_project_context = True
     mgr = _mk_manager(tmp_path, {"claude_code": cc, "local": local})
 
     async def stay_claude(*a, **k):
