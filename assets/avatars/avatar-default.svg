@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 160" fill="none">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-18 -18 196 196" fill="none">
   <!-- Agent avatar: the mascot's screen face, straight-on. Vary eyes + accent per agent. -->
   <rect x="9" y="9" width="142" height="142" rx="36" fill="#0a0a0f" stroke="#7d8695" stroke-width="7"/>
   <ellipse cx="58" cy="82" rx="10.5" ry="16" fill="#ff4444" transform="rotate(-5 58 82)"/>

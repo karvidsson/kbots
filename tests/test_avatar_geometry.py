@@ -131,6 +131,30 @@ def test_badge_is_centred_in_the_view():
     assert (badge_x, badge_y) == pytest.approx((crop_x, crop_y))
 
 
+SHIPPED_AVATARS = sorted(
+    (Path(__file__).resolve().parent.parent / "assets" / "avatars").glob("*.svg"))
+
+
+def test_there_are_shipped_avatars_to_check():
+    """A glob that silently matches nothing would make the next test a no-op."""
+    assert SHIPPED_AVATARS, "no assets/avatars/*.svg found — has the path moved?"
+
+
+@pytest.mark.parametrize("svg_path", SHIPPED_AVATARS, ids=lambda p: p.stem)
+def test_shipped_avatar_assets_fit_the_crop(svg_path):
+    """The sample avatars are hand-authored, so the generator cannot vouch for them.
+
+    assets/README.md points people at these as the starting point for a new
+    avatar, which makes them a second source of the clipping bug: fixing
+    build_svg does nothing for someone who copies a file. They are checked with
+    the same maths as generated output so the two cannot drift apart.
+    """
+    ratio = _overflow_ratio(svg_path.read_text())
+    assert ratio <= 1.0, (
+        f"{svg_path.name} overflows Discord's circular crop by "
+        f"{(ratio - 1) * 100:.1f}% — copying it reproduces the clipped avatar.")
+
+
 def test_the_original_face_really_did_clip():
     """Guards the checks above against passing vacuously.
 
