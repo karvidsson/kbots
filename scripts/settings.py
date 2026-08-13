@@ -919,12 +919,13 @@ Use your MCP tools for memory — do NOT use curl or HTTP calls.
 The team roster is at `config/team.json`. User context is injected before
 each message so you know who you're talking to.
 """
-    claude_md_path = agent_dir / "CLAUDE.md"
-    if claude_md_path.exists():
-        warn("CLAUDE.md already exists — skipping (won't overwrite)")
+    from src.core.agent_scaffold import write_identity
+    identity_written = write_identity(agent_dir, claude_md)
+    if identity_written:
+        for p in identity_written:
+            ok(f"Created {_display_path(agent_dir)}/{p.name}")
     else:
-        claude_md_path.write_text(claude_md)
-        ok(f"Created {_display_path(agent_dir)}/CLAUDE.md")
+        warn("Identity files already exist — skipping (won't overwrite)")
 
     # .mcp.json
     mcp_path = agent_dir / ".mcp.json"
@@ -1207,12 +1208,13 @@ def create_ops_instance():
     else:
         claude_md = f"# {display_name}\n\nYou are {display_name} — the ops and dev agent.\n"
         warn(f"Template not found at config/templates/{template_name} — using minimal fallback")
-    claude_md_path = agent_dir / "CLAUDE.md"
-    if claude_md_path.exists():
-        warn("CLAUDE.md already exists — skipping (won't overwrite)")
+    from src.core.agent_scaffold import write_identity
+    identity_written = write_identity(agent_dir, claude_md)
+    if identity_written:
+        for p in identity_written:
+            ok(f"Created agents/{agent_name}/{p.name}")
     else:
-        claude_md_path.write_text(claude_md)
-        ok(f"Created agents/{agent_name}/CLAUDE.md")
+        warn("Identity files already exist — skipping (won't overwrite)")
 
     mcp_path = agent_dir / ".mcp.json"
     if mcp_path.exists():

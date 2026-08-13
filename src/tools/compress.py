@@ -1,6 +1,6 @@
 """Context compression tool for kbots.
 
-Compresses prose in context files (CLAUDE.md, codex, skills) to reduce
+Compresses prose in context files (identity files, codex, skills) to reduce
 input tokens per agent message. Preserves code, config, structure.
 """
 

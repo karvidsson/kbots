@@ -21,7 +21,7 @@ uv run python setup.py
 10. **Machine control** — how much of the machine the main agent may touch: none (default), user shell, or root via a sudoers rule
 11. **HITL** — approval channel and approvers; which tools are gated (`send_email`, `install_mcp`, `create_agent`)
 12. **Compression** — context compression, if wanted; plus optional sub-steps 12b **Local models** (Ollama / LM Studio + tier router) and 12c **Training-data collection**
-13. **Config generation** — produces config.yaml, agents.yaml, team.json, mcp.yaml, and the agent CLAUDE.md
+13. **Config generation** — produces config.yaml, agents.yaml, team.json, mcp.yaml, and the agent AGENTS.md
 14. **Ops instance** — optionally adds a privileged dev/ops agent with its own bot and service
 15. **Extras** — additional team members or bots (further *agents* are created post-setup by your main agent via its `create_agent` tool)
 16. **Service** — Linux: systemd units via `scripts/install-systemd.sh`; macOS: launchd plist. Starts the service and verifies the agent comes online
@@ -227,7 +227,7 @@ sudo bash scripts/install-systemd.sh <overlay-dir> [--enable-service]
 ```
 
 ### `scripts/compress-context.sh` — Context Compression
-Compresses agent context files in bulk — codex docs, skill prompts — to cut input tokens. Safe to re-run: files that haven't changed are skipped, and CLAUDE.md files are left out by default.
+Compresses agent context files in bulk — codex docs, skill prompts — to cut input tokens. Safe to re-run: files that haven't changed are skipped, and agent identity files (AGENTS.md) are left out by default.
 ```bash
 # Dry run — show savings without writing
 scripts/compress-context.sh --dry-run

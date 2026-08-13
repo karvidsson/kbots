@@ -100,7 +100,8 @@ def build_workspace(mock: bool, agent_prompt: str | None) -> None:
     agents_path.write_text(yaml.dump(agents_cfg, default_flow_style=False, sort_keys=False))
 
     if agent_prompt:
-        (OVERLAY / "agents" / AGENT_NAME / "CLAUDE.md").write_text(agent_prompt + "\n")
+        from src.core.agent_scaffold import write_identity
+        write_identity(OVERLAY / "agents" / AGENT_NAME, agent_prompt + "\n", force=True)
 
     _ok(f"Workspace: {DEV_DIR}  (provider: {'mock — offline' if mock else 'claude_code'})")
 
@@ -200,7 +201,7 @@ def main() -> int:
     p_chat = sub.add_parser("chat", help="Spin up the test agent and chat (teardown on exit)")
     p_chat.add_argument("--mock", action="store_true", help="Use the offline mock LLM")
     p_chat.add_argument("--keep", action="store_true", help="Keep .dev/ after exit")
-    p_chat.add_argument("--agent-prompt", help="Override the test agent's CLAUDE.md")
+    p_chat.add_argument("--agent-prompt", help="Override the test agent identity (AGENTS.md)")
     p_chat.set_defaults(func=cmd_chat)
 
     p_down = sub.add_parser("down", help="Force-stop the dev instance and remove .dev/")
