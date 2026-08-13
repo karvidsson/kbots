@@ -12,6 +12,7 @@ from pathlib import Path
 
 import yaml
 
+from src.core.agent_scaffold import agent_entries
 from src.core.base import ToolContext, resolve_config_file
 from src.core.tools import tool
 from src.lib.avatar_gen import (
@@ -32,6 +33,26 @@ def _agent_dir(agent_name: str) -> Path:
         return Path(overlay) / "agents" / agent_name
     from src.core.base import KBOTS_TMP
     return KBOTS_TMP / "avatars" / agent_name
+
+
+def _bot_account_for(agent_name: str) -> str:
+    """The Discord account an agent posts as, which is not always its own name.
+
+    Most agents run on an account named after themselves, so the two were used
+    interchangeably. The primary agent does not: it runs on the shared 'main'
+    account, so assuming account == agent name looked up a token key that was
+    never created, and setting the main agent's avatar always failed with 'no
+    bot token found'. Agent config carries the real account under its discord
+    routing; fall back to the name when nothing is configured, which is the
+    old behaviour and correct for every scaffolded agent.
+    """
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    if overlay:
+        entry = agent_entries(Path(overlay)).get(agent_name) or {}
+        account = ((entry.get("routing") or {}).get("discord") or {}).get("account")
+        if account:
+            return account
+    return agent_name
 
 
 def _token_key_for(account: str) -> str:
@@ -77,11 +98,14 @@ async def set_agent_avatar(
                 "missing?) — Discord upload needs the PNG. Ask an operator to run: "
                 "uv run playwright install chromium")
 
-    token = ctx.vault.get(_token_key_for(agent_name)) if ctx.vault else None
+    account = _bot_account_for(agent_name)
+    token_key = _token_key_for(account)
+    token = ctx.vault.get(token_key) if ctx.vault else None
     if not token:
         return (f"Avatar written to {png_path}, but no bot token found for "
-                f"'{agent_name}' in the vault — upload it manually "
-                "(Developer Portal → app → Bot → icon) or add the token first.")
+                f"'{agent_name}' (account '{account}', vault key '{token_key}') "
+                "— upload it manually (Developer Portal → app → Bot → icon) "
+                "or add the token first.")
 
     success, msg = await asyncio.to_thread(upload_discord_avatar, png_path, token)
     if success:
