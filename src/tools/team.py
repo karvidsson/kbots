@@ -8,6 +8,7 @@ Architecture:
 
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 
@@ -32,9 +33,19 @@ def record_bot_identity(name: str, discord_id: str) -> None:
     with _TEAM_LOCK:
         team = _load_team()
         agents = team.setdefault("agents", [])
-        aid = name.lower()
+        aid = _slug(name)
+        # The Discord ID is the durable key — check it before any name match. A
+        # bot already bound to a row needs nothing done, whatever it is called
+        # now; without this a rename would bind a second row to the same bot.
+        if _find_by_discord(team, discord_id) is not None:
+            return  # already bound to this bot
+        # Match on slugs, not raw lowercase. The Discord display name and the
+        # config id are written by different hands: 'Data Bot' lowercases to
+        # 'data bot', which equals neither the id 'data-bot' nor the name
+        # 'Data.Bot'. That near-miss is what appended a duplicate stub the first
+        # time each bot started.
         for a in agents:
-            if a.get("id") == aid or (a.get("name", "").lower() == aid):
+            if _slug(a.get("id", "")) == aid or _slug(a.get("name", "")) == aid:
                 if a.get("discord") == discord_id:
                     return  # already correct
                 a["discord"] = discord_id
@@ -122,6 +133,29 @@ def _save_team(data: dict) -> None:
         json.dump(data, f, indent=2)
 
 
+def _slug(value: str) -> str:
+    """The roster-id form of a name: lowercase, non-alphanumerics collapsed to
+    single hyphens. 'Data Bot', 'Data.Bot' and 'data-bot' all reduce to 'data-bot',
+    so the same agent written three ways still matches one row.
+    """
+    return re.sub(r"[^a-z0-9]+", "-", (value or "").lower()).strip("-")
+
+
+def _find_by_discord(team: dict, discord_id: str) -> dict | None:
+    """Find the agent row already bound to this Discord ID, if any.
+
+    A Discord ID identifies a bot account, and policy is one app per agent, so
+    it is the only durable key in the roster — an id derived from a display
+    name drifts the moment the name is edited.
+    """
+    if not discord_id:
+        return None
+    for a in team.get("agents", []):
+        if str(a.get("discord") or "") == str(discord_id):
+            return a
+    return None
+
+
 def upsert_agent(agent_id: str, name: str, *, agent_tier: str = "assistant",
                  role: str = "", domain: str = "", discord: str = "",
                  reports_to: str = "") -> bool:
@@ -130,6 +164,10 @@ def upsert_agent(agent_id: str, name: str, *, agent_tier: str = "assistant",
     Programmatic entry point (used by create_agent) so the relations map stays
     in sync with agents.yaml — no manual team_add needed. Only non-empty fields
     overwrite existing values. Returns True if the agent was newly added.
+
+    Matching is by id, then by Discord ID: a row already bound to this bot is
+    updated in place rather than duplicated, so a roster stub under a stale id
+    cannot coexist with the real agent.
     """
     team = _load_team()
     agents = team.setdefault("agents", [])
@@ -142,6 +180,17 @@ def upsert_agent(agent_id: str, name: str, *, agent_tier: str = "assistant",
             a.update({k: v for k, v in fields.items() if v or k in ("agent_tier",)})
             _save_team(team)
             return False
+    # No id match — before creating a row, adopt any row already holding this
+    # Discord ID. Without this the roster accretes a duplicate per rename.
+    bound = _find_by_discord(team, discord)
+    if bound is not None:
+        stale_id = bound.get("id")
+        bound["id"] = agent_id
+        bound.update({k: v for k, v in fields.items() if v or k in ("agent_tier",)})
+        _save_team(team)
+        logger.info(f"roster: adopted existing row for discord {discord} "
+                    f"('{stale_id}' → '{agent_id}') instead of adding a duplicate")
+        return False
     agents.append({"id": agent_id, **fields})
     _save_team(team)
     return True
@@ -305,6 +354,15 @@ async def team_update(ctx: ToolContext, id: str, field: str, value: str) -> str:
         return f"Invalid agent_tier '{value}'. Must be one of: {', '.join(VALID_AGENT_TIERS)}"
 
     team = _load_team()
+
+    # One Discord app per agent: refuse to bind an ID already held elsewhere,
+    # which would leave two rows resolving to the same bot.
+    if field == "discord" and value:
+        bound = _find_by_discord(team, value)
+        if bound is not None and bound.get("id") != id:
+            return (f"Discord ID {value} is already bound to agent "
+                    f"'{bound.get('id')}'. Remove that binding first, or "
+                    f"correct that row's id — two rows must not share a bot.")
 
     for collection in [team.get("humans", []), team.get("agents", [])]:
         for member in collection:
