@@ -3,6 +3,7 @@
 All DNS and HTTP is mocked; no network access.
 """
 
+import ipaddress
 import socket
 from email.message import Message
 from urllib.error import HTTPError, URLError
@@ -49,7 +50,11 @@ def test_allows_ipv4_mapped_public_ipv6(monkeypatch):
     )
     err, ip = _validate_url("http://ok.example/")
     assert err is None
-    assert ip == f"::ffff:{PUBLIC_IP}"
+    # Compare parsed addresses rather than their text. CPython renders an
+    # IPv4-mapped IPv6 address as '::ffff:93.184.216.34' from 3.13 on and as
+    # '::ffff:5db8:d822' before it, so asserting on the string pins the test to
+    # one interpreter — it passed locally and failed in CI for that reason alone.
+    assert ipaddress.ip_address(ip) == ipaddress.ip_address(f"::ffff:{PUBLIC_IP}")
 
 
 def test_allows_public_hostname(monkeypatch):
