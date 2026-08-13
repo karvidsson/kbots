@@ -473,6 +473,26 @@ async def main() -> None:
     if sched_channel and "discord" in active_connectors:
         active_connectors["discord"]._schedules_channel = sched_channel
 
+    # --- Restart recovery: turns killed at the last shutdown's drain timeout
+    # get one synthetic turn each, telling the agent to resume or report.
+    from src.core.recovery import build_recovery_message, load_and_clear
+    interrupted = load_and_clear(data_dir)
+    if interrupted:
+        async def _deliver_recovery():
+            await asyncio.sleep(20)  # let connectors finish coming online
+            for turn in interrupted:
+                agent_id = turn.get("agent_id")
+                if agent_id not in agent_manager.agent_configs:
+                    logger.warning(f"Restart recovery: unknown agent {agent_id!r} — skipped")
+                    continue
+                logger.info(f"Restart recovery → {agent_id} in {turn.get('channel_id')}")
+                try:
+                    await agent_manager.handle_message(
+                        agent_id, build_recovery_message(turn))
+                except Exception as e:
+                    logger.error(f"Restart recovery for {agent_id} failed: {e}")
+        asyncio.create_task(_deliver_recovery(), name="restart-recovery")
+
     # --- Android emulator reaper: shut the emulator down once nobody uses it ---
     # Must live here, in the long-running service: the failure mode is "no agent
     # calls android_device again", so a check inside the tool would never run for
@@ -542,6 +562,12 @@ async def main() -> None:
         if agent_manager.active_turns > 0:
             logger.warning(f"Drain timeout — {agent_manager.active_turns} turn(s) still "
                            "running; restarting anyway")
+            # Snapshot the turns we're about to kill so the next boot can
+            # tell each affected agent to pick its work back up.
+            from src.core.recovery import save_interrupted
+            saved = save_interrupted(data_dir, agent_manager.inflight_snapshot())
+            if saved:
+                logger.info(f"Recorded {saved} interrupted turn(s) for recovery on next boot")
         else:
             logger.info("All turns drained cleanly")
 

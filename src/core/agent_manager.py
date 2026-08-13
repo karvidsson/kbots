@@ -162,6 +162,10 @@ class AgentManager:
         # Track running LLM processes per agent for /stop
         self._running_procs: dict[str, asyncio.subprocess.Process] = {}
         self.active_turns = 0  # in-flight handle_message turns (drained on shutdown)
+        # Metadata for each in-flight turn, so turns killed at the shutdown
+        # drain timeout can be recovered next boot (src/core/recovery.py)
+        self._inflight_turns: dict[int, dict] = {}
+        self._inflight_seq = 0
         # Per-session locks: serialize messages to the same channel so a
         # follow-up doesn't run concurrently with the current turn and collide
         # on the shared CLI --resume session. Different channels stay parallel.
@@ -391,10 +395,26 @@ class AgentManager:
                     )
         async with lock:
             self.active_turns += 1
+            self._inflight_seq += 1
+            turn_key = self._inflight_seq
+            self._inflight_turns[turn_key] = {
+                "agent_id": agent_id,
+                "connector": message.connector,
+                "channel_id": message.channel_id,
+                "user_id": message.user_id,
+                "bot_account": message.bot_account,
+                "started_at": time.time(),
+            }
             try:
                 await self._handle_message_inner(agent_id, message)
             finally:
                 self.active_turns -= 1
+                self._inflight_turns.pop(turn_key, None)
+
+    def inflight_snapshot(self) -> list[dict]:
+        """Metadata of turns currently running — the shutdown path persists
+        these when the drain window expires so they can be recovered."""
+        return list(self._inflight_turns.values())
 
     async def _handle_message_inner(self, agent_id: str, message: IncomingMessage) -> None:
         """Full flow: build context → call LLM → dispatch tools → send response."""
