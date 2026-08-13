@@ -35,6 +35,23 @@ def _isolate_roster(tmp_path, monkeypatch):
     return roster
 
 
+@pytest.fixture(autouse=True)
+def _isolate_inter_agent_depth(monkeypatch):
+    """No test may inherit this process's inter-agent call depth.
+
+    KBOTS_INTER_AGENT_DEPTH is threaded into agent subprocesses through the
+    environment, so running the suite from inside an agent turn that was itself
+    started by another agent leaves it set — and the loopback tests read it,
+    asserted a depth of 1, and got 2. The suite then failed for a reason that
+    had nothing to do with the code under test and could not be reproduced from
+    a plain shell or in CI.
+
+    Autouse, and paired with _isolate_roster above, for the same reason: the
+    test that forgets is the one that gets it wrong.
+    """
+    monkeypatch.delenv("KBOTS_INTER_AGENT_DEPTH", raising=False)
+
+
 @pytest.fixture
 def overlay(tmp_path):
     """A minimal overlay directory structure (config/ + agents/)."""
