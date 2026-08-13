@@ -201,7 +201,7 @@ class DiscordConnector(Connector):
         return first_msg
 
     # Plain-text mention token: one or two words after @ (covers names like
-    # "Data.Bot" and "Engineer Bot"). Not preceded by a word char or '<', so
+    # "Data.Bot" and "Build Agent"). Not preceded by a word char or '<', so
     # emails and existing <@id> markup never match.
     _MENTION_TOKEN = re.compile(r"(?<![\w<])@([\w.\-]+(?: [\w.\-]+)?)")
     _CODE_SPAN = re.compile(r"(```.*?```|`[^`\n]*`)", re.DOTALL)
@@ -248,7 +248,7 @@ class DiscordConnector(Connector):
 
     @staticmethod
     def _norm_name(s: str) -> str:
-        """Alphanumeric-only comparison: 'Data.Bot' == 'Data Bot' == 'Data.Bot'.
+        """Alphanumeric-only comparison: 'Data.Bot' == 'Data Bot' == 'databot'.
         Agents type names from the roster; Discord identities differ in
         punctuation and spacing."""
         return re.sub(r"[^a-z0-9]", "", (s or "").lower())
