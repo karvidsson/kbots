@@ -84,6 +84,14 @@ defaults:
       model: haiku          # cheap model — reflection is a focused consolidation call
       interval_hours: 24    # per-agent cadence
       min_lessons: 3        # skip until an agent has at least this many lessons
+    # Graph memory (optional): entity/relationship layer on LadybugDB, additive
+    # to the sqlite backend. One shared graph for all agents; edges carry scope
+    # (global / agent:<id> / group:<name>) like memories. Agents get the
+    # memory_link / memory_related / memory_unlink / memory_graph_query /
+    # memory_graph tools. Requires: uv sync --extra graph
+    graph:
+      enabled: false
+      path: data/graph/memory.lbdb   # resolved against the repo root
 
 # Schedule oversight (optional): a dedicated channel where agents' scheduled
 # tasks are posted. React ❌ on a card to cancel it; use /schedules for the full
