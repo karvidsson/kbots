@@ -1,0 +1,20 @@
+#!/bin/sh
+# Refuse a commit message that identifies one installation.
+#
+# The cheapest place to catch this: the message does not exist yet, so fixing it
+# costs a reword rather than a history rewrite. This is a convenience, not the
+# guarantee — hooks are per-clone and `--no-verify` skips them. The guarantee is
+# tests/test_no_install_leaks.py, which scripts/self-deploy.sh will not ship red.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+
+repo_root=$(git rev-parse --show-toplevel) || exit 0
+
+if ! output=$(python3 "$repo_root/scripts/check_install_leaks.py" --text "$1" 2>&1); then
+    echo
+    echo "commit-msg: this message identifies one installation of kbots."
+    echo "$output" | sed 's/^/  /'
+    echo
+    echo "Reword it, or use --no-verify if you are certain this is a false positive."
+    exit 1
+fi
