@@ -15,13 +15,25 @@ logger = logging.getLogger(__name__)
 # This is the single source of truth. Import from here, don't recompute.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 
-# Shared temp directory for agent-generated files (media, docs, scratch).
-# Precedence: KBOTS_TMP env → KBOTS_OVERLAY/tmp → /tmp
-_kbots_tmp = os.environ.get("KBOTS_TMP", "")
-if not _kbots_tmp:
-    _overlay = os.environ.get("KBOTS_OVERLAY", "")
-    _kbots_tmp = os.path.join(_overlay, "tmp") if _overlay else "/tmp"
-KBOTS_TMP = Path(_kbots_tmp)
+def resolve_kbots_tmp() -> Path:
+    """Shared temp directory for agent-generated files (media, docs, scratch).
+
+    Precedence: KBOTS_TMP env → KBOTS_OVERLAY/tmp → /tmp
+
+    A function as well as the KBOTS_TMP constant below, because the constant
+    freezes whatever the environment held at import time. Callers that build
+    configuration for a *different* process — writing an agent's sandbox
+    permissions, say — need the value at call time, and must not re-implement
+    this precedence and drift from it.
+    """
+    tmp = os.environ.get("KBOTS_TMP", "")
+    if not tmp:
+        overlay = os.environ.get("KBOTS_OVERLAY", "")
+        tmp = os.path.join(overlay, "tmp") if overlay else "/tmp"
+    return Path(tmp)
+
+
+KBOTS_TMP = resolve_kbots_tmp()
 
 
 def resolve_vault_key_file() -> Path:
