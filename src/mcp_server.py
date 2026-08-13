@@ -326,6 +326,14 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
 
         # Note: team module reads from team.json directly, no memory backend needed
 
+    # Graph memory is single-writer (one process per .lbdb file) and owned by the
+    # main kbots process — never open it from this subprocess.
+    from src.lib.graph_store import set_unavailable
+    set_unavailable(
+        "Graph memory is owned by the main kbots process (single-writer database) "
+        "and is not available via the MCP server — ask the agent in chat instead."
+    )
+
     # Initialize middleware
     security_cfg = config.get("security", {})
 

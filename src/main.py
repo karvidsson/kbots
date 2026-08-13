@@ -242,6 +242,12 @@ async def main() -> None:
 
     # Note: team module reads from team.json directly, no memory backend needed
 
+    # --- Graph memory (optional, additive to sqlite; opens lazily on first use) ---
+    from src.lib.graph_store import close_graph, init_graph
+    graph = init_graph(defaults.get("memory", {}))
+    if graph:
+        logger.info(f"Graph memory: LadybugDB ({graph.path})")
+
     # --- Security: HITL, rate limiting, audit, content safety ---
     from src.core.audit import AuditLog
     from src.core.content_safety import BehaviorMonitor
@@ -403,6 +409,7 @@ async def main() -> None:
 
     if not active_connectors:
         logger.error("No connectors started. Nothing to do.")
+        close_graph()
         await storage.close()
         return
 
@@ -580,6 +587,7 @@ async def main() -> None:
 
     audit.log_auth("shutdown", "kbots stopping")
     audit.close()
+    close_graph()
     await storage.close()
     logger.info("kbots stopped.")
 

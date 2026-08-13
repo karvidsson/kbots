@@ -47,6 +47,11 @@ _SCHEMA: dict[str, tuple] = {
             "semantic_search": (bool, False, None, None),
             "decay_enabled": (bool, False, None, None),
             "max_results": (int, False, None, None),
+            "reflection": (dict, False, None, None),
+            "graph": (dict, False, None, {
+                "enabled": (bool, False, None, None),
+                "path": (str, False, None, None),
+            }),
         }),
     }),
     "security": (dict, False, None, {
