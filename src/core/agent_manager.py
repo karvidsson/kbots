@@ -317,8 +317,9 @@ class AgentManager:
         """
         agent_cfg = self.agent_configs[agent_id]
         llm_cfg = agent_cfg.get("llm", self.defaults.get("llm", {}))
-        if llm_cfg.get("provider") == "claude_code":
-            return ""  # Claude Code reads the identity from the project dir
+        provider = self.llm_providers.get(llm_cfg.get("provider", ""))
+        if getattr(provider, "reads_project_context", False):
+            return ""  # the CLI loads the identity from the project dir itself
 
         return self._read_identity_prompt(agent_id)
 
@@ -696,12 +697,12 @@ class AgentManager:
         provider_used = next(
             (n for n, p in self.llm_providers.items() if p is llm), "unknown")
 
-        # claude_code agents get no system prompt at build time — the CLI loads
+        # CLI-backed agents get no system prompt at build time — the CLI loads
         # the identity file itself. If this turn ended up on a different provider
         # (tier-router local turn, skill pin), that assumption is wrong: the
         # model would answer with no idea which agent it is and improvise an
         # identity from the message envelope. Inject the identity now.
-        if not system_prompt and provider_used != "claude_code":
+        if not system_prompt and not getattr(llm, "reads_project_context", False):
             identity = self._read_identity_prompt(agent_id)
             if identity:
                 messages.insert(
