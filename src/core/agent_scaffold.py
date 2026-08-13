@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from src.core.base import PROJECT_ROOT
+from src.core.base import PROJECT_ROOT, resolve_kbots_tmp
 
 TIERS = ("privileged", "coordinator", "assistant")
 
@@ -87,6 +87,24 @@ def agent_is_privileged_or_coordinator(overlay: Path, agent_id: str) -> bool:
     return bool(entry.get("privileged")) or entry.get("tier") == "coordinator"
 
 
+def _tmp_rules(*tools: str) -> list[str]:
+    """Permission rules granting `tools` over the shared temp directory.
+
+    Sandboxed tiers are scoped to their own project_dir, but every agent brief
+    tells them to put generated files in $KBOTS_TMP — and the media tools
+    (screenshots, generated images, charts, rendered SVG) write there too.
+    Without this an agent can produce a file through an MCP tool and then be
+    denied reading back the very thing it just made, because viewing an image
+    needs the native Read. The tools succeed and their output is unusable.
+
+    Resolved at call time rather than from the KBOTS_TMP constant: this writes
+    another process's config, so it must reflect the environment now, and stay
+    testable without reimporting the module.
+    """
+    tmp = resolve_kbots_tmp()
+    return [f"{tool}({tmp}/**)" for tool in tools]
+
+
 def cc_allow_for_tier(tier: str) -> list[str]:
     """Derive Claude Code settings.json allow list from agent tier.
 
@@ -109,13 +127,17 @@ def cc_allow_for_tier(tier: str) -> list[str]:
                 "mcp__kbots-tools"]
     if tier == "coordinator":
         # Reads everywhere; full file ops in its OWN folder; restricted shell.
+        # Read(*) already covers the shared temp dir, so only writes are added.
         return ["Read(*)", "Glob(*)", "Grep(*)",
                 "Write(./**)", "Edit(./**)", "MultiEdit(./**)",
+                *_tmp_rules("Write", "Edit", "MultiEdit"),
                 "mcp__kbots-tools", "Bash(uv run python:*)"]
     # assistant — confined to its own project_dir, but FULL file ops there so it
     # can actually work (save data, build reports). No shell (see disallow).
     return ["Read(./**)", "Write(./**)", "Edit(./**)", "MultiEdit(./**)",
-            "Glob(./**)", "Grep(./**)", "mcp__kbots-tools"]
+            "Glob(./**)", "Grep(./**)",
+            *_tmp_rules("Read", "Write", "Edit", "MultiEdit", "Glob", "Grep"),
+            "mcp__kbots-tools"]
 
 
 def default_claude_md(display_name: str, description: str, agent_dir: Path,
@@ -219,8 +241,11 @@ re-propose the same thing.
 
 ## Team
 
-The team roster is at `config/team.json`. User context is injected before
-each message so you know who you're talking to.
+Call `team_list` for the roster — who your teammates are and how to reach
+them — and `team_get` for one member's detail. Use the tools rather than
+looking for a roster file: it lives outside your sandbox, so hunting for it
+only earns you a denied read. User context is injected before each message
+so you know who you're talking to.
 """
 
 
