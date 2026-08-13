@@ -68,6 +68,76 @@ async def test_not_ready_is_safe():
     await bot.task_finished()  # cancels the heartbeat cleanly
 
 
+async def test_dropped_update_is_remembered_and_reapplied_on_resume():
+    """A status Discord holds for us is not self-correcting.
+
+    If task_finished() lands while the gateway is down the update is lost, and
+    we go on advertising work that already ended until something else happens
+    to write. A RESUME does not fire on_ready, so on_resumed has to reconcile.
+    """
+    bot = _bot()
+    await bot.task_started("scan the network")
+    bot.client.change_presence.reset_mock()
+
+    bot.client.is_ready.return_value = False
+    await bot.task_finished()                      # dropped on the floor
+    assert bot.client.change_presence.await_count == 0
+    assert bot._presence_dirty is True
+
+    bot.client.is_ready.return_value = True
+    await bot.on_resumed()
+
+    assert bot.client.change_presence.await_count == 1
+    kwargs = bot.client.change_presence.await_args.kwargs
+    assert kwargs["status"] == discord.Status.online   # idle, which is the truth
+    assert kwargs["activity"] is None
+    assert bot._presence_dirty is False
+
+
+async def test_resume_does_not_write_when_presence_is_already_accurate():
+    """Only reconcile a known drift — no needless writes against a rate limit."""
+    bot = _bot()
+    await bot.task_started("thinking")
+    await bot.task_finished()
+    bot.client.change_presence.reset_mock()
+
+    await bot.on_resumed()
+    assert bot.client.change_presence.await_count == 0
+
+
+async def test_close_clears_a_busy_status_before_disconnecting():
+    """The case that prompted this: self-deploy restarts the service the agent
+    is running in, killing an in-flight turn by design. Whatever it was doing
+    must not linger as the bot's status."""
+    bot = _bot()
+    bot.client.close = AsyncMock()
+    await bot.task_started("Verify all record_bot_identity paths")
+    bot.client.change_presence.reset_mock()
+
+    await bot.close()
+
+    assert bot.client.change_presence.await_count == 1, "status left as-is on shutdown"
+    kwargs = bot.client.change_presence.await_args.kwargs
+    assert kwargs["status"] == discord.Status.online
+    assert kwargs["activity"] is None
+    assert bot._active_tasks == 0
+    assert bot._heartbeat_task is None      # heartbeat cannot outlive the bot
+    bot.client.close.assert_awaited_once()
+
+
+async def test_close_still_disconnects_when_clearing_fails():
+    """A slow or dead gateway must not hold up shutdown — whatever is stopping
+    us is on a timer of its own."""
+    bot = _bot()
+    bot.client.close = AsyncMock()
+    bot.client.change_presence = AsyncMock(side_effect=RuntimeError("gateway gone"))
+    await bot.task_started("something")
+
+    await bot.close()      # must not raise
+
+    bot.client.close.assert_awaited_once()
+
+
 async def test_shows_task_hint_in_status():
     bot = _bot()
     await bot.task_started("scan the network")
