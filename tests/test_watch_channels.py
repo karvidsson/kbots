@@ -90,6 +90,20 @@ async def test_mentioned_message_in_watched_channel_is_not_flagged_watched():
     assert emitted[0].watched is False
 
 
+async def test_managed_role_mention_counts_as_mention_without_member_cache():
+    # A bot pinged via its auto-created managed role must process the message
+    # even with the member cache disabled (get_member returns None). The
+    # role's tags carry the owning bot's id.
+    bot, emitted = _bot({"mentions": True})  # no watch — mention is the only way in
+    my_role = SimpleNamespace(id=77, name="Atlas", tags=SimpleNamespace(bot_id=999))
+    msg = _msg("<@&77> status?", channel_id=777, author_bot=True)
+    msg.role_mentions = [my_role]
+    msg.guild = SimpleNamespace(get_member=lambda _id: None)
+    await bot.on_message(msg)
+    assert len(emitted) == 1
+    assert emitted[0].watched is False
+
+
 async def test_chain_guard_still_applies_in_watched_channel():
     bot, emitted = _bot(ROUTING)
     # Distinct senders and content so the per-pair loop guard stays out of
