@@ -299,25 +299,26 @@ class AgentManager:
         return project_dir  # Return original (may fail, but logs will show why)
 
     def _read_identity_prompt(self, agent_id: str) -> str:
-        """CLAUDE.md from the agent's project dir, or the inline config fallback."""
-        project_dir = self._get_project_dir(agent_id)
-        claude_md = Path(project_dir) / "CLAUDE.md"
-        if claude_md.exists():
-            return claude_md.read_text()
+        """AGENTS.md (or legacy CLAUDE.md) from the agent's project dir, or
+        the inline config fallback."""
+        from src.core.agent_scaffold import read_identity
+        identity = read_identity(self._get_project_dir(agent_id))
+        if identity:
+            return identity
         return self.agent_configs[agent_id].get("system_prompt", "")
 
     def _build_system_prompt(self, agent_id: str) -> str:
         """Build the system prompt for an agent.
 
-        When using Claude Code as the LLM provider, CLAUDE.md in the project
-        directory is loaded automatically by the CLI — no injection needed.
-        For other providers, we read CLAUDE.md and inject it as a system message.
+        When using Claude Code as the LLM provider, the CLI loads the identity
+        itself from the project directory (CLAUDE.md, which imports AGENTS.md)
+        — no injection needed. For other providers, we read the identity file
+        and inject it as a system message.
         """
-        # Check if using Claude Code — it reads CLAUDE.md automatically
         agent_cfg = self.agent_configs[agent_id]
         llm_cfg = agent_cfg.get("llm", self.defaults.get("llm", {}))
         if llm_cfg.get("provider") == "claude_code":
-            return ""  # Claude Code handles this via CLAUDE.md
+            return ""  # Claude Code reads the identity from the project dir
 
         return self._read_identity_prompt(agent_id)
 
@@ -696,10 +697,10 @@ class AgentManager:
             (n for n, p in self.llm_providers.items() if p is llm), "unknown")
 
         # claude_code agents get no system prompt at build time — the CLI loads
-        # CLAUDE.md itself. If this turn ended up on a different provider
+        # the identity file itself. If this turn ended up on a different provider
         # (tier-router local turn, skill pin), that assumption is wrong: the
         # model would answer with no idea which agent it is and improvise an
-        # identity from the message envelope. Inject CLAUDE.md now.
+        # identity from the message envelope. Inject the identity now.
         if not system_prompt and provider_used != "claude_code":
             identity = self._read_identity_prompt(agent_id)
             if identity:

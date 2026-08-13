@@ -1,9 +1,9 @@
 """Agent scaffolding — shared by the setup wizard and the create_agent tool.
 
 Pure, non-interactive functions that write everything a new agent needs:
-an agents.yaml entry, the agent directory with CLAUDE.md, .mcp.json and
-.claude/settings.json. New agents come online after a process restart
-(agents.yaml is read at startup).
+an agents.yaml entry, the agent directory with AGENTS.md (+ per-CLI stubs),
+.mcp.json and .claude/settings.json. New agents come online after a process
+restart (agents.yaml is read at startup).
 """
 
 import json
@@ -17,6 +17,52 @@ from src.core.base import PROJECT_ROOT
 TIERS = ("privileged", "coordinator", "assistant")
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+# The agent's identity/instructions live in ONE canonical file, named for the
+# cross-CLI convention most agent CLIs read natively (Codex, opencode, Amp…).
+# CLIs with their own filename get a thin stub that imports it, so the content
+# exists exactly once and per-CLI notes have a home.
+IDENTITY_FILE = "AGENTS.md"
+
+CLAUDE_STUB = """@AGENTS.md
+
+<!-- Claude Code entry point. This agent's identity and instructions live in
+     AGENTS.md (imported above) — edit THAT file, not this one. Only Claude
+     Code-specific notes belong below this line. -->
+"""
+
+
+def write_identity(agent_dir: Path, content: str, *, force: bool = False) -> list[Path]:
+    """Write the canonical AGENTS.md plus per-CLI stub files.
+
+    Returns the paths written. Existing files are left untouched unless
+    force=True (used by dev harnesses that override the prompt).
+    """
+    agent_dir = Path(agent_dir)
+    written: list[Path] = []
+    identity_path = agent_dir / IDENTITY_FILE
+    if force or not identity_path.exists():
+        identity_path.write_text(content)
+        written.append(identity_path)
+    stub_path = agent_dir / "CLAUDE.md"
+    # A legacy full CLAUDE.md is only replaced under force — otherwise the
+    # migration script handles the rename explicitly.
+    if force or not stub_path.exists():
+        stub_path.write_text(CLAUDE_STUB)
+        written.append(stub_path)
+    return written
+
+
+def read_identity(project_dir: Path | str) -> str:
+    """The agent's identity text: AGENTS.md, or legacy CLAUDE.md, or empty."""
+    for name in (IDENTITY_FILE, "CLAUDE.md"):
+        path = Path(project_dir) / name
+        try:
+            if path.exists():
+                return path.read_text()
+        except OSError:
+            continue
+    return ""
 
 
 def agent_entries(overlay: Path) -> dict[str, dict]:
@@ -74,7 +120,7 @@ def cc_allow_for_tier(tier: str) -> list[str]:
 
 def default_claude_md(display_name: str, description: str, agent_dir: Path,
                       personality: str = "") -> str:
-    """Starter CLAUDE.md for a scaffolded agent."""
+    """Starter identity file (AGENTS.md) for a scaffolded agent."""
     personality_line = f"- Be {personality}\n" if personality else ""
     return f"""# {display_name}
 
@@ -110,7 +156,7 @@ The same loop on every request:
 You run inside a sandboxed kbots instance. Your project directory is in
 the **overlay**, separate from the engine code.
 
-- **Your directory:** `{agent_dir}/` — your CLAUDE.md, config, and data live here
+- **Your directory:** `{agent_dir}/` — your AGENTS.md, config, and data live here
 - **Generated files:** use `$KBOTS_TMP` (media, docs, scratch) for any files you create
 - **NEVER** `git add`, `git commit`, or `git push` in the kbots core engine
   directory — it is the framework, not your workspace. Agent configs, custom
@@ -256,11 +302,8 @@ def scaffold_agent(
     # --- agent directory ---
     agent_dir.mkdir(parents=True, exist_ok=True)
 
-    claude_md_path = agent_dir / "CLAUDE.md"
-    if not claude_md_path.exists():
-        content = claude_md or default_claude_md(display_name, description, agent_dir, personality)
-        claude_md_path.write_text(content)
-        written.append(claude_md_path)
+    content = claude_md or default_claude_md(display_name, description, agent_dir, personality)
+    written.extend(write_identity(agent_dir, content))
 
     # --- .mcp.json ---
     mcp_json_path = agent_dir / ".mcp.json"
