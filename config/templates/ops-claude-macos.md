@@ -20,7 +20,7 @@ You are {display_name} — the ops and dev agent.
 
 ## File System
 
-- **Your directory:** `{agent_dir}/` — your CLAUDE.md, config, and data live here
+- **Your directory:** `{agent_dir}/` — your AGENTS.md, config, and data live here
 - **Generated files:** use `$KBOTS_TMP` for media, docs, and scratch files
 - When editing Core framework code, always use a feature branch + PR — never commit directly to main
 - Deployment-specific files (agent configs, personal data) belong in the overlay, not in Core

@@ -189,7 +189,7 @@ tail -f <overlay>/data/launchd.stderr.log
 
 ### Your second agent
 
-The wizard sets up the process and your **main agent** only. Further agents are created *by the main agent*: ask it in Discord ("create an agent called research that..."), approve the HITL prompt, then restart (`/admin reboot`). It scaffolds the agents.yaml entry, agent directory, CLAUDE.md, and permissions via its `create_agent` tool.
+The wizard sets up the process and your **main agent** only. Further agents are created *by the main agent*: ask it in Discord ("create an agent called research that..."), approve the HITL prompt, then restart (`/admin reboot`). It scaffolds the agents.yaml entry, agent directory, AGENTS.md (+ CLAUDE.md stub), and permissions via its `create_agent` tool.
 
 **Every agent gets its own Discord bot** — own name, avatar, and entry in the member list (one Discord app per agent; `create_agent` refuses to share a bot between agents). Discord has no API to create apps, so the main agent replies with a **pre-filled Claude-in-Chrome prompt** (bot name and server ID already inserted) that automates the portal setup. It registers the bot account in config automatically and tells you exactly where the token goes — your part is: paste the prompt, copy the token into the vault, restart.
 
@@ -394,7 +394,7 @@ codex/
 └── processes/         ← SOPs, workflows
 ```
 
-An agent's CLAUDE.md points it at the codex, and `_index.md` draws the line between what to read here and what to fetch live from tools — so agents never quote a stale doc when fresher data is a tool call away. Full guide: [codex/README.md](codex/README.md).
+An agent's AGENTS.md points it at the codex, and `_index.md` draws the line between what to read here and what to fetch live from tools — so agents never quote a stale doc when fresher data is a tool call away. Full guide: [codex/README.md](codex/README.md).
 
 ## Built-in tools
 

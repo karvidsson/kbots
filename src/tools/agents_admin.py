@@ -96,7 +96,7 @@ def _portal_prompt(display_name: str, guild_id: str) -> str:
 @tool(
     name="create_agent",
     description=(
-        "Create a new agent: agents.yaml entry, agent directory, CLAUDE.md, "
+        "Create a new agent: agents.yaml entry, agent directory, AGENTS.md, "
         "MCP and permission config. Requires human approval; the new agent "
         "comes online after the service restarts. Every agent gets its OWN "
         "Discord bot identity (one Discord app per agent — sharing is "

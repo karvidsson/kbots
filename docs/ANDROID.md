@@ -69,7 +69,7 @@ account into an emulator.
 ## Agent playbook
 
 Guidance to give agents that drive the device (put deployment-specific facts
-— which phone, which accounts are logged in — in the agent's CLAUDE.md; this
+— which phone, which accounts are logged in — in the agent's AGENTS.md; this
 section is the generic technique). The `/android_task` skill packages this
 loop as a slash command.
 

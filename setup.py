@@ -841,7 +841,7 @@ def step_agent(state: dict):
 
     # Agent personality
     print()
-    info("Optionally set a personality for the agent's CLAUDE.md.")
+    info("Optionally set a personality for the agent's identity file (AGENTS.md).")
     personality = ask("Personality (e.g., 'concise and direct', 'friendly and detailed')", "concise and direct")
     state["agent"]["personality"] = personality
 
@@ -965,7 +965,7 @@ def step_compression(state: dict):
     header("Step 12: Context Compression (optional)")
     info("kbots can compress verbose context files (codex docs, skill prompts)")
     info("to reduce input tokens per agent message. Rule-based, no LLM calls.")
-    info("CLAUDE.md files are excluded — they're carefully tuned prompts.")
+    info("Agent identity files (AGENTS.md) are excluded — carefully tuned prompts.")
     print()
 
     compression = {"enabled": False, "level": "standard"}
@@ -1310,7 +1310,7 @@ def step_ops_instance(state: dict):
             config_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
             ok(f"Added bot '{bot_name}' to config.yaml")
 
-    # Scaffold the ops agent's CLAUDE.md from the platform-matching template:
+    # Scaffold the ops agent's identity from the platform-matching template:
     # Linux gets the separate unsandboxed rescue instance, macOS gets a
     # main-instance ops agent (no systemd sandbox to escape from).
     template_name = "ops-claude-macos.md" if sys.platform == "darwin" else "rescue-claude.md"
@@ -1745,11 +1745,11 @@ def step_summary(state: dict):
     {overlay}/config/config.yaml
     {overlay}/config/agents.yaml
     {overlay}/config/team.json
-    {agent_dir}/CLAUDE.md
+    {agent_dir}/AGENTS.md  (+ CLAUDE.md stub)
     {agent_dir}/.mcp.json
 
   {BOLD}Next steps:{RESET}
-    1. Review and customise {agent_dir}/CLAUDE.md
+    1. Review and customise {agent_dir}/AGENTS.md
     2. Talk to your agent:  mention @{agent['display_name']} in Discord
     3. Logs:                {CYAN}{logs_cmd}{RESET}
     4. Manage secrets:      {CYAN}uv run python vault-manage.py{RESET}
