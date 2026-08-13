@@ -14,12 +14,29 @@ focused PRs are all welcome.
   `extras/`, not `src/tools/`.
 - **No secrets, names, or numeric IDs** in code, tests, or docs — use synthetic
   fixtures (`1000000000000000001`-style snowflakes, `example.com` addresses).
-  `tests/test_no_install_leaks.py` enforces this: it fails on real snowflakes,
-  email addresses, home-directory paths and tailnet hostnames anywhere in the
-  tree, and — when run on a machine with an overlay — on that deployment's own
-  agent names. Comments and test fixtures count; that is where it has leaked
-  before. A leaked name is an untidy comment, but a leaked account ID is a live
-  identifier that outlives any later cleanup of the working tree.
+  This applies to **everything you write, not just the files you change**:
+  comments, test fixtures, **commit messages** and **pull request
+  descriptions** all count. That is not a style note — it is where every leak
+  so far has actually happened, and text outside the tree is the expensive kind:
+  a file can be edited, a commit message needs a history rewrite, and a PR body
+  stays on GitHub after the branch is gone.
+
+  `scripts/check_install_leaks.py` is the single implementation, run from three
+  places so nothing is checked only by good intentions:
+
+  | Surface | Enforced by |
+  |---|---|
+  | tracked files | `tests/test_no_install_leaks.py` |
+  | commit messages | the same tests, plus `.githooks/commit-msg` |
+  | PR title and body | `.github/workflows/ci.yml` |
+
+  It fails on real snowflakes, email addresses, home-directory paths and tailnet
+  hostnames — checks that need no configuration and work in a fresh public
+  clone — and, on a machine with an overlay, on that deployment's own agent
+  names. Enable the hook once per clone with `git config core.hooksPath
+  .githooks`; it is the cheapest place to catch this, but the test suite is the
+  guarantee, since `--no-verify` skips hooks and `scripts/self-deploy.sh` will
+  not ship a red suite.
 
 ## Workflow
 

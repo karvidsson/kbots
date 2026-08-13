@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: lint + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: tests/test_no_install_leaks.py scans every commit
+          # message, and a shallow clone would make that check pass vacuously.
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev
+      - run: uv run ruff check .
+      - run: uv run pytest -q
+
+  pr-metadata:
+    name: no install leaks in PR title/body
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # A pull request description is the one surface no test can reach: it
+      # lives on GitHub, not in the tree, and it is where live account IDs
+      # actually leaked. Title and body arrive via env rather than ${{ }}
+      # interpolation so that a description can never be run as shell.
+      - name: Scan PR title and body
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" > pr-metadata.txt
+          python3 scripts/check_install_leaks.py --text pr-metadata.txt
