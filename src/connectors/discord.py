@@ -246,36 +246,64 @@ class DiscordConnector(Connector):
         result.append(text[last:])
         return "".join(result)
 
+    @staticmethod
+    def _norm_name(s: str) -> str:
+        """Alphanumeric-only comparison: 'Data.Bot' == 'Data Bot' == 'Data.Bot'.
+        Agents type names from the roster; Discord identities differ in
+        punctuation and spacing."""
+        return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+    @classmethod
+    def _member_match(cls, member, norm: str) -> bool:
+        return (cls._norm_name(getattr(member, "display_name", "")) == norm
+                or cls._norm_name(getattr(member, "name", "")) == norm)
+
     async def _resolve_mention(self, guild, name: str) -> str | None:
-        """Name -> mention markup via roles, member cache, then HTTP search."""
-        low = name.lower()
-        key = (guild.id, low)
+        """Name -> mention markup: members first, roles as fallback.
+
+        Members MUST win over the auto-created managed role that shares every
+        bot's name — the bot-to-bot gates key on user mentions, and a role
+        mention is only as good as the receiver's role detection.
+        """
+        norm = self._norm_name(name)
+        if not norm:
+            return None
+        key = (guild.id, norm)
         cached = self._mention_cache.get(key)
         if cached:
             markup, ts = cached
             if markup is not None or (time.monotonic() - ts) < self._MENTION_NEG_TTL:
                 return markup
         markup = None
-        for role in getattr(guild, "roles", []):
-            if role.name.lower() == low:
-                markup = f"<@&{role.id}>"
+        for member in getattr(guild, "members", []):
+            if self._member_match(member, norm):
+                markup = f"<@{member.id}>"
                 break
-        if markup is None:
-            for member in getattr(guild, "members", []):
-                if member.display_name.lower() == low or member.name.lower() == low:
-                    markup = f"<@{member.id}>"
-                    break
         if markup is None and hasattr(guild, "search_members"):
             # HTTP prefix search — works without the privileged members intent,
             # which this client does not request (member cache is disabled).
+            # The search is a literal prefix match, so "Data.Bot" never finds
+            # "Data Bot" — retry with the leading alphanumeric run.
+            queries = [name]
+            lead = re.match(r"[A-Za-z0-9]+", name)
+            if lead and lead.group(0).lower() != name.lower():
+                queries.append(lead.group(0))
             try:
-                for member in await guild.search_members(name, limit=10):
-                    if member.display_name.lower() == low or member.name.lower() == low:
-                        markup = f"<@{member.id}>"
+                for query in queries:
+                    for member in await guild.search_members(query, limit=25):
+                        if self._member_match(member, norm):
+                            markup = f"<@{member.id}>"
+                            break
+                    if markup:
                         break
             except Exception as e:
                 logger.debug(f"Member search for {name!r} failed: {e}")
                 return None  # transient failure — don't negative-cache
+        if markup is None:
+            for role in getattr(guild, "roles", []):
+                if self._norm_name(role.name) == norm:
+                    markup = f"<@&{role.id}>"
+                    break
         if len(self._mention_cache) > 512:
             self._mention_cache.clear()
         self._mention_cache[key] = (markup, time.monotonic())
@@ -720,9 +748,20 @@ class DiscordBot:
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_mentioned = self.client.user in message.mentions if self.client.user else False
         if not is_mentioned and self.client.user:
-            # Check role mentions — Discord auto-creates a managed role for bots
+            # Check role mentions — Discord auto-creates a managed role for
+            # bots, and its tags carry the owning bot's id. This works without
+            # the member cache (disabled on this client), where the
+            # get_member() fallback below silently returns None.
+            for role in message.role_mentions:
+                tags = getattr(role, "tags", None)
+                if tags and getattr(tags, "bot_id", None) == self.client.user.id:
+                    is_mentioned = True
+                    break
+        if not is_mentioned and self.client.user:
+            # Fallback for regular (non-managed) roles assigned to the bot —
+            # only effective when the member cache holds our own entry
             bot_role_ids = {r.id for r in message.role_mentions}
-            if message.guild and self.client.user:
+            if bot_role_ids and message.guild:
                 member = message.guild.get_member(self.client.user.id)
                 if member:
                     for role in member.roles:

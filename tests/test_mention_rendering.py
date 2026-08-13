@@ -139,3 +139,23 @@ async def test_outgoing_no_guild_is_untouched():
     ch = SimpleNamespace()  # DM channel — no guild attribute
     text = "@Data.Bot hello"
     assert await _connector()._linkify_mentions(text, ch) == text
+
+
+async def test_outgoing_member_beats_managed_role_with_same_name():
+    # Discord auto-creates a managed role named after every bot. The USER
+    # mention must win — bot-to-bot gates key on user mentions.
+    eng_role = SimpleNamespace(id=50, name="Engineer")
+    eng_user = _user(3, "Engineer")
+    ch = _channel(_guild(roles=[eng_role], searchable=[eng_user]))
+    out = await _connector()._linkify_mentions("@Engineer build list updated", ch)
+    assert out == "<@3> build list updated"
+
+
+async def test_outgoing_punctuation_insensitive_name_match():
+    # Agents write "@Data.Bot" from the roster; the Discord identity is
+    # "Data Bot". Prefix search on the full token finds nothing — the
+    # leading-alphanumeric retry plus normalized comparison must connect.
+    databot = _user(2, "Data Bot")
+    ch = _channel(_guild(searchable=[databot]))
+    out = await _connector()._linkify_mentions("@Data.Bot interview time", ch)
+    assert out == "<@2> interview time"
