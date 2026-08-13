@@ -504,6 +504,11 @@ class DiscordBot:
         self._task_started_at = 0.0
         self._last_presence_at = 0.0
         self._heartbeat_task: "asyncio.Task | None" = None
+        # Set when a presence update could not be sent (gateway not ready).
+        # Presence is the one bit of state Discord holds for us rather than the
+        # other way round, so a dropped update is not self-correcting: it stays
+        # wrong until something else writes. Reconciled on reconnect.
+        self._presence_dirty = False
 
         # Build intents
         intents = discord.Intents.none()
@@ -519,6 +524,7 @@ class DiscordBot:
 
         # Register event handlers
         self.client.event(self.on_ready)
+        self.client.event(self.on_resumed)
         self.client.event(self.on_message)
         self.client.event(self.on_raw_reaction_add)
 
@@ -530,8 +536,41 @@ class DiscordBot:
         asyncio.create_task(self.client.start(token), name=f"discord-{self.account_name}")
         logger.info(f"Discord bot '{self.account_name}' starting...")
 
+    async def on_resumed(self) -> None:
+        """Gateway RESUMEd — re-assert presence if it drifted.
+
+        A RESUME does not fire on_ready, so nothing else re-states our status.
+        Any update dropped while the socket was down is still unsent, and
+        Discord may have kept whatever we last set, so reconcile here.
+        """
+        if self._presence_dirty:
+            logger.info(f"[{self.account_name}] gateway resumed — "
+                        f"re-applying presence (was stale)")
+            await self._apply_presence()
+
     async def close(self) -> None:
-        """Close the bot connection."""
+        """Close the bot connection, leaving an honest status behind.
+
+        Clearing presence first is the point. Restarting while busy is the
+        normal case, not the exception — self-deploy restarts the very service
+        the agent runs in, and the drain is capped, so an in-flight turn is
+        killed by design. Without this the last '🛠 <task>' stays on the
+        account, advertising work that died with the process: a status showing
+        a task that finished twenty minutes ago is worse than no status.
+
+        Best-effort and time-boxed — a slow gateway must not hold up shutdown,
+        because whatever is stopping us will not wait for long either.
+        """
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+        self._active_tasks = 0
+        self._task_detail = ""
+        try:
+            await asyncio.wait_for(self._apply_presence(), timeout=5)
+        except Exception as e:
+            logger.debug(f"[{self.account_name}] could not clear presence "
+                         f"on shutdown: {e}")
         await self.client.close()
 
     async def on_ready(self) -> None:
@@ -578,7 +617,14 @@ class DiscordBot:
         While busy, shows '🛠 <task> · m:ss' so a user can follow a long task
         by the running clock. A heartbeat refreshes the elapsed time.
         """
-        if not self._presence_enabled or not self.client.is_ready():
+        if not self._presence_enabled:
+            return
+        if not self.client.is_ready():
+            # Remember that the shown status no longer matches reality. Without
+            # this a task_finished() landing during a gateway blip leaves us
+            # advertising work that has already ended, until the next task
+            # happens to overwrite it.
+            self._presence_dirty = True
             return
         try:
             if self._active_tasks > 0:
@@ -595,7 +641,9 @@ class DiscordBot:
                     status=discord.Status.online, activity=None
                 )
             self._last_presence_at = time.monotonic()
+            self._presence_dirty = False
         except Exception as e:
+            self._presence_dirty = True
             logger.debug(f"[{self.account_name}] presence update failed: {e}")
 
     async def _presence_heartbeat(self) -> None:
