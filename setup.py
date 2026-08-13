@@ -1310,13 +1310,17 @@ def step_ops_instance(state: dict):
             config_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
             ok(f"Added bot '{bot_name}' to config.yaml")
 
-    # Scaffold into agents.rescue.yaml with the rescue CLAUDE.md template
-    template_path = ENGINE_ROOT / "config" / "templates" / "rescue-claude.md"
+    # Scaffold the ops agent's CLAUDE.md from the platform-matching template:
+    # Linux gets the separate unsandboxed rescue instance, macOS gets a
+    # main-instance ops agent (no systemd sandbox to escape from).
+    template_name = "ops-claude-macos.md" if sys.platform == "darwin" else "rescue-claude.md"
+    template_path = ENGINE_ROOT / "config" / "templates" / template_name
     if template_path.exists():
-        claude_md = template_path.read_text().format(display_name=display_name, agent_dir=agent_dir)
+        claude_md = template_path.read_text().format(
+            display_name=display_name, agent_dir=agent_dir, engine_root=ENGINE_ROOT)
     else:
-        claude_md = f"# {display_name}\n\nYou are {display_name} — the unsandboxed ops and dev agent.\n"
-        warn("Template not found at config/templates/rescue-claude.md — using minimal fallback")
+        claude_md = f"# {display_name}\n\nYou are {display_name} — the ops and dev agent.\n"
+        warn(f"Template not found at config/templates/{template_name} — using minimal fallback")
 
     # The separate "rescue" profile exists for Linux sandbox isolation (the
     # main service runs sandboxed; the ops agent needs its own unsandboxed
