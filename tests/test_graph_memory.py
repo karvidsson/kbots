@@ -122,6 +122,26 @@ async def test_export_for_visualization(tmp_path):
         gm.close()
 
 
+@needs_ladybug
+async def test_export_own_only(tmp_path):
+    gm = _gm(tmp_path)
+    try:
+        await gm.link("A", "knows", "B", scope="global", created_by="alice")
+        await gm.link("B", "uses", "C", scope="agent", created_by="alice")
+        await gm.link("C", "runs", "D", scope="global", created_by="bob")
+        # own_only: alice sees only what she created — not bob's global edge
+        data = await gm.export(agent_id="alice", own_only=True)
+        assert {(e["src"], e["dst"]) for e in data["edges"]} == {("A", "B"), ("B", "C")}
+        # default (visible) view still includes bob's global edge
+        data = await gm.export(agent_id="alice")
+        assert len(data["edges"]) == 3
+        # bob's own view: just his edge
+        data = await gm.export(agent_id="bob", own_only=True)
+        assert {(e["src"], e["dst"]) for e in data["edges"]} == {("C", "D")}
+    finally:
+        gm.close()
+
+
 # --- Scope normalization (pure functions, no DB) ---
 
 def test_normalize_scope():

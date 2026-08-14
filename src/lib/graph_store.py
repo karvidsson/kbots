@@ -209,22 +209,31 @@ class GraphMemory:
         )
         return _rows(result)
 
-    async def export(self, *, agent_id: str | None = None, limit: int = 400) -> dict:
-        """All visible edges + their endpoints, for visualization.
+    async def export(self, *, agent_id: str | None = None, limit: int = 400,
+                     own_only: bool = False) -> dict:
+        """Edges + their endpoints, for visualization.
 
+        Default: everything visible to the agent (own + global + group edges).
+        own_only: just this agent's memories — edges it created or scoped to it.
         Returns {"nodes": [{name, type, degree}], "edges": [{src, rel, dst, ...}]}.
         """
         limit = max(1, min(int(limit), 2000))
         conn = await self._ensure_open()
         agent_scope = f"agent:{agent_id}" if agent_id else "agent:"
+        if own_only:
+            where = "(r.created_by = $agent OR r.scope = $agent_scope)"
+            params = {"agent": agent_id or "", "agent_scope": agent_scope}
+        else:
+            where = _SCOPE_FILTER
+            params = {"agent_scope": agent_scope}
         result = await conn.execute(
             "MATCH (a:Entity)-[r:Related]->(b:Entity) "
-            f"WHERE {_SCOPE_FILTER} "
+            f"WHERE {where} "
             "RETURN a.name AS src, a.type AS src_type, b.name AS dst, b.type AS dst_type, "
             "r.rel AS rel, r.confidence AS confidence, r.scope AS scope, "
             "r.created_by AS created_by "
             f"LIMIT {limit}",
-            {"agent_scope": agent_scope},
+            params,
         )
         edges = _rows(result)
         nodes: dict[str, dict] = {}

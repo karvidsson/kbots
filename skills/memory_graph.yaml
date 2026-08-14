@@ -1,14 +1,15 @@
 name: memory_graph
-description: Generate and send an interactive map of the agent's memory graph (entities + relationships)
+description: Generate and send an interactive map of this agent's memory graph (entities + relationships)
 tools:
   - memory_graph
   - send_discord_file
 prompt: |
   The user wants to see the memory graph.
 
-  1. Call `memory_graph` — it gathers every entity and relationship visible to
-     you from graph memory and writes a self-contained interactive HTML file,
-     returning its path.
+  1. Call `memory_graph` — it gathers YOUR memories (entities + relationships
+     this agent stored) from graph memory and writes a self-contained
+     interactive HTML file, returning its path. Only pass view='shared' if the
+     user explicitly asked for the shared/global graph across agents.
   2. Send that file to the user in THIS channel with
      `send_discord_file(channel_id=<this channel>, file_path=<the path from step 1>)`,
      plus a short note like "Here's the current memory graph — open it in a
