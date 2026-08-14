@@ -51,6 +51,8 @@ _SCHEMA: dict[str, tuple] = {
             "graph": (dict, False, None, {
                 "enabled": (bool, False, None, None),
                 "path": (str, False, None, None),
+                "extract": (bool, False, None, None),
+                "extract_batch": (int, False, None, None),
             }),
         }),
     }),
