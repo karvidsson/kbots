@@ -9,7 +9,6 @@ memory_unlink — memory_graph_query is read-only by design.
 
 import json
 import logging
-import re
 import time
 from pathlib import Path
 
@@ -18,14 +17,6 @@ from src.core.tools import tool
 from src.lib.graph_store import GraphUnavailableError, get_graph
 
 logger = logging.getLogger(__name__)
-
-# Defense-in-depth for memory_graph_query, not a sandbox: rejects Cypher that
-# writes or touches the catalog. Scope attribution can only be bypassed by
-# writes, and writes only happen through memory_link/memory_unlink.
-_WRITE_RE = re.compile(
-    r"\b(CREATE|MERGE|SET|DELETE|DETACH|DROP|ALTER|COPY|CALL|LOAD|INSTALL|ATTACH|IMPORT|EXPORT)\b",
-    re.IGNORECASE,
-)
 
 
 @tool(name="memory_link", description="Link two entities in graph memory (a —rel→ b)", category="memory")
@@ -92,31 +83,29 @@ async def memory_unlink(ctx: ToolContext, a: str, rel: str, b: str) -> str:
     return f"Removed: {a} —{rel}→ {b}"
 
 
-@tool(name="memory_graph_query", description="Run a read-only Cypher query against graph memory", category="memory")
-async def memory_graph_query(ctx: ToolContext, cypher: str, limit: int = 50) -> str:
-    """Run a read-only Cypher query on the memory graph.
+@tool(name="memory_graph_query", description="Search graph memory by relationship and/or entity", category="memory")
+async def memory_graph_query(ctx: ToolContext, rel: str = "", entity: str = "", limit: int = 50) -> str:
+    """Search the memory graph for edges, scoped to what you're allowed to see.
 
-    Schema: (a:Entity {name, type, scope, created_by, created_at})
-            -[r:Related {rel, confidence, scope, created_by, created_at}]->(b:Entity).
-    Example: MATCH (a:Entity)-[r:Related]->(b:Entity) WHERE r.rel = 'works_at' RETURN a.name, b.name
+    This is a structured, scope-enforced search — not raw Cypher — so it can
+    only ever return edges visible to you (global, your group, your own private).
+    Give a relationship, an entity, both, or neither (to list everything visible).
 
     Args:
-        cypher: The Cypher query (MATCH/RETURN only — writes are rejected)
+        rel: Filter to this relationship, e.g. works_at (optional)
+        entity: Filter to edges touching this entity (optional)
         limit: Max rows to return
     """
-    if _WRITE_RE.search(cypher):
-        return ("Rejected: only read queries are allowed here. "
-                "Use memory_link / memory_unlink to modify the graph.")
     try:
-        rows = await get_graph().query(cypher, limit=limit)
+        rows = await get_graph().find(rel=rel or None, entity=entity or None,
+                                      agent_id=ctx.agent_id, limit=limit)
     except GraphUnavailableError as e:
         return str(e)
-    except Exception as e:
-        return f"Query error: {e}"
     if not rows:
-        return "Query returned no rows."
-    lines = [f"{len(rows)} row(s):"]
-    lines += [json.dumps(row, default=str, ensure_ascii=False) for row in rows]
+        return "No matching relationships found."
+    lines = [f"{len(rows)} relationship(s):"]
+    lines += [f"  {r['src']} —{r['rel']}→ {r['dst']} (conf {r['confidence']:.2f}, {r['scope']})"
+              for r in rows]
     return "\n".join(lines)
 
 
@@ -202,7 +191,7 @@ function select(n){
   panel.innerHTML=`<h2>${esc(n.name)}</h2><div class="t">${esc(n.type)} · ${rel.length} relationship(s)</div>`+
     `<section><h3>Relationships</h3><div>`+
     (rel.map(e=>{const out=e.src===n.name;
-      return `<div style="margin:4px 0">${out?'':esc(e.src)+' '}<code>${out?e.rel:'←'+esc(e.rel)}</code> ${out?esc(e.dst):''}`+
+      return `<div style="margin:4px 0">${out?'':esc(e.src)+' '}<code>${out?esc(e.rel):'←'+esc(e.rel)}</code> ${out?esc(e.dst):''}`+
         `<span class="hint"> · conf ${Number(e.confidence).toFixed(2)} · ${esc(e.scope)}${e.created_by?' · by '+esc(e.created_by):''}</span></div>`;}).join('')||'<span class="hint">—</span>')+
     `</div></section>`;
 }
