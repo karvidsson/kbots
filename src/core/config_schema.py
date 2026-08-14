@@ -29,7 +29,6 @@ _SCHEMA: dict[str, tuple] = {
     }),
     "connectors": (dict, False, None, {
         "discord": (dict, False, None, None),
-        "telegram": (dict, False, None, None),
         "http": (dict, False, None, None),
         "webhook": (dict, False, None, None),
     }),

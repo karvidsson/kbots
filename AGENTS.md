@@ -22,7 +22,7 @@ Put a file in the matching folder, point config at it, and it works.
 ```
 Registry (auto-discovers all modules)
     │
-    ├── Connectors   src/connectors/    discord, telegram, slack, http...
+    ├── Connectors   src/connectors/    discord, slack, http...
     ├── LLM          src/llm/           claude, groq, ollama, openai...
     ├── Memory       src/memory/        sqlite, postgres, redis...
     ├── Vault        src/vault/         fernet (default)
@@ -39,7 +39,7 @@ An agent = a project folder plus a config block that selects modules. [ARCHITECT
 ```
 src/
   core/          — registry, agent manager, router, middleware, base interfaces
-  connectors/    — one file per platform (discord.py, telegram.py, etc.)
+  connectors/    — one file per platform (discord.py, etc.)
   llm/           — one file per provider (claude_code.py, etc.)
   memory/        — one file per backend (sqlite.py, etc.)
   vault/         — credential encryption (fernet.py)
@@ -61,7 +61,6 @@ data/            — SQLite databases, audit logs, state (gitignored)
 - **Claude Code CLI** driving the primary LLM engine (Pro/Max subscription, or API/Console billing)
 - Alternative LLM providers via a direct HTTP client — any OpenAI-compatible endpoint; Ollama and LM Studio are auto-detected
 - **discord.py** for Discord
-- *python-telegram-bot* for Telegram (roadmap)
 - **cryptography** (Fernet) powering the credential vault
 - *FastAPI* for HTTP API / webhooks (roadmap)
 

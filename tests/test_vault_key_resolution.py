@@ -135,7 +135,7 @@ def test_canonical_keys_are_the_ones_core_actually_reads():
     for expected in ("secrets/cloudflare-api-token", "secrets/notion-api-key",
                      "secrets/gemini-api-key", "secrets/tavily-api-key",
                      "secrets/serpapi-key", "secrets/slack-bot-token",
-                     "secrets/telegram-bot-token", "discord-token", "github-token"):
+                     "discord-token", "github-token"):
         assert expected in vault_manage.ALL_KEYS
 
 

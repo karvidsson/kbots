@@ -218,7 +218,7 @@ class Skill:
 # === Module interfaces ===
 
 class Connector(ABC):
-    """Base class for all connectors (Discord, Telegram, HTTP, etc.)."""
+    """Base class for all connectors (Discord, HTTP, etc.)."""
     name: str
 
     def __init__(self, config: dict, vault: "VaultBackend | None" = None):
