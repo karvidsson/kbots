@@ -256,20 +256,23 @@ async def main() -> None:
 
     security_cfg = config.get("security", {})
 
-    # HITL
-    hitl = None
+    # HITL — always constructed so gated / hitl=True tools fail closed even when
+    # no channel is configured (previously a missing channel meant no gate at all).
     hitl_cfg = security_cfg.get("hitl", {})
-    if hitl_cfg.get("channel"):
-        hitl = HITLGate(hitl_cfg, storage._db)
-        await hitl.init_schema()
-        await hitl.load_enabled()
-        if not hitl.enabled:
-            logger.warning("HITL approval gate is DISABLED (full-control mode) — "
-                           "tools run without human approval")
-        recovered = await hitl.recover_pending()
-        if recovered:
-            logger.info(f"HITL: recovered {recovered} expired pending requests")
-        logger.info(f"HITL gates: {len(hitl_cfg.get('gated_tools', []))} tools gated")
+    admin_discord = (config.get("admin_users", {}) or {}).get("discord", [])
+    hitl = HITLGate(hitl_cfg, storage._db, admin_users=admin_discord)
+    await hitl.init_schema()
+    await hitl.load_enabled()
+    if not hitl_cfg.get("channel"):
+        logger.warning("HITL: no security.hitl.channel configured — gated and hitl=True "
+                       "tools fail closed (denied) on the in-process path.")
+    if not hitl.enabled:
+        logger.warning("HITL approval gate is DISABLED (full-control mode) — "
+                       "tools run without human approval")
+    recovered = await hitl.recover_pending()
+    if recovered:
+        logger.info(f"HITL: recovered {recovered} expired pending requests")
+    logger.info(f"HITL gates: {len(hitl_cfg.get('gated_tools', []))} tools gated")
 
     # Rate limiter
     rate_limiter = RateLimiter(security_cfg.get("rate_limits", {}))
@@ -301,14 +304,26 @@ async def main() -> None:
             tc_path, include_tool_trace=tc_cfg.get("include_tool_trace", True))
         logger.info(f"Training-data collection: ON → {tc_path}")
 
-    # Access control
+    # Access control — opt-in (enabling it fail-closes unknown senders, which
+    # would silently ignore any human not in team.json, so it must be a
+    # deliberate operator choice). When unconfigured we log a loud warning rather
+    # than silently enforcing and risking a lockout. `admin_users` bridge to owner
+    # so turning it on can never lock the operator out.
     from src.core.access_control import AccessControl
     ac_cfg = security_cfg.get("access_control", {})
     hitl_gated = security_cfg.get("hitl", {}).get("gated_tools", [])
-    access_control = AccessControl(ac_cfg, hitl_gated_tools=hitl_gated) if ac_cfg else None
-    if access_control:
-        logger.info(f"Access control: {len(ac_cfg.get('safe_tools', []))} safe tools, "
+    if ac_cfg:
+        access_control = AccessControl(ac_cfg, hitl_gated_tools=hitl_gated,
+                                       admin_users=admin_discord)
+        logger.info(f"Access control: ENABLED — {len(ac_cfg.get('safe_tools', []))} safe tools, "
                      f"isolated agents: {ac_cfg.get('isolated_agents', [])}")
+    else:
+        access_control = None
+        logger.warning(
+            "Access control is NOT configured — any user who can post in a routed "
+            "channel can drive agents with their full toolset (including Bash). "
+            "Enable security.access_control in config.yaml (see config.yaml.example)."
+        )
 
     # Keep team.json (the central roster) in sync with config — prune stale agents,
     # refresh tier/model/tools/rights. The roster injection + /team-graph read from it.
