@@ -89,6 +89,9 @@ defaults:
     # (global / agent:<id> / group:<name>) like memories. Agents get the
     # memory_link / memory_related / memory_unlink / memory_graph_query /
     # memory_graph tools. Requires: uv sync --extra graph
+    # NOTE macOS 14: that sync fails — ladybug ships no macOS 14 wheels and its
+    # source build needs the macOS 15 SDK. Workaround (a 2-line patch + local
+    # wheel via the overlay): roadmap/graph-memory-ladybugdb.md → "macOS 14"
     graph:
       enabled: false
       path: data/graph/memory.lbdb   # resolved against the repo root
