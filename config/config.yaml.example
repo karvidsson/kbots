@@ -95,6 +95,12 @@ defaults:
     graph:
       enabled: false
       path: data/graph/memory.lbdb   # resolved against the repo root
+      # extract: true        # reflector also mines memories into graph edges
+      #                      # (one cheap LLM call per agent per reflection pass;
+      #                      # backfills the existing store batch by batch, then
+      #                      # keeps absorbing new memories; edge scope inherits
+      #                      # the source memory's scope)
+      # extract_batch: 60    # memories examined per pass
 
 # Schedule oversight (optional): a dedicated channel where agents' scheduled
 # tasks are posted. React ❌ on a card to cancel it; use /schedules for the full
