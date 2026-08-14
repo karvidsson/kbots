@@ -352,6 +352,28 @@ class SQLiteMemory(MemoryBackend):
         ).fetchall()
         return [self._row_to_dict(r) for r in rows]
 
+    async def list_since(self, agent_id: str, since: tuple[str, str] | None = None,
+                         limit: int = 100) -> list[dict]:
+        """An agent's visible memories after the cursor (any category), oldest
+        first — a stable cursor for incremental consumers (the reflector's
+        graph extraction walks the store batch by batch).
+
+        `since` is (updated_at, id) of the last row already consumed. The id
+        tiebreak makes the walk lossless across rows sharing one second-
+        precision timestamp, without ever re-reading a full batch."""
+        s_ts, s_id = since or ("", "")
+        scope_sql, scope_params = self._scope_filter(agent_id)
+        rows = self.db.execute(
+            f"""SELECT * FROM memories
+                WHERE ({scope_sql})
+                  AND scope NOT LIKE 'archived%'
+                  AND (updated_at > ? OR (updated_at = ? AND id > ?))
+                ORDER BY updated_at ASC, id ASC
+                LIMIT ?""",
+            scope_params + [s_ts, s_ts, s_id, limit],
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
     async def update(self, memory_id: int, agent_id: str | None = None, **fields) -> bool:
         """Update fields on a memory."""
         if not fields:
