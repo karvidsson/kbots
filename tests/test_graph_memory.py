@@ -5,7 +5,7 @@ import pytest
 from src.core.base import ToolContext
 from src.lib import graph_store
 from src.lib.graph_store import GraphMemory, GraphUnavailableError, get_graph, init_graph
-from src.tools.graph import _WRITE_RE, memory_graph, memory_link, memory_related
+from src.tools.graph import memory_graph, memory_link, memory_related
 
 try:
     import ladybug  # noqa: F401
@@ -128,19 +128,15 @@ def test_normalize_scope():
     assert graph_store._normalize_scope("agent", "alice") == "agent:alice"
     assert graph_store._normalize_scope("global", None) == "global"
     assert graph_store._normalize_scope("group:ops", None) == "group:ops"
+    # An agent may name its own private scope explicitly...
+    assert graph_store._normalize_scope("agent:alice", "alice") == "agent:alice"
+    # ...but never another agent's (memory-poisoning guard).
+    with pytest.raises(ValueError):
+        graph_store._normalize_scope("agent:bob", "alice")
     with pytest.raises(ValueError):
         graph_store._normalize_scope("everyone", "alice")
     with pytest.raises(ValueError):
         graph_store._normalize_scope("agent", None)
-
-
-# --- Read-only guard (pure regex, no DB) ---
-
-def test_readonly_guard():
-    assert _WRITE_RE.search("MERGE (a:Entity {name:'x'})")
-    assert _WRITE_RE.search("MATCH (a) DETACH DELETE a")
-    assert _WRITE_RE.search("create node table X(name STRING)")
-    assert not _WRITE_RE.search("MATCH (a:Entity)-[r:Related]->(b) RETURN a.name, r.rel")
 
 
 # --- Singleton + degradation (no ladybug needed) ---
@@ -161,7 +157,37 @@ async def test_tools_degrade_when_unavailable():
     assert "kbots[graph]" in out
 
 
-async def test_tool_rejects_write_cypher():
+@needs_ladybug
+async def test_graph_query_is_scope_filtered(tmp_path):
+    """memory_graph_query must never surface another agent's private edges."""
     from src.tools.graph import memory_graph_query
-    out = await memory_graph_query(_ctx(), "MATCH (a) DETACH DELETE a")
-    assert "Rejected" in out
+    gm = _gm(tmp_path)
+    graph_store._graph = gm
+    try:
+        await gm.link("Alice", "prefers", "Tea", scope="agent", created_by="alice")
+        await gm.link("Alice", "works_at", "Acme", scope="global", created_by="alice")
+        # Bob queries — must see the global edge, never Alice's private one.
+        out = await memory_graph_query(_ctx("bob"))
+        assert "works_at" in out
+        assert "prefers" not in out and "Tea" not in out
+    finally:
+        graph_store._graph = None
+        gm.close()
+
+
+@needs_ladybug
+async def test_graph_html_escapes_rel(tmp_path):
+    """A relationship containing markup must not inject into the exported HTML JS."""
+    from src.tools.graph import _render_graph_html
+    gm = _gm(tmp_path)
+    try:
+        await gm.link("A", "</script><img src=x onerror=alert(1)>", "B",
+                      scope="global", created_by="alice")
+        data = await gm.export(agent_id="alice")
+        html = _render_graph_html(data["nodes"], data["edges"], "T")
+        # The injected closing tag must be escaped in the embedded JSON payload,
+        # leaving only the document's own single real </script>.
+        assert "<\\/script>" in html
+        assert html.count("</script>") == 1
+    finally:
+        gm.close()
