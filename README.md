@@ -419,8 +419,8 @@ One process, with every layer swappable:
 ```
                         ┌─ the kbots process ──────────────────────────┐
  Discord ───────────────►  connector                                   │
- (Telegram/Slack:       │      │                                       │
-  roadmap)              │   router ── channel/category → agent         │
+ (Slack: roadmap)       │      │                                       │
+                        │   router ── channel/category → agent         │
                         │      │                                       │
                         │   access control (3 layers)                  │
                         │      │                                       │
@@ -651,7 +651,7 @@ Two different questions get asked as "which agent framework should I use?" One i
 |---|---|---|---|---|
 | One-liner | messaging → persistent LLM sessions in project contexts | personal assistant, any OS, any platform | self-improving harness by Nous Research | memory-first agent server (ex-MemGPT) |
 | Runtime | Python 3.12, **one process + SQLite** | Node 24+, TypeScript | Python 3.11 | Python server; Docker, Postgres/SQLite |
-| Chat channels | Discord (Telegram, Slack on roadmap) | **11+** (Discord, WhatsApp, Signal, iMessage, Teams, Telegram…) + plugin channels | Telegram, Discord, Slack, WhatsApp, Signal + CLI | Slack, CLI, desktop app, SDK |
+| Chat channels | Discord (Slack on roadmap) | **11+** (Discord, WhatsApp, Signal, iMessage, Teams, Telegram…) + plugin channels | Telegram, Discord, Slack, WhatsApp, Signal + CLI | Slack, CLI, desktop app, SDK |
 | LLM support | Claude Code CLI, any OpenAI-compatible endpoint, **local models** (Ollama/LM Studio auto-detect) | model-agnostic, bring your own key | Nous Portal, OpenRouter (200+), OpenAI-compatible, local vLLM | model-agnostic; Anthropic/OpenAI recommended |
 | Memory | SQLite FTS + semantic search + agent-curated lessons w/ periodic reflection | session-scoped (per agent/workspace/sender) | FTS5 session search + LLM summarization + agent-curated memory | **the** differentiator — self-improving memory hierarchy (MemGPT lineage) |
 | Agents create their own tools | ✅ `create_tool`: AST-validated, hot-loaded, **private to creator** until human-approved promotion | ➖ skills ecosystem ([ClawHub](https://clawhub.ai)), install-based | ✅ autonomous skill creation ([SKILL.md](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills), self-improving) | ➖ custom tools via SDK |
