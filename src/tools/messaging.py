@@ -1,10 +1,9 @@
 """Outbound messaging tools — reach people beyond Discord.
 
-Slack, Telegram, and SMS (Twilio). Each is HITL-gated (like send_email) and
+Slack and SMS (Twilio). Each is HITL-gated (like send_email) and
 reads its credentials from the vault, degrading with clear guidance when a
 token isn't configured. Tokens (add via the vault):
 - Slack:    secrets/slack-bot-token          (xoxb-… bot token)
-- Telegram: secrets/telegram-bot-token        (from @BotFather)
 - Twilio:   secrets/twilio-account-sid,
             secrets/twilio-auth-token,
             secrets/twilio-from-number         (+15551234567)
@@ -51,40 +50,6 @@ async def slack_send(ctx: ToolContext, channel: str, text: str) -> str:
     if not data.get("ok"):
         return f"Slack error: {data.get('error', 'unknown')}"
     return f"Message sent to Slack {channel} (ts {data.get('ts')})."
-
-
-@tool(name="telegram_send", description="Send a message to a Telegram chat",
-      category="messaging", hitl=True)
-async def telegram_send(ctx: ToolContext, chat_id: str, text: str) -> str:
-    """Send a message via the Telegram Bot API.
-
-    Args:
-        chat_id: numeric chat ID or @channelusername.
-        text: message text.
-    Requires a bot token in the vault as secrets/telegram-bot-token.
-    """
-    token = _secret(ctx, "telegram-bot-token")
-    if not token:
-        return "No Telegram token configured. Add it to the vault as secrets/telegram-bot-token."
-    if not chat_id or not text:
-        return "Both 'chat_id' and 'text' are required."
-
-    import aiohttp
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.post(
-                f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": text},
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as r:
-                data = await r.json()
-    except aiohttp.ClientError as e:
-        # Scrub the bot token — it's embedded in the request URL and can appear
-        # in aiohttp's error text.
-        return f"Telegram request failed: {str(e).replace(token, '***')}"
-    if not data.get("ok"):
-        return f"Telegram error: {data.get('description', 'unknown')}"
-    return f"Message sent to Telegram chat {chat_id}."
 
 
 @tool(name="sms_send", description="Send an SMS via Twilio",

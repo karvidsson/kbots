@@ -37,8 +37,6 @@ connectors:
       # Add more bots:
       # ops:
       #   token_key: secrets/ops-bot-token
-  telegram:
-    enabled: false
   http:
     enabled: false
     port: 8080

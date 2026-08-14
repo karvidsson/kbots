@@ -372,7 +372,7 @@ agents:
 
 ### Routing
 
-When a message arrives, routing decides which agent picks it up. Every connector defines its own namespace of routing keys (`routing.discord`, `routing.telegram`, and so on).
+When a message arrives, routing decides which agent picks it up. Every connector defines its own namespace of routing keys (`routing.discord`, `routing.http`, and so on).
 
 **Discord routing — scope vs filters:**
 

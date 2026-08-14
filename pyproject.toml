@@ -5,7 +5,6 @@ description = "Self-contained, LLM-agnostic agent system for messaging platforms
 requires-python = ">=3.12"
 dependencies = [
     "discord.py>=2.4.0",
-    "python-telegram-bot>=21.0",
     "aiosqlite>=0.20.0",
     "cryptography>=43.0.0",
     "pyyaml>=6.0",
