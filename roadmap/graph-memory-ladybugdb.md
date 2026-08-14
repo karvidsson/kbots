@@ -108,6 +108,33 @@ global/group visible), idempotent MERGE, unlink-own-only, reopen persistence,
 read-only-guard regex (pure function, no DB), graceful degradation without ladybug
 (returns string mentioning `kbots[graph]`), `init_graph` disabled → `get_graph()` raises.
 
+## macOS 14: `uv sync --extra graph` fails — patched local wheel needed
+
+`ladybug` publishes only `macosx_15_0` wheels, and building its sdist on
+macOS 14 fails: `src/c_api/{connection,database}.cpp` use `std::atomic_ref`,
+which Apple's toolchain only supports from the macOS 15 SDK (libc++ >= 17;
+upstream documents Xcode 16+ as the minimum — LadybugDB/ladybug#779). Linux and
+macOS 15+ are unaffected.
+
+Workaround for a macOS 14 deployment:
+
+1. Download the 0.19.1 sdist and, in `ladybug-source/src/c_api/`, replace the
+   two `std::atomic_ref<void*>(...).exchange(nullptr)` call sites
+   (`connection.cpp` and `database.cpp`) with the equivalent builtin:
+   `__atomic_exchange_n(&<member>, static_cast<void*>(nullptr), __ATOMIC_SEQ_CST)`
+   — same semantics, no behavior change.
+2. Build a wheel (`python setup.py bdist_wheel`; needs cmake + a C++20
+   compiler) and copy it into the overlay, e.g. `$KBOTS_OVERLAY/wheels/`.
+3. Reference it from `$KBOTS_OVERLAY/requirements.txt`
+   (`ladybug @ file://<path-to-wheel>`) — sync.sh installs Layer 3 after the
+   core `uv sync`, so the wheel is re-applied on every deploy.
+4. Do **not** add `graph` to `$KBOTS_OVERLAY/extras`: that makes `uv sync`
+   attempt the sdist build, which fails and aborts the deploy. The config
+   block below is still just `defaults.memory.graph.enabled: true`.
+
+Remove the workaround (wheel + requirements entry, re-add the `graph` extra)
+once the host is on macOS 15+ or upstream ships broader wheels.
+
 ## Deferred (designed, not in scope)
 - **Auto-recall graph context**: `agent_manager._auto_recall` (~line 326-364) can later
   append a `<graph-neighborhood>` block via `get_graph().related(...)`; gate behind future
