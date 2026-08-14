@@ -403,7 +403,7 @@ def edit_connectors(cfg: dict):
         if choice in ("5", "back", "b", ""):
             break
         elif choice == "1":
-            name = ask("Connector name (discord/telegram/http)")
+            name = ask("Connector name (discord/http)")
             if name in connectors:
                 current = connectors[name].get("enabled", False)
                 connectors[name]["enabled"] = not current

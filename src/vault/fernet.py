@@ -186,7 +186,7 @@ class FernetVault(VaultBackend):
         for key in os.environ:
             if any(key.startswith(prefix) for prefix in (
                 "DISCORD_", "ANTHROPIC_", "GROQ_", "OPENAI_",
-                "TAVILY_", "TELEGRAM_", "SLACK_",
+                "TAVILY_", "SLACK_",
             )):
                 self._secrets[key] = os.environ[key]
 

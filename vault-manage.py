@@ -29,7 +29,6 @@ ALL_KEYS = [
     "secrets/trello-credentials.json",
     # Messaging
     "secrets/slack-bot-token",
-    "secrets/telegram-bot-token",
     "secrets/twilio-account-sid",
     "secrets/twilio-auth-token",
     "secrets/twilio-from-number",
