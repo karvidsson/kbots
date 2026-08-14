@@ -185,3 +185,71 @@ async def test_tool_rejects_write_cypher():
     from src.tools.graph import memory_graph_query
     out = await memory_graph_query(_ctx(), "MATCH (a) DETACH DELETE a")
     assert "Rejected" in out
+
+
+# --- Loopback routing: GraphClient → InternalAPI /graph → GraphMemory ---
+# The path agents actually use: tools run in the MCP subprocess and forward
+# every graph call to the main process. A stub-only test here is what let the
+# "structurally unreachable" bug ship — keep this one end-to-end.
+
+async def _start_api():
+    from src.core.internal_api import InternalAPI
+    api = InternalAPI(object(), {"port": 0})
+    await api.start()
+    return api
+
+
+@needs_ladybug
+async def test_graph_client_loopback_end_to_end(tmp_path, monkeypatch):
+    from src.lib.graph_store import GraphClient
+    gm = _gm(tmp_path)
+    monkeypatch.setattr(graph_store, "_graph", gm)
+    api = await _start_api()
+    try:
+        client = GraphClient(f"http://{api.host}:{api.port}", api.token)
+        edge = await client.link("Alice", "works_at", "Acme",
+                                 scope="agent", created_by="alice")
+        assert edge["scope"] == "agent:alice"
+        edges = await client.related("Alice", agent_id="alice")
+        assert [(e["src"], e["dst"]) for e in edges] == [("Alice", "Acme")]
+        data = await client.export(agent_id="alice", own_only=True)
+        assert len(data["edges"]) == 1
+        rows = await client.query(
+            "MATCH (a:Entity)-[r:Related]->(b:Entity) RETURN a.name AS src")
+        assert rows == [{"src": "Alice"}]
+        assert await client.unlink("Alice", "works_at", "Acme", agent_id="alice") == 1
+        # a bad scope surfaces as ValueError across the process boundary,
+        # matching in-process GraphMemory behavior (memory_link catches it)
+        with pytest.raises(ValueError):
+            await client.link("A", "r", "B", scope="bogus")
+    finally:
+        await api.stop()
+        gm.close()
+
+
+async def test_graph_client_auth_and_disabled(monkeypatch):
+    from src.lib.graph_store import GraphClient
+    monkeypatch.setattr(graph_store, "_graph", None)
+    api = await _start_api()
+    try:
+        # graph disabled in the main process → unavailable, not a crash
+        client = GraphClient(f"http://{api.host}:{api.port}", api.token)
+        with pytest.raises(GraphUnavailableError):
+            await client.related("Alice")
+        # wrong bearer token → unavailable, never dispatched
+        bad = GraphClient(f"http://{api.host}:{api.port}", "wrong-token")
+        with pytest.raises(GraphUnavailableError):
+            await bad.related("Alice")
+    finally:
+        await api.stop()
+
+
+def test_init_graph_client_requires_loopback_env(monkeypatch):
+    monkeypatch.delenv("KBOTS_INTERNAL_API", raising=False)
+    monkeypatch.delenv("KBOTS_INTERNAL_TOKEN", raising=False)
+    monkeypatch.setattr(graph_store, "_graph", None)
+    assert graph_store.init_graph_client() is False
+    monkeypatch.setenv("KBOTS_INTERNAL_API", "http://127.0.0.1:1")
+    monkeypatch.setenv("KBOTS_INTERNAL_TOKEN", "t")
+    assert graph_store.init_graph_client() is True
+    assert isinstance(graph_store._graph, graph_store.GraphClient)
