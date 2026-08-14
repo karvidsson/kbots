@@ -43,14 +43,18 @@ CREATE TABLE IF NOT EXISTS runtime_flags (
 class HITLGate:
     """Human-in-the-loop approval system for sensitive tool calls."""
 
-    def __init__(self, config: dict, db: aiosqlite.Connection, connector=None):
+    def __init__(self, config: dict, db: aiosqlite.Connection, connector=None,
+                 admin_users: list | None = None):
         self.config = config
         self.db = db
         self.connector = connector
 
         # Config
         self.channel_id = config.get("channel")
-        self.approvers = set(config.get("approvers", []))
+        # Empty approvers must not mean "anyone can approve" — fall back to the
+        # configured admin users. If neither is set, nobody can approve and gated
+        # calls fail closed (time out → denied).
+        self.approvers = set(config.get("approvers") or []) or set(admin_users or [])
         self.timeout = config.get("timeout", 1800)  # 30 min
         self.fail_mode = config.get("fail_mode", "closed")  # closed = deny if unreachable
         self.poll_interval = config.get("poll_interval", 3)
@@ -95,6 +99,19 @@ class HITLGate:
         """
         hitl_id = str(uuid.uuid4())[:8]
         now = time.time()
+
+        # No channel/connector to ask on → resolve immediately instead of polling
+        # for the full timeout. fail_mode=closed denies (a gated tool never runs
+        # unapproved); fail_mode=open allows.
+        if not self.connector or not self.channel_id:
+            if self.fail_mode == "open":
+                logger.warning(f"HITL: no channel for '{tool_name}' — fail_mode=open, allowing")
+                return {"status": "approved", "approver": None, "reason": "no_channel_open"}
+            logger.warning(
+                f"HITL: '{tool_name}' requires approval but no HITL channel is configured — "
+                "denying (fail-closed). Set security.hitl.channel to enable approvals."
+            )
+            return {"status": "denied", "approver": None, "reason": "no_channel"}
 
         # Persist to SQLite
         await self.db.execute(
@@ -154,15 +171,19 @@ class HITLGate:
         return {"status": "timeout", "approver": None}
 
     async def approve(self, hitl_id: str, approver_id: str) -> bool:
-        """Approve a pending request. Called when a reaction is detected."""
-        if self.approvers and approver_id not in self.approvers:
+        """Approve a pending request. Called when a reaction is detected.
+
+        Empty approvers means nobody is authorized (fail closed) — see __init__,
+        where it falls back to admin_users.
+        """
+        if approver_id not in self.approvers:
             return False
         await self._resolve(hitl_id, "approved", approver_id)
         return True
 
     async def deny(self, hitl_id: str, approver_id: str) -> bool:
         """Deny a pending request. Only approvers can deny."""
-        if self.approvers and approver_id not in self.approvers:
+        if approver_id not in self.approvers:
             return False
         await self._resolve(hitl_id, "denied", approver_id)
         return True

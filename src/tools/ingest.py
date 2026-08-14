@@ -431,7 +431,16 @@ async def create_tool(
     if not clean_name.isidentifier():
         return f"ERROR: invalid tool name: {name!r}. Use lowercase letters, digits, underscores."
 
-    error = _validate_tool_source(python_code)
+    # Compose the final module and validate THAT, not just python_code. The
+    # description becomes the module docstring, so a naive f-string would let a
+    # triple-quote in description close the docstring and inject module-level
+    # code that bypasses the AST guard. repr() emits a safe single-line string
+    # literal that cannot break out; validating the composed source is the
+    # belt-and-braces check.
+    doc = repr(f"{description}\n\nCreated by agent {ctx.agent_id} via create_tool.")
+    composed = f"{doc}\n\n{python_code.strip()}\n"
+
+    error = _validate_tool_source(composed)
     if error:
         return f"ERROR: code rejected — {error}"
 
@@ -445,8 +454,7 @@ async def create_tool(
     if tool_path.exists():
         return f"ERROR: {tool_path} already exists."
 
-    header = f'"""{description}\n\nCreated by agent {ctx.agent_id} via create_tool."""\n\n'
-    tool_path.write_text(header + python_code.strip() + "\n")
+    tool_path.write_text(composed)
 
     # Hot-load immediately and verify the import actually registered something
     from src.core.digest import reload_tools

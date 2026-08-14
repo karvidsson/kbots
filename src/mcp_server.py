@@ -74,10 +74,14 @@ class MCPHitlGate:
     """HITL approval via Discord API. Separate from the connector-based HITL
     in src/core/hitl.py because MCP runs in a subprocess without connector access."""
 
-    def __init__(self, config: dict, vault: FernetVault):
+    def __init__(self, config: dict, vault: FernetVault, admin_users: list | None = None):
         self.vault = vault
         self.channel_id = config.get("channel")
-        self.approvers = set(config.get("approvers", []))
+        # Empty approvers must NOT mean "anyone can approve" (that would let any
+        # channel member green-light create_tool / install_mcp). Fall back to the
+        # configured admin users; if there are none either, nobody can approve and
+        # every gated call fails closed (times out → denied).
+        self.approvers = set(config.get("approvers") or []) or set(admin_users or [])
         self.timeout = config.get("timeout", 1800)
         self.poll_interval = config.get("poll_interval", 3)
         self.fail_mode = config.get("fail_mode", "closed")
@@ -96,7 +100,12 @@ class MCPHitlGate:
         token = self.vault.get("discord-token")  # production kbots bot — always has access to ops channel
         if not token or not self.channel_id:
             if self.fail_mode == "open":
+                logger.warning(f"HITL: no channel/token for '{tool_name}' — fail_mode=open, auto-approving")
                 return {"status": "approved", "reason": "no channel, fail_mode=open"}
+            logger.warning(
+                f"HITL: '{tool_name}' requires approval but no HITL channel/token is configured — "
+                "denying (fail-closed). Set security.hitl.channel to enable approvals."
+            )
             return {"status": "denied", "reason": "no discord token or HITL channel"}
 
         hitl_id = str(uuid.uuid4())[:8]
@@ -177,7 +186,7 @@ class MCPHitlGate:
                             if reactor.get("bot"):
                                 continue
                             reactor_id = str(reactor["id"])
-                            if not self.approvers or reactor_id in self.approvers:
+                            if reactor_id in self.approvers:
                                 logger.info(f"HITL {hitl_id}: {status} by {reactor_id}")
                                 result_icon = "Approved" if status == "approved" else "Denied"
                                 await session.post(
@@ -338,7 +347,16 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     security_cfg = config.get("security", {})
 
     hitl_cfg = security_cfg.get("hitl", {})
-    hitl = MCPHitlGate(hitl_cfg, vault) if hitl_cfg.get("channel") else None
+    # Always construct the gate — even with no channel configured it must be able
+    # to fail closed on gated / hitl=True tools rather than letting them run
+    # unapproved. Empty approvers fall back to admin_users (see MCPHitlGate).
+    admin_users = (config.get("admin_users", {}) or {}).get("discord", [])
+    hitl = MCPHitlGate(hitl_cfg, vault, admin_users=admin_users)
+    if not hitl_cfg.get("channel"):
+        logger.warning(
+            "HITL: no security.hitl.channel configured — gated and hitl=True tools "
+            "will be denied (fail-closed) on the MCP path until a channel is set."
+        )
 
     rl_cfg = security_cfg.get("rate_limits", {})
     rate_limiter = RateLimiter(rl_cfg) if rl_cfg else None
@@ -401,8 +419,13 @@ def _make_middleware_handler(
                 return f"Rate limit exceeded: {rl_check['reason']}"
 
         # --- HITL gate ---
+        # A tool needs approval if config lists it (is_gated) OR it declares
+        # hitl=True on its @tool decorator. The decorator flag was previously
+        # ignored here, so tools like create_tool ran with no approval despite
+        # advertising "[HITL-GATED]". `hitl` is always constructed (even with no
+        # channel) so request_approval can fail closed.
         hitl_result = None
-        if hitl and hitl.is_gated(_name):
+        if hitl and (hitl.is_gated(_name) or _td.hitl):
             logger.info(f"HITL gate: {_name} requires approval")
             hitl_result = await hitl.request_approval(_name, kwargs)
             if hitl_result["status"] != "approved":
