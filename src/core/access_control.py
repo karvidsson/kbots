@@ -98,12 +98,16 @@ def _load_agent_tiers() -> dict[str, str]:
 class AccessControl:
     """Three-layer access control for kbots agents."""
 
-    def __init__(self, config: dict, hitl_gated_tools: list[str] | None = None):
+    def __init__(self, config: dict, hitl_gated_tools: list[str] | None = None,
+                 admin_users: list[str] | None = None):
         """
         config: security.access_control block from config.yaml
         hitl_gated_tools: tools with HITL gates in MCP (from security.hitl.gated_tools).
                           Agent-originated calls to these tools pass through to MCP
                           where the HITL gate fires, instead of being hard-blocked.
+        admin_users: config.admin_users.discord — always resolved to owner tier so
+                     that enabling access control can never lock the operator out,
+                     even if they aren't listed in team.json.
 
         Expected shape:
             safe_tools: [list of tools any known tier can use freely]
@@ -112,6 +116,7 @@ class AccessControl:
         self._safe_tools: set[str] = set(config.get("safe_tools", []))
         self._hitl_gated: set[str] = set(hitl_gated_tools or [])
         self._unknown_policy: str = config.get("unknown_policy", "deny")
+        self._admin_users: set[str] = set(str(u) for u in (admin_users or []))
         self._team: dict = _load_team()
         self._agent_tiers: dict[str, str] = _load_agent_tiers()
 
@@ -124,9 +129,16 @@ class AccessControl:
         """Return access tier for a discord user ID."""
         member = self._team.get(user_id)
         if not member:
+            # Configured admins are owner even if absent from team.json — this is
+            # what keeps enabling access control from locking the operator out.
+            if not is_bot and str(user_id) in self._admin_users:
+                return "owner"
             return "unknown"
         if member["type"] == "agent" or is_bot:
             return "agent"
+        # A human who is also a configured admin gets at least owner privileges.
+        if str(user_id) in self._admin_users:
+            return "owner"
         return member.get("access", "staff")
 
     def get_sender_agent_tier(self, user_id: str) -> str | None:
