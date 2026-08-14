@@ -225,18 +225,32 @@ def _render_graph_html(nodes: list[dict], edges: list[dict], title: str) -> str:
 @tool(
     name="memory_graph",
     description=(
-        "Render the memory graph (entities + relationships visible to you) as a "
-        "self-contained interactive HTML file. Returns a file path; deliver it "
-        "to the user with send_discord_file."
+        "Render this agent's memory graph as a self-contained interactive HTML "
+        "file. Default shows only your own memories; view='shared' adds the "
+        "global/group edges other agents contributed. Returns a file path; "
+        "deliver it to the user with send_discord_file."
     ),
     category="memory",
 )
-async def memory_graph(ctx: ToolContext, title: str = "Memory Graph") -> str:
+async def memory_graph(ctx: ToolContext, title: str = "Memory Graph", view: str = "own") -> str:
+    """Render the memory graph as an interactive HTML file.
+
+    Args:
+        title: Heading shown on the page
+        view: 'own' (default) — only this agent's memories (edges it created or
+              scoped to it); 'shared' — everything visible to it, including
+              global/group edges from other agents
+    """
+    if view not in ("own", "shared"):
+        return "Invalid view — use 'own' (default) or 'shared'."
     try:
-        data = await get_graph().export(agent_id=ctx.agent_id)
+        data = await get_graph().export(agent_id=ctx.agent_id, own_only=(view == "own"))
     except GraphUnavailableError as e:
         return str(e)
     if not data["edges"]:
+        if view == "own":
+            return ("You have no memories in the graph yet — nothing to visualize. "
+                    "Store relationships with memory_link first.")
         return "The memory graph is empty — nothing to visualize yet. Store relationships with memory_link first."
     doc = _render_graph_html(data["nodes"], data["edges"], title)
     out_dir = Path(ctx.project_dir) if ctx.project_dir else KBOTS_TMP
