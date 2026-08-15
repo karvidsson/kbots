@@ -3,6 +3,9 @@
 import asyncio
 import json
 
+import pytest
+
+from src.auth.oauth2 import OAuth2AuthRevokedError
 from src.core.email_watch import EmailWatcher
 
 
@@ -108,3 +111,58 @@ async def test_interval_without_storage_uses_config(tmp_path):
     w = _watcher(tmp_path, {})
     assert await w._effective_interval("husky", {"interval": 120}) == 120
     assert await w._effective_interval("husky", {}) == 60
+
+
+# --- a revoked grant must stop the loop, not slow it down --------------------
+
+async def test_revoked_auth_stops_watching_and_names_the_fix(tmp_path, monkeypatch, caplog):
+    """A dead grant produced 839 identical ERROR lines over three days while the
+    agent silently stopped being woken by mail. It must stop and say so."""
+    w = _watcher(tmp_path, {})
+    calls = []
+
+    async def dead_baseline(account):
+        calls.append(account)
+        raise OAuth2AuthRevokedError("GOOGLE[husky]", "invalid_grant",
+                                "Token has been expired or revoked.")
+
+    monkeypatch.setattr(w, "_baseline", dead_baseline)
+    slept = []
+
+    async def no_sleep(seconds):
+        slept.append(seconds)
+        raise AssertionError("the loop slept instead of giving up")
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    # Returns rather than looping: without the fix this never terminates.
+    await asyncio.wait_for(
+        w._watch_agent("husky", {"google_account": "husky", "channel": "1"}), timeout=5)
+
+    assert len(calls) == 1, "retried a credential that cannot recover"
+    assert slept == []
+    text = caplog.text
+    assert "STOPPED watching husky" in text
+    assert "google-reauth.py --account husky" in text, "the fix must be in the message"
+
+
+async def test_transient_failure_keeps_retrying(tmp_path, monkeypatch):
+    """The counterpart: an ordinary error must NOT stop the watcher, or a Gmail
+    blip would silently disable mail for good."""
+    w = _watcher(tmp_path, {})
+    calls = []
+
+    async def flaky_baseline(account):
+        calls.append(account)
+        raise RuntimeError("Gmail 503")
+
+    monkeypatch.setattr(w, "_baseline", flaky_baseline)
+
+    async def stop_after_three(seconds):
+        if len(calls) >= 3:
+            raise asyncio.CancelledError
+    monkeypatch.setattr(asyncio, "sleep", stop_after_three)
+
+    with pytest.raises(asyncio.CancelledError):
+        await w._watch_agent("husky", {"google_account": "husky", "channel": "1"})
+    assert len(calls) == 3
