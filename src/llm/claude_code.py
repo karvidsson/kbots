@@ -97,6 +97,18 @@ def _atomic_write_secret_json(path: Path, data: dict) -> None:
         raise
 
 
+def _git_toplevel(path: Path) -> Path | None:
+    """Innermost directory at or above `path` that contains a `.git` entry.
+
+    `.git` may be a directory (normal repo) or a file (worktree/submodule);
+    `exists()` covers both. Returns None when `path` is not inside a repo.
+    """
+    for p in (path, *path.parents):
+        if (p / ".git").exists():
+            return p
+    return None
+
+
 def _ensure_workspace_trusted(cwd: Path) -> None:
     """Mark an agent workspace trusted so its settings.json permissions apply.
 
@@ -108,25 +120,38 @@ def _ensure_workspace_trusted(cwd: Path) -> None:
     the workspace untrusted until the next service restart; a disk check heals
     it on the next turn instead. `_trusted_dirs` only tracks what this process
     has trusted before, so a clobber is logged as the anomaly it is.
+
+    The enclosing git toplevel is trusted alongside the cwd: Claude Code
+    ≥2.1.232 resolves trust at the repo root, so an agent dir nested inside an
+    overlay repo is governed by the root's entry — if that entry is absent or
+    False, the session comes up untrusted no matter what the cwd entry says.
+    An explicit False at the root (a previously declined dialog) is overwritten,
+    same as for the cwd entry.
     """
-    key = str(cwd)
+    keys = [str(cwd)]
+    toplevel = _git_toplevel(cwd)
+    if toplevel is not None and str(toplevel) != str(cwd):
+        keys.append(str(toplevel))
     path = _claude_json_path()
     try:
         data = json.loads(path.read_text()) if path.exists() else {}
         projects = data.setdefault("projects", {})
-        entry = projects.setdefault(key, {})
-        if entry.get("hasTrustDialogAccepted") is not True:
-            entry["hasTrustDialogAccepted"] = True
+        stale = [k for k in keys
+                 if projects.setdefault(k, {}).get("hasTrustDialogAccepted") is not True]
+        if stale:
+            for k in stale:
+                projects[k]["hasTrustDialogAccepted"] = True
             path.parent.mkdir(parents=True, exist_ok=True)
             _atomic_write_secret_json(path, data)
-            if key in _trusted_dirs:
-                logger.warning(
-                    f"Workspace trust for {key} was clobbered (concurrent "
-                    f"~/.claude.json rewrite) — re-trusted"
-                )
-            else:
-                logger.info(f"Trusted Claude Code workspace: {key}")
-        _trusted_dirs.add(key)
+            for k in stale:
+                if k in _trusted_dirs:
+                    logger.warning(
+                        f"Workspace trust for {k} was clobbered (concurrent "
+                        f"~/.claude.json rewrite) — re-trusted"
+                    )
+                else:
+                    logger.info(f"Trusted Claude Code workspace: {k}")
+        _trusted_dirs.update(keys)
     except PermissionError as e:
         # The atomic write below only needs a writable PARENT dir, so it survives a
         # read-only target — but read_text() above fails outright on a file this user
