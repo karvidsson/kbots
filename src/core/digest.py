@@ -212,27 +212,57 @@ def reload_tools() -> int:
 
 
 def _reload_tools_dir(tools_dir: Path, prefix: str) -> None:
-    """Re-import all .py files in a tools directory."""
+    """Re-import all .py files in a tools directory.
+
+    Layer files (overlay / modules) are loaded BY PATH under a synthetic module
+    name, and importlib.reload cannot be used on them: reload re-resolves the
+    spec by NAME through the normal finders, and a synthetic name is on no
+    sys.path, so reloading an already-loaded layer tool raised
+    "spec not found for the module 'kbots_overlay_x'" every time. The exception
+    was caught and logged while the caller still reported "N tools reloaded" —
+    so editing an overlay tool looked like it took effect, and the process went
+    on running whichever version it imported first until someone restarted the
+    service. Re-executing the file spec is what reload means for these.
+    """
     for py_file in tools_dir.glob("*.py"):
         if py_file.name.startswith("_"):
             continue
-        if prefix.startswith("src."):
-            module_name = f"{prefix}{py_file.stem}"
-        else:
-            module_name = f"{prefix}{py_file.stem}"
+        module_name = f"{prefix}{py_file.stem}"
         try:
-            if module_name in importlib.sys.modules:
-                importlib.reload(importlib.sys.modules[module_name])
-            else:
-                if prefix.startswith("src."):
-                    importlib.import_module(module_name)
+            if prefix.startswith("src."):
+                # A real package module: importable by name, so reload works.
+                if module_name in importlib.sys.modules:
+                    importlib.reload(importlib.sys.modules[module_name])
                 else:
-                    # Layer file — import by file path
-                    spec = importlib.util.spec_from_file_location(module_name, py_file)
-                    if spec and spec.loader:
-                        mod = importlib.util.module_from_spec(spec)
-                        importlib.sys.modules[module_name] = mod
-                        spec.loader.exec_module(mod)
+                    importlib.import_module(module_name)
+                continue
+
+            spec = importlib.util.spec_from_file_location(module_name, py_file)
+            if not (spec and spec.loader):
+                logger.error(f"Failed to reload {module_name}: no import spec for {py_file}")
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            previous = importlib.sys.modules.get(module_name)
+            # Publish before exec so a module importing itself sees the new
+            # object — the same order importlib.reload uses.
+            importlib.sys.modules[module_name] = mod
+            try:
+                # Compile from source rather than spec.loader.exec_module: the
+                # bytecode cache is keyed on (size, mtime-to-the-SECOND), so two
+                # edits inside the same second that happen not to change the file
+                # length load the STALE .pyc. Reloading exists precisely to pick
+                # up a just-made edit, which is exactly when that collides.
+                source = py_file.read_bytes()
+                exec(compile(source, str(py_file), "exec"), mod.__dict__)
+            except Exception:
+                # A broken edit must not leave a half-initialised module behind
+                # where a working one used to be: put the old one back and let
+                # the live tools keep running on it.
+                if previous is not None:
+                    importlib.sys.modules[module_name] = previous
+                else:
+                    importlib.sys.modules.pop(module_name, None)
+                raise
         except Exception as e:
             logger.error(f"Failed to reload {module_name}: {e}")
 
