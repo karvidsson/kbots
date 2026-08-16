@@ -1377,9 +1377,10 @@ class AgentManager:
                         approval["status"], approval.get("approver"),
                     )
                 if approval["status"] != "approved":
+                    from src.core.hitl import hitl_result_message
                     results.append({
                         "name": tool_name,
-                        "content": f"HITL: Tool '{tool_name}' was {approval['status']}.",
+                        "content": hitl_result_message(tool_name, approval),
                     })
                     continue
 

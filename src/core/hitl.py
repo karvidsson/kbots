@@ -245,6 +245,30 @@ def _redact_args(args: dict) -> str:
     return json.dumps(redacted)
 
 
+def hitl_result_message(tool_name: str, result: dict) -> str:
+    """Agent-facing text for a non-approved HITL outcome.
+
+    The no-channel case names the missing setting explicitly: without that, the
+    agent reports a bare "denied" and the operator never learns the denial came
+    from missing config rather than a human saying no.
+    """
+    if result.get("reason") in ("no_channel", "no discord token or HITL channel"):
+        return (
+            f"HITL: Tool '{tool_name}' requires human approval, but no approval "
+            "channel is configured, so it was denied without asking anyone "
+            "(fail-closed) and did NOT run. Tell the user plainly: approvals need "
+            "`security.hitl.channel` in config.yaml set to a Discord channel ID "
+            "(approval cards are posted there for ✅/❌ reaction) — until then, "
+            "every approval-gated tool call is blocked."
+        )
+    return (
+        f"HITL: Tool '{tool_name}' was {result['status']}. The tool did "
+        "NOT run — nothing is queued or in progress. Tell the user plainly "
+        "that the call needs approval (or was denied / timed out); do not "
+        "describe it as running or pending completion."
+    )
+
+
 def build_hitl_description(tool_name: str, args: dict) -> str:
     """Build a human-readable description for the approval message."""
     extractors = {
