@@ -534,6 +534,12 @@ async def main() -> None:
                               graph_cfg=memory_cfg.get("graph"))
         asyncio.create_task(reflector.run(), name="reflector")
 
+    # --- Browser janitor: quit the shared debug Chrome after hours of idleness ---
+    from src.core.browser_janitor import BrowserJanitor
+    janitor = BrowserJanitor(config.get("browser", {}))
+    if janitor.enabled:
+        asyncio.create_task(janitor.run(), name="browser-janitor")
+
     # --- Turn judge: auto-label collected turns for training export (default off) ---
     judge_cfg = tc_cfg.get("judge", {}) or {}
     if training_collector and judge_cfg.get("enabled"):
