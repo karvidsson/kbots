@@ -62,19 +62,31 @@ def test_ask_menu_returns_index(feed):
 
 
 def test_routing_all_channels_simplest(feed):
-    # mentions? y | menu 1 (all channels) | restrict guild? n
-    feed("y", "1", "n")
+    # mentions? y | menu 1 (all channels) | restrict guild? n | restrict users? n
+    feed("y", "1", "n", "n")
     r = setup._ask_routing("main")["discord"]
     assert r == {"account": "main", "channels": [], "mentions": True}
 
 
 def test_routing_specific_channels_with_dupes(feed):
-    # mentions? y | menu 2 | channel GUILD, dup, blank | restrict guild? y | GUILD, blank
-    feed("y", "2", CHAN, CHAN, "", "y", GUILD, "")
+    # mentions? y | menu 2 | channel GUILD, dup, blank | restrict guild? y |
+    # GUILD, blank | restrict users? n
+    feed("y", "2", CHAN, CHAN, "", "y", GUILD, "", "n")
     r = setup._ask_routing("main")["discord"]
     assert r["channels"] == [CHAN]            # deduped
     assert r["guilds"] == [GUILD]             # deduped
     assert r["mentions"] is True
+    assert "users" not in r                   # declined → key omitted
+
+
+USER = "1000000000000000003"
+
+
+def test_routing_user_allowlist(feed):
+    # mentions? y | menu 1 | restrict guild? n | restrict users? y | USER, blank
+    feed("y", "1", "n", "y", USER, "")
+    r = setup._ask_routing("main")["discord"]
+    assert r["users"] == [USER]
 
 
 # --- Step 12c: training-data collection ---
