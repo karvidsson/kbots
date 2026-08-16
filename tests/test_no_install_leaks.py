@@ -162,3 +162,32 @@ def test_core_does_not_name_this_installations_agents():
         "Core names agents from this installation:\n  " + "\n  ".join(bad)
         + "\nInvent a fixture name (Data Bot, Atlas) — Core is published, the "
           "overlay is not.")
+
+
+# --- human names leak one word at a time ------------------------------------
+
+def test_human_names_split_into_words_in_single_word_mode(tmp_path, monkeypatch):
+    """Forty commit messages named the owner by bare first name — never the
+    full roster value — and passed. Human names must match word by word in
+    single-word mode; agent names must stay whole ('Data Bot' must not turn
+    every 'data' into a finding)."""
+    import json
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "team.json").write_text(json.dumps({
+        "humans": [{"id": "u1", "name": "Ada Lovelace"}],
+        "agents": [{"id": "data-bot", "name": "Data Bot"}],
+    }))
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+
+    names = leaks.overlay_roster_names(single_words=True)
+    assert "Ada Lovelace" in names
+    assert "Lovelace" in names       # human name word, len >= 4
+    assert "Ada" not in names        # short words stay out
+    assert "Data" not in names       # agent names are never split
+
+    assert leaks.roster_hits("Lovelace saw the status page", "msg", names)
+    assert not leaks.roster_hits("the data pipeline is fine", "msg", names)
+
+    # tree mode is unchanged: multi-word values only, no word splitting
+    tree_names = leaks.overlay_roster_names()
+    assert "Lovelace" not in tree_names
