@@ -90,6 +90,16 @@ _SCHEMA: dict[str, tuple] = {
         # Health audit config (expected open ports, etc.)
         "expected_ports": (str, False, None, None),
     }),
+    # Goal workstreams — multi-agent collaboration channels (src/core/goals.py)
+    "goals": (dict, False, None, {
+        "enabled": (bool, False, None, None),
+        "create_tiers": (list, False, None, None),
+        "category_id": (str, False, None, None),
+        "default_turn_budget": (int, False, None, None),
+        "objection_window_hours": (int, False, None, None),
+        "escalation_user": (str, False, None, None),
+        "alert_on_block": (bool, False, None, None),
+    }),
     "admin_users": (dict, False, None, None),
     "agents": (dict, False, None, None),
     # Browser janitor (quit the shared debug Chrome after hours of idleness)

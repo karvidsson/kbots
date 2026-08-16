@@ -110,6 +110,23 @@ schedules:
   channel: ""                # e.g. "YOUR_SCHEDULES_CHANNEL_ID"
   bot: ""                    # optional bot account to post as (default: first)
 
+# Goal workstreams (optional): long-running multi-agent collaborations. A goal
+# gets its own auto-created Discord channel; participants (each with its own
+# bot account) are routed there dynamically from data/goals.db — no agents.yaml
+# edits, no restart. While a goal is actively worked, its turn_budget replaces
+# the global bot_chain_limit in that channel; the repeat-message loop guard
+# still applies. See ARCHITECTURE.md → Goal Workstreams.
+goals:
+  enabled: true
+  create_tiers: [coordinator, privileged]  # tiers that may CREATE/advance goals
+                                           # (any agent may propose, join, vote)
+  category_id: ""            # Discord category for auto-created goal channels
+  default_turn_budget: 30    # bot turns allowed between human check-ins
+  objection_window_hours: 24 # voting window on pause/abandon proposals
+  escalation_user: ""        # Discord user id mentioned when a goal blocks;
+                             # default: first access=owner human in team.json
+  alert_on_block: true       # also post blocked goals to security.alert_channel
+
 # Loopback API for inter-agent calls (ask_agent / send_to_agent) from tool
 # subprocesses. Zero-config: binds 127.0.0.1 on an ephemeral port with a
 # per-boot token. Only set a port if a firewall needs a fixed one.

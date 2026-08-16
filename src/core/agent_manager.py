@@ -546,6 +546,16 @@ class AgentManager:
         except ImportError:
             pass
 
+        # Goal context: injected every turn (goal state mutates mid-conversation,
+        # unlike the roster) — kept short by build_goal_context itself.
+        try:
+            from src.core.goals import build_goal_context
+            goal_ctx = build_goal_context(agent_id, message.channel_id)
+            if goal_ctx:
+                context_blocks.append(goal_ctx)
+        except Exception as e:
+            logger.debug(f"Goal context injection failed: {e}")
+
         # Startup context: inject team roster, pinned memories, codex index
         # on first message of a session (subsequent messages inherit via --resume)
         if session.message_count == 1 or not session.cli_session_id:
