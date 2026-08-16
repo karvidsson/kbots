@@ -1842,6 +1842,11 @@ def _ask_routing(bot_account: str, default_mentions: bool = True) -> dict:
               "works where it's invited anyway)", default=False):
         guilds = ask_ids("server/guild")
 
+    users = []
+    if ask_yn("Only respond to specific user(s)? (most people: No — team access "
+              "tiers already gate who can talk to it)", default=False):
+        users = ask_ids("user")
+
     routing = {
         "discord": {
             "account": bot_account,
@@ -1853,6 +1858,8 @@ def _ask_routing(bot_account: str, default_mentions: bool = True) -> dict:
         routing["discord"]["categories"] = categories
     if guilds:
         routing["discord"]["guilds"] = guilds
+    if users:
+        routing["discord"]["users"] = users
 
     return routing
 

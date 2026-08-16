@@ -41,6 +41,9 @@ agents:
         #                     # defaults to channels[0], or (wildcard) the agent's most
         #                     # recently active conversation channel
         mentions: true        # filter: only respond when @mentioned
+        # users: []           # filter: only respond to these sender user IDs
+        #                     # (empty/omitted = everyone the team tiers allow;
+        #                     # when set, messages with no sender ID are dropped)
         # watch_channels: []  # channel IDs where this agent hears EVERY message
         #                     # (human or bot, mentioned or not) and may abstain
         #                     # by replying NO_REPLY. Each listed channel must
