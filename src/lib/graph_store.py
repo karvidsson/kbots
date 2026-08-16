@@ -6,9 +6,11 @@ mirroring SQLiteMemory._scope_filter semantics: entities are shared identifiers,
 visibility lives on the edges.
 
 LadybugDB (PyPI: `ladybug`, the Kuzu fork) is fully in-process and SINGLE-WRITER:
-only the main kbots process may open the file. The MCP subprocess never calls
-init_graph() and gets a clear GraphUnavailableError message instead (see
-mcp_server.build_server). Install with: pip install 'kbots[graph]'.
+only the main kbots process may open the file. Tool subprocesses (the MCP
+server) never call init_graph(); they call init_graph_client() and forward
+every graph call to the main process over the loopback internal API (see
+mcp_server.build_server and internal_api._handle_graph). Install with:
+pip install 'kbots[graph]'.
 """
 
 import asyncio
@@ -221,22 +223,31 @@ class GraphMemory:
         )
         return _rows(result)
 
-    async def export(self, *, agent_id: str | None = None, limit: int = 400) -> dict:
-        """All visible edges + their endpoints, for visualization.
+    async def export(self, *, agent_id: str | None = None, limit: int = 400,
+                     own_only: bool = False) -> dict:
+        """Edges + their endpoints, for visualization.
 
+        Default: everything visible to the agent (own + global + group edges).
+        own_only: just this agent's memories — edges it created or scoped to it.
         Returns {"nodes": [{name, type, degree}], "edges": [{src, rel, dst, ...}]}.
         """
         limit = max(1, min(int(limit), 2000))
         conn = await self._ensure_open()
         agent_scope = f"agent:{agent_id}" if agent_id else "agent:"
+        if own_only:
+            where = "(r.created_by = $agent OR r.scope = $agent_scope)"
+            params = {"agent": agent_id or "", "agent_scope": agent_scope}
+        else:
+            where = _SCOPE_FILTER
+            params = {"agent_scope": agent_scope}
         result = await conn.execute(
             "MATCH (a:Entity)-[r:Related]->(b:Entity) "
-            f"WHERE {_SCOPE_FILTER} "
+            f"WHERE {where} "
             "RETURN a.name AS src, a.type AS src_type, b.name AS dst, b.type AS dst_type, "
             "r.rel AS rel, r.confidence AS confidence, r.scope AS scope, "
             "r.created_by AS created_by "
             f"LIMIT {limit}",
-            {"agent_scope": agent_scope},
+            params,
         )
         edges = _rows(result)
         nodes: dict[str, dict] = {}
@@ -289,9 +300,75 @@ class GraphMemory:
                 setattr(self, attr, None)
 
 
+class GraphClient:
+    """Loopback proxy to the main process's GraphMemory.
+
+    Tool subprocesses (the MCP server, a stdio child of each agent's CLI) must
+    never open the single-writer .lbdb file. Instead they forward every call to
+    the internal API in the main process (src/core/internal_api.py, /graph
+    route), which executes it against the one real GraphMemory. Same method
+    signatures as GraphMemory, so get_graph() callers can't tell the difference.
+    """
+
+    def __init__(self, api: str, token: str):
+        self._api = api
+        self._token = token
+
+    async def _call(self, method: str, **kwargs):
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=60)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    f"{self._api}/graph",
+                    json={"method": method, "kwargs": kwargs},
+                    headers={"Authorization": f"Bearer {self._token}"},
+                ) as resp:
+                    data = await resp.json(content_type=None)
+        except GraphUnavailableError:
+            raise
+        except Exception as e:
+            raise GraphUnavailableError(
+                f"Graph memory unreachable (loopback API): {e}") from None
+        if "error" in data:
+            if data.get("kind") == "value":
+                raise ValueError(data["error"])
+            raise GraphUnavailableError(data["error"])
+        return data.get("result")
+
+    async def link(self, a: str, rel: str, b: str, *, confidence: float = 0.7,
+                   scope: str = "global", created_by: str | None = None) -> dict:
+        return await self._call("link", a=a, rel=rel, b=b, confidence=confidence,
+                                scope=scope, created_by=created_by)
+
+    async def related(self, entity: str, depth: int = 1, *,
+                      agent_id: str | None = None, limit: int = 50) -> list[dict]:
+        return await self._call("related", entity=entity, depth=depth,
+                                agent_id=agent_id, limit=limit)
+
+    async def unlink(self, a: str, rel: str, b: str, *, agent_id: str) -> int:
+        return await self._call("unlink", a=a, rel=rel, b=b, agent_id=agent_id)
+
+    async def entities(self, *, agent_id: str | None = None, limit: int = 50) -> list[dict]:
+        return await self._call("entities", agent_id=agent_id, limit=limit)
+
+    async def export(self, *, agent_id: str | None = None, limit: int = 400,
+                     own_only: bool = False) -> dict:
+        return await self._call("export", agent_id=agent_id, limit=limit,
+                                own_only=own_only)
+
+    async def find(self, *, rel: str | None = None, entity: str | None = None,
+                   agent_id: str | None = None, limit: int = 50) -> list[dict]:
+        return await self._call("find", rel=rel, entity=entity,
+                                agent_id=agent_id, limit=limit)
+
+    def close(self) -> None:
+        """Nothing to close — sessions are per-call."""
+
+
 # --- Module-level singleton (pattern of src/tools/browser.py _sessions) ---
 
-_graph: GraphMemory | None = None
+_graph: GraphMemory | GraphClient | None = None
 _unavailable_reason = "Graph memory is not enabled (set defaults.memory.graph.enabled in config.yaml)"
 
 
@@ -314,7 +391,22 @@ def init_graph(memory_cfg: dict) -> GraphMemory | None:
     return _graph
 
 
-def get_graph() -> GraphMemory:
+def init_graph_client() -> bool:
+    """Called by tool subprocesses (mcp_server): route graph calls to the main
+    process over the loopback internal API. Returns False when the loopback
+    env (KBOTS_INTERNAL_API / KBOTS_INTERNAL_TOKEN) isn't present — e.g. a
+    standalone `kbots-mcp` run with no main process to forward to."""
+    global _graph
+    import os
+    api = os.environ.get("KBOTS_INTERNAL_API", "")
+    token = os.environ.get("KBOTS_INTERNAL_TOKEN", "")
+    if not api or not token:
+        return False
+    _graph = GraphClient(api, token)
+    return True
+
+
+def get_graph() -> GraphMemory | GraphClient:
     """Tool-facing accessor. Raises GraphUnavailableError with the recorded reason."""
     if _graph is None:
         raise GraphUnavailableError(_unavailable_reason)

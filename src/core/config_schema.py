@@ -29,7 +29,6 @@ _SCHEMA: dict[str, tuple] = {
     }),
     "connectors": (dict, False, None, {
         "discord": (dict, False, None, None),
-        "telegram": (dict, False, None, None),
         "http": (dict, False, None, None),
         "webhook": (dict, False, None, None),
     }),
@@ -51,6 +50,8 @@ _SCHEMA: dict[str, tuple] = {
             "graph": (dict, False, None, {
                 "enabled": (bool, False, None, None),
                 "path": (str, False, None, None),
+                "extract": (bool, False, None, None),
+                "extract_batch": (int, False, None, None),
             }),
         }),
     }),
@@ -91,6 +92,11 @@ _SCHEMA: dict[str, tuple] = {
     }),
     "admin_users": (dict, False, None, None),
     "agents": (dict, False, None, None),
+    # Browser janitor (quit the shared debug Chrome after hours of idleness)
+    "browser": (dict, False, None, {
+        "idle_quit_hours": ((int, float), False, None, None),
+        "tick_seconds": ((int, float), False, None, None),
+    }),
 }
 
 
