@@ -48,3 +48,39 @@ async def set_hitl(ctx: ToolContext, enabled: bool) -> str:
     note = "" if enabled else " — I'll now act without approval prompts."
     return (f"🔓 Human-approval gate is now **{state}**{note} "
             f"(applies from your next message; also `/admin hitl {state.lower()}`).")
+
+
+@tool(
+    name="set_hitl_channel",
+    description=(
+        "Point human-approval (HITL) requests at a Discord channel — approval "
+        "cards post there and an admin reacts ✅/❌. Pass a channel_id to enable "
+        "it (create a private one first with discord_create_channel if needed), "
+        "or an empty channel_id to clear the override (reverts to config; with "
+        "no config channel, gated tools are denied fail-closed). Applies live — "
+        "no restart. Admin-only."
+    ),
+    category="admin",
+)
+async def set_hitl_channel(ctx: ToolContext, channel_id: str) -> str:
+    """Point approvals at channel_id; empty clears the override. Live."""
+    if not _is_admin(ctx.user_id or ""):
+        return ("ERROR: only an admin can set the approval channel "
+                "(it decides who sees and approves sensitive tool calls).")
+    channel_id = (channel_id or "").strip()
+    if not channel_id:
+        runtime_state.clear_flag("hitl_channel")
+        logger.warning(f"HITL channel override cleared by admin {ctx.agent_id} (user {ctx.user_id})")
+        return ("🔐 Cleared the approval-channel override — HITL now follows config "
+                "(security.hitl.channel). If config has none, approval-gated tools "
+                "are denied fail-closed until a channel is set.")
+    if not channel_id.isdigit():
+        return f"ERROR: '{channel_id}' is not a Discord channel ID (numeric)."
+    runtime_state.set_flag("hitl_channel", channel_id)
+    logger.warning(f"HITL channel → {channel_id} by admin {ctx.agent_id} (user {ctx.user_id})")
+    return (
+        f"🔐 Approval requests now post to <#{channel_id}> — applies immediately, no restart.\n"
+        f"How it works: when an agent calls an approval-gated tool, a card appears there "
+        f"describing the call; an admin reacts ✅ to approve or ❌ to deny. No reaction "
+        f"within the timeout (default 30 min) = denied. Explain this to the user now."
+    )

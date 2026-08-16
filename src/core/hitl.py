@@ -50,7 +50,7 @@ class HITLGate:
         self.connector = connector
 
         # Config
-        self.channel_id = config.get("channel")
+        self._config_channel = config.get("channel")
         # Empty approvers must not mean "anyone can approve" — fall back to the
         # configured admin users. If neither is set, nobody can approve and gated
         # calls fail closed (time out → denied).
@@ -65,6 +65,14 @@ class HITLGate:
         # can flip it and the engine picks it up on the next message.
         self._config_default = config.get("enabled", True)
         self.enabled = self._config_default
+
+    @property
+    def channel_id(self):
+        """Approval channel — the set_hitl_channel runtime override wins over
+        config, mirroring the schedules board. Read per access so an admin can
+        point approvals at a channel live, with no restart."""
+        from src.core import runtime_state
+        return runtime_state.get_flag("hitl_channel") or self._config_channel
 
     async def load_enabled(self) -> None:
         """Refresh the enabled flag from shared runtime state (cheap file read).
@@ -256,10 +264,12 @@ def hitl_result_message(tool_name: str, result: dict) -> str:
         return (
             f"HITL: Tool '{tool_name}' requires human approval, but no approval "
             "channel is configured, so it was denied without asking anyone "
-            "(fail-closed) and did NOT run. Tell the user plainly: approvals need "
-            "`security.hitl.channel` in config.yaml set to a Discord channel ID "
-            "(approval cards are posted there for ✅/❌ reaction) — until then, "
-            "every approval-gated tool call is blocked."
+            "(fail-closed) and did NOT run. Tell the user plainly, and offer to "
+            "fix it yourself: create a private approvals channel with "
+            "discord_create_channel, then run set_hitl_channel(channel_id) — it "
+            "applies live, and approval cards will post there for the admin to "
+            "react ✅/❌. (Permanent alternative: set security.hitl.channel in "
+            "config.yaml.) Until then, every approval-gated tool call is blocked."
         )
     return (
         f"HITL: Tool '{tool_name}' was {result['status']}. The tool did "
