@@ -198,14 +198,17 @@ def test_env_injected_names_work_without_an_overlay(monkeypatch):
     Multi-word entries follow roster semantics: whole in tree mode, plus
     word-by-word in single-word mode."""
     monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
-    monkeypatch.setenv("KBOTS_LEAK_NAMES", "Ada Lovelace\nzeta-bot\nxy\n")
+    monkeypatch.setenv("KBOTS_LEAK_NAMES", "Ada Lovelace\nzeta-bot\nxy\nOverseer\n")
 
     single = leaks.overlay_roster_names(single_words=True)
-    assert {"Ada Lovelace", "Lovelace", "zeta-bot"} <= single
+    assert {"Ada Lovelace", "Lovelace", "zeta-bot", "Overseer"} <= single
     assert "xy" not in single            # < 4 chars ignored
 
     tree = leaks.overlay_roster_names()
     assert "Ada Lovelace" in tree and "zeta-bot" in tree
     assert "Lovelace" not in tree        # no word-split in tree mode
+    # A plain single word must not gate the working tree — same rule as the
+    # overlay path, else CI (env-fed) flags prose that local runs accept.
+    assert "Overseer" not in tree
 
     assert leaks.roster_hits("ping zeta-bot about it", "msg", single)
