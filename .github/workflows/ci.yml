@@ -12,6 +12,13 @@ jobs:
   gates:
     name: lint + tests
     runs-on: ubuntu-latest
+    # CI runners have no overlay, so the roster-name leak checks would
+    # silently skip here — the one place that sees every merge. The
+    # deployment's names live in a repo secret (never in the tree) and are
+    # injected for the leak tests. Empty/unset degrades gracefully to
+    # shape-checks only (e.g. on forks, which never see secrets).
+    env:
+      KBOTS_LEAK_NAMES: ${{ secrets.KBOTS_LEAK_NAMES }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,6 +46,7 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          KBOTS_LEAK_NAMES: ${{ secrets.KBOTS_LEAK_NAMES }}
         run: |
           printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" > pr-metadata.txt
           python3 scripts/check_install_leaks.py --text pr-metadata.txt
