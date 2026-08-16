@@ -140,6 +140,25 @@ security:
     level: standard          # lite (articles + filler) | standard (full compression)
     # memory_recall: false   # compress memories at injection time (requires core wiring)
 
+<<<<<<< HEAD
+  # Access control (STRONGLY RECOMMENDED). When present, tiers from config/team.json
+  # decide who can message which agent and which tools they may trigger. Without
+  # this block, ANY user who can post in a routed channel drives agents with their
+  # full toolset (Bash included) — the engine logs a warning at startup.
+  #
+  # Enabling it is fail-closed: users NOT listed in team.json resolve to the
+  # `unknown` tier and are ignored, so populate team.json (humans + access levels)
+  # before turning this on. Users in `admin_users.discord` are always treated as
+  # owner, so you can never lock yourself out. Uncomment to enable:
+  # access_control:
+  #   unknown_policy: deny          # deny | safe_only
+  #   safe_tools:                   # usable by any known tier
+  #     - memory_search
+  #     - memory_semantic_search
+  #     - web_search
+  #     - team_get
+  #     - team_list
+=======
 # Browser janitor: agents drive one real Chrome (chrome_browser tool) and leave
 # it running when a task ends — tabs with video keep burning CPU forever. After
 # this many hours with no chrome_browser activity the janitor closes Chrome
@@ -147,6 +166,7 @@ security:
 browser:
   idle_quit_hours: 3
   # tick_seconds: 600
+>>>>>>> main
 
 admin_users:
   discord: ["YOUR_DISCORD_USER_ID"]

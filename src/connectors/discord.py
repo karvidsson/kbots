@@ -1945,7 +1945,16 @@ class DiscordBot:
         import os
         import shlex
         kbots_home = os.environ.get("KBOTS_HOME", "/opt/kbots")
-        env = {**os.environ, "TERM": "dumb", "KBOTS_HOME": kbots_home}
+        # Build the child env from an explicit allowlist rather than inheriting
+        # the whole parent env — that would hand the script the Discord/LLM
+        # tokens, the vault key path, and KBOTS_INTERNAL_TOKEN. Pass only what a
+        # local kbots script legitimately needs.
+        _env_allow = {"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "TMPDIR",
+                      "SHELL", "USER", "LOGNAME", "KBOTS_HOME", "KBOTS_OVERLAY",
+                      "KBOTS_MODULES", "KBOTS_TMP", "KBOTS_PROFILE"}
+        env = {k: v for k, v in os.environ.items() if k in _env_allow}
+        env["TERM"] = "dumb"
+        env["KBOTS_HOME"] = kbots_home
         try:
             parts = shlex.split(command)
             if not parts[0].startswith("/"):
@@ -2040,6 +2049,20 @@ class DiscordBot:
             async def _skill_cmd(interaction: discord.Interaction, **kwargs):
                 await interaction.response.defer()
                 if _command:
+                    # Direct-command skills execute a host script, bypassing the
+                    # LLM, access control, HITL and audit — so gate them to admins
+                    # (mirrors every /admin subcommand). LLM-path skills stay open:
+                    # they emit an IncomingMessage and go through access control.
+                    if not self._is_admin(interaction.user.id):
+                        await interaction.followup.send(
+                            "This command runs a host script and is admin-only.",
+                            ephemeral=True,
+                        )
+                        logger.warning(
+                            f"Skill {_skill_name}: non-admin {interaction.user.id} blocked "
+                            "from direct-command path"
+                        )
+                        return
                     logger.debug(f"Skill {_skill_name}: direct command path → {_command}")
                     await DiscordBot._run_direct_command(interaction, _command)
                     return
