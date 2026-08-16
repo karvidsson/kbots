@@ -246,6 +246,25 @@ Set these in the [Discord Developer Portal](https://discord.com/developers/appli
 
 These fixes need only the web dashboard — no machine access.
 
+## macOS privacy grants (desktop control)
+
+The `computer` tool (screenshots, clicks, typing, window control) needs two
+macOS TCC grants, human-only via **System Settings → Privacy & Security** —
+they cannot be scripted. Everything chat-based works without them.
+
+- **Screen Recording** → add the install's Python binary
+  (`<install>/.venv/bin/python3`) — needed for screenshots
+- **Accessibility** → same binary — needed for clicks/typing/System Events
+- Add the **terminal app** too if kbots is run in the foreground: the grant
+  attaches to whichever app hosts the process — and for the same reason,
+  re-add the binary after a `.venv` rebuild that changes the Python binary
+- First-time **Automation** prompts ("… wants to control …") appear per app
+  on the Mac's screen — click Allow; they can't be pre-granted
+
+Check from chat with `computer(action='perms')`; the install playbook covers
+this as Phase 3.5. A `computer` action that *hangs* usually means a permission
+prompt is sitting open on the Mac's screen.
+
 ## Chrome sessions — the sign-in-once flow
 
 The `chrome_browser` tool drives a dedicated debug Chrome
@@ -289,6 +308,7 @@ design.
 | Bot silent in one channel only | Discord role can't view the channel | channel permission overrides in Discord |
 | "OAuth session expired and could not be refreshed" | genuine token expiry, not ownership | re-login interactively as the service user |
 | Worked earlier today, broke mid-session | a root `claude` session ran meanwhile | service log for `Cannot mark workspace trusted` |
+| `computer` screenshots black/empty, or clicks do nothing / hang | missing macOS Screen Recording / Accessibility grant (a hang = prompt open on the Mac's screen) | `computer(action='perms')`; System Settings → Privacy & Security |
 
 The definitive evidence is always the service log
 (`journalctl -u kbots` / `<overlay>/data/launchd.stderr.log`): the engine names

@@ -228,6 +228,41 @@ for key in ('discord-token', 'discord-engineer'):
 Both must print `200`. A `401` means the token was mis-pasted — have the
 human reset that bot's token in the portal and store it again.
 
+## Phase 3.5 — macOS privacy grants (HUMAN HANDOFF — optional but recommended)
+
+Everything chat-based works with **no** macOS grants — skip this phase for a
+headless/chat-only install. But the `computer` tool (desktop control:
+screenshots, clicks, typing, window control) is blocked by macOS TCC until the
+human grants two permissions, and these **cannot be scripted** — System
+Settings only. Doing it now beats discovering it when an agent's first
+screenshot fails.
+
+Give the human these steps verbatim:
+
+1. **System Settings → Privacy & Security → Screen Recording** → **+** →
+   press `Cmd+Shift+G` and add the install's Python binary:
+   `~/kbots/.venv/bin/python3` (needed for screenshots).
+2. **Privacy & Security → Accessibility** → **+** → add the same binary
+   (needed for clicks, typing, and window control via System Events).
+3. If you'll also run kbots in a terminal for testing (Phase 5's foreground
+   run), add your **terminal app** to both lists as well — macOS attributes
+   the permission to whichever app hosts the process.
+4. Later, when an agent first drives another app via AppleScript, macOS will
+   show one-off **Automation** prompts ("… wants to control …") — click
+   Allow; there is no way to pre-grant these.
+
+Two gotchas worth saying out loud:
+
+- Grants attach to the **binary**, so if the `.venv` is rebuilt with a new
+  Python version, the grants silently stop matching — re-add the binary.
+- A `computer` action that **hangs** usually means a permission prompt is
+  sitting open on the Mac's screen waiting for a click.
+
+**Checkpoint (you):** once the service is running (Phase 6), ask an agent to
+run `computer(action='perms')` — it reports which of the two grants are
+active. Screenshots black/empty → Screen Recording missing; clicks that do
+nothing or hang → Accessibility missing.
+
 ## Phase 4 — Config + agents (you)
 
 Write `~/kbots-overlay/config/config.yaml` (substitute the three IDs from
