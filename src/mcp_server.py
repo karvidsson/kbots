@@ -76,7 +76,7 @@ class MCPHitlGate:
 
     def __init__(self, config: dict, vault: FernetVault, admin_users: list | None = None):
         self.vault = vault
-        self.channel_id = config.get("channel")
+        self._config_channel = config.get("channel")
         # Empty approvers must NOT mean "anyone can approve" (that would let any
         # channel member green-light create_tool / install_mcp). Fall back to the
         # configured admin users; if there are none either, nobody can approve and
@@ -86,6 +86,14 @@ class MCPHitlGate:
         self.poll_interval = config.get("poll_interval", 3)
         self.fail_mode = config.get("fail_mode", "closed")
         self.gated_tools = set(config.get("gated_tools", []))
+
+    @property
+    def channel_id(self):
+        """Approval channel — the set_hitl_channel runtime override wins over
+        config (runtime_state is a shared overlay file, so this subprocess sees
+        an admin's live change without a restart)."""
+        from src.core import runtime_state
+        return runtime_state.get_flag("hitl_channel") or self._config_channel
 
     def is_gated(self, tool_name: str) -> bool:
         if tool_name in self.gated_tools:
