@@ -92,6 +92,11 @@ _SCHEMA: dict[str, tuple] = {
     }),
     "admin_users": (dict, False, None, None),
     "agents": (dict, False, None, None),
+    # Browser janitor (quit the shared debug Chrome after hours of idleness)
+    "browser": (dict, False, None, {
+        "idle_quit_hours": ((int, float), False, None, None),
+        "tick_seconds": ((int, float), False, None, None),
+    }),
 }
 
 

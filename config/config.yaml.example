@@ -140,5 +140,13 @@ security:
     level: standard          # lite (articles + filler) | standard (full compression)
     # memory_recall: false   # compress memories at injection time (requires core wiring)
 
+# Browser janitor: agents drive one real Chrome (chrome_browser tool) and leave
+# it running when a task ends — tabs with video keep burning CPU forever. After
+# this many hours with no chrome_browser activity the janitor closes Chrome
+# cleanly (profile/logins persist; the next task relaunches it). 0 disables.
+browser:
+  idle_quit_hours: 3
+  # tick_seconds: 600
+
 admin_users:
   discord: ["YOUR_DISCORD_USER_ID"]
