@@ -180,6 +180,14 @@ def _env_names(*, single_words: bool) -> set[str]:
         entry = entry.strip()
         if len(entry) < 4:
             continue
+        # Same rule as the overlay roster below: in tree mode a plain single
+        # word ('Engineer', 'Ledger') would match ordinary prose across the
+        # whole repo, so only unmistakable forms ('some-bot', 'Some Bot')
+        # participate. Without this, CI (env-fed) flags text that the same
+        # check run locally (overlay-fed) accepts — the working-tree gate must
+        # behave identically wherever the roster comes from.
+        if not single_words and re.fullmatch(r"[A-Za-z]+", entry):
+            continue
         names.add(entry)
         if single_words and " " in entry:
             for word in entry.split():
