@@ -394,6 +394,7 @@ Two mechanisms combine here: **scope** picks the channels an agent listens in, a
 | **Bot account** | `account` | Routing namespace; every bot routes on its own. Required. |
 | **Guild/Server** | `guilds: [id, ...]` | Limits matching to the listed servers; an empty list means no limit. |
 | **Mentions** | `mentions: true/false` | If enabled, the agent answers only DMs and messages that @mention it. |
+| **Users** | `users: [id, ...]` | Only respond to these sender user IDs; an empty list means everyone the team tiers allow. When set, messages carrying no sender ID (system posts) are dropped too. |
 
 Overlapping routing rules are allowed: when several agents match one message, every one of them gets a copy.
 
