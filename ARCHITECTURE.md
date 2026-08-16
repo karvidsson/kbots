@@ -920,6 +920,24 @@ Every scheduled task rides on a systemd timer, with `Persistent=true` so runs mi
 
 ---
 
+## Goal Workstreams
+
+Long-running multi-agent collaborations toward a shared goal ("get 1000 streams for X"), spanning weeks or months and surviving restarts. A **goal** is a SQLite record (`data/goals.db`, WAL — opened directly by both the engine and the MCP tool subprocess, like the memory DB) anchored to one Discord channel that `goal_create` auto-creates. Store: `src/core/goals.py`; tools: `src/tools/goals.py`; config: the `goals:` section of `config.yaml`.
+
+**Lifecycle:** `proposed → brainstorm → strategy → executing → done`, with `paused` and `blocked_on_user` side-states and `abandoned` as the exit. Transitions are validated; every write appends a `goal_events` audit row and bumps `last_activity_at`.
+
+**Dynamic routing — no config edits:** participants of a live goal are routed into its channel straight from the goal store (`get_agent_for_channel` falls through to `goals.routed_participants_for_channel`), and they hear *every* message there (same semantics as `watch_channels`), with `NO_REPLY` as the abstain path. `goal_join` makes an agent live in the channel within ~10 s (TTL cache) — no restart. Each participating agent still needs its own bot account with guild access to the goals category (one Discord app per agent, as usual).
+
+**Anti-ramble:** while a goal is in an active phase, its `turn_budget` (default 30) replaces the global `bot_chain_limit` in that channel; any human message resets the chain, and exhaustion posts one "waiting for a human check-in" notice and silences the channel. The repeat-message pair-mute (`_bot_loop_check`) is **never** waived. Soft norms ride in a `<goal-context>` block injected into every participating turn: phase, strategy, open tasks, open decisions, and phase-specific speaking rules (in `executing`, speak only when @mentioned, on a task event, or with new information — otherwise `NO_REPLY`).
+
+**Facilitation:** the goal's owner agent advances phases (`goal_set`), assigns tasks (`goal_task`), and closes decisions. Any participant can propose a pause, abandon, or strategy change (`goal_propose` — a pause carries a wake condition); others support or object with reasons (`goal_vote`) during an objection window (default 24 h, closed by a scheduler wake to the owner); the owner rules with `goal_decide`. An adopted pause materializes its wake condition on existing machinery: `time` → a one-shot schedule, `metric` → a recurring watch schedule, `webhook` → a trigger (secret shown once), `email` → the owner's email watch plus the paused-goal context.
+
+**Escalation:** when the team hits a wall only the user can clear, `goal_block` records a durable two-list brief (need-to-know / need-from-you), posts it in the goal channel with the escalation user's mention (config `goals.escalation_user`, default the first `access: owner` human in team.json), and optionally alerts `security.alert_channel`. The user replies in the channel; the owner calls `goal_resume`.
+
+**Tier gating:** `goals.create_tiers` (default coordinator + privileged) controls who may create/advance goals; any agent may propose (goal parks at `proposed`), join, vote, and work tasks.
+
+---
+
 ## Operations
 
 ### Start / Stop / Status

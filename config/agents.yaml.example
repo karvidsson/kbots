@@ -41,8 +41,15 @@ agents:
         #                     # defaults to channels[0], or (wildcard) the agent's most
         #                     # recently active conversation channel
         mentions: true        # filter: only respond when @mentioned
+        # watch_channels: []  # channel IDs where this agent hears EVERY message
+        #                     # (human or bot, mentioned or not) and may abstain
+        #                     # by replying NO_REPLY. Each listed channel must
+        #                     # also resolve to this agent via channels/
+        #                     # categories/wildcard, or the watch never fires.
         # Scope priority: specific channel > category > wildcard
         # Filters (account, guilds, mentions) apply independently of scope
+        # Goal channels (see config.yaml `goals:`) need no entry here at all —
+        # participants of a live goal are routed into its channel dynamically.
 
   # Example: assistant-tier agent with a restricted tool whitelist
   # assistant:

@@ -465,6 +465,21 @@ class DiscordConnector(Connector):
             if category_id is None and dm_fallback_agent is None:
                 dm_fallback_agent = agent_id
 
+        # Goal channels route dynamically: a participant of a live goal is
+        # bound to its channel by the goal store, with no agents.yaml entry.
+        # One Discord app per agent, so at most one participant per account.
+        try:
+            from src.core import goals
+            participants = goals.routed_participants_for_channel(channel_id)
+            if participants:
+                for agent_id, agent_cfg in self._agent_configs.items():
+                    routing = agent_cfg.get("routing", {}).get("discord", {})
+                    if (routing.get("account", "default") == bot_account
+                            and agent_id in participants):
+                        return agent_id
+        except Exception:
+            logger.debug("goal routing lookup failed", exc_info=True)
+
         return category_agent or wildcard_agent or dm_fallback_agent
 
 
@@ -744,6 +759,17 @@ class DiscordBot:
         chain = prev_count + 1
         self._bot_chain[channel_id] = (chain, now)
         limit = int(self.connector.config.get("bot_chain_limit", _BOT_CHAIN_LIMIT))
+        goal = None
+        try:
+            # A sanctioned goal collaboration gets that goal's turn budget
+            # instead of the global limit. Restart-safe (a DB read), and the
+            # exemption ends the moment the goal pauses, blocks, or finishes.
+            from src.core import goals
+            goal = goals.active_goal_for_channel(str(channel_id))
+            if goal:
+                limit = int(goal["turn_budget"])
+        except Exception:
+            logger.debug("goal budget lookup failed", exc_info=True)
         if chain > limit:
             if chain == limit + 1:  # log once per trip, not per suppressed message
                 logger.warning(
@@ -751,8 +777,34 @@ class DiscordBot:
                     f"channel {channel_id} with no human message — going quiet until "
                     f"a human posts"
                 )
+                if goal:
+                    self._announce_budget_exhausted(channel_id, goal)
             return True
         return False
+
+    def _announce_budget_exhausted(self, channel_id: int, goal: dict) -> None:
+        """Make the goal channel's silence legible: one system line + an event."""
+        try:
+            from src.core import goals
+            goals.log_event(goal["id"], "system", "budget_exhausted",
+                            f"turn budget {goal['turn_budget']} reached")
+        except Exception:
+            logger.debug("budget_exhausted event failed", exc_info=True)
+        try:
+            channel = self.client.get_channel(channel_id)
+            if channel:
+                asyncio.create_task(self._safe_send(
+                    channel,
+                    f"⏸ Turn budget reached for goal `{goal['id']}` — waiting "
+                    f"for a human check-in before the team continues."))
+        except Exception:
+            logger.debug("budget notice failed", exc_info=True)
+
+    async def _safe_send(self, channel, content: str) -> None:
+        try:
+            await channel.send(content)
+        except discord.HTTPException:
+            logger.debug("budget notice send failed", exc_info=True)
 
     def _render_mentions(self, message: discord.Message) -> str:
         """Replace raw mention markup with readable @names.
@@ -835,6 +887,15 @@ class DiscordBot:
         # mentioned or not — so channel activity itself can drive its work.
         watch_channels = {str(c) for c in (routing.get("watch_channels") or [])}
         is_watched = str(message.channel.id) in watch_channels
+        if not is_watched:
+            # Goal-channel participants hear everything there — same semantics
+            # as watch_channels, sourced from the goal store instead of config.
+            try:
+                from src.core import goals
+                is_watched = agent_id in goals.routed_participants_for_channel(
+                    str(message.channel.id))
+            except Exception:
+                logger.debug("goal watch lookup failed", exc_info=True)
 
         # Ignore bot messages unless this bot was @mentioned (user or role)
         # or the channel is explicitly watched
