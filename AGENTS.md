@@ -128,7 +128,7 @@ git add <files>
 git commit -m "fix: description"
 git push -u origin fix/description     # plain push — hooks stay on
 gh pr create                           # PR for cross-review
-gh pr merge --auto --merge             # merges ONLY after CI (incl. leak checks) passes
+gh pr merge --auto --merge             # waits for required checks where branch protection exists
 # other install reviews and approves
 # then both installs: git checkout main && git pull
 ```
@@ -139,8 +139,11 @@ gh pr merge --auto --merge             # merges ONLY after CI (incl. leak checks
   `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `ci`. Scope is optional;
   summary is imperative and lowercase (e.g. `feat(discord): thread replies in approvals`)
 - Every change lands through a **cross-reviewed PR** approved by a maintainer
-- Merge with `gh pr merge --auto` so the merge waits for CI — the leak checks in CI
-  are the only ones that run with the full deployment name list on every surface
+- Merge with `gh pr merge --auto` — on a protected branch (the public repo) this
+  waits for CI, including the leak checks, which are the only checks that run
+  with the full deployment name list on every surface. On an unprotected private
+  repo it merges immediately, so the local hooks and tests remain the front line
+  — CI still scans every push to `main` and fails loudly after the fact
 - Never use `--no-verify` — not on commits, not on pushes. The hooks guarding
   `main` and scanning messages for install leaks only protect a repo they run on
 - Check the diff for personal names, company names, and numeric IDs before every commit
