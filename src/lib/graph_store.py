@@ -52,14 +52,26 @@ def _now() -> str:
 
 
 def _normalize_scope(scope: str, created_by: str | None) -> str:
-    """Accept 'agent' (→ agent:<created_by>), 'global', 'group:<name>', 'agent:<id>'."""
+    """Accept 'agent' (→ agent:<created_by>), 'global', 'group:<name>'.
+
+    A raw 'agent:<id>' is only accepted when <id> is the caller — an agent must
+    not be able to write edges into another agent's private scope (that would be
+    a memory-poisoning primitive: the victim sees an authoritative-looking
+    private edge it never created).
+    """
     if scope == "agent":
         if not created_by:
             raise ValueError("scope 'agent' requires a creating agent id")
         return f"agent:{created_by}"
-    if scope == "global" or scope.startswith("group:") or scope.startswith("agent:"):
+    if scope.startswith("agent:"):
+        if not created_by or scope != f"agent:{created_by}":
+            raise ValueError(
+                f"Cannot write to another agent's scope {scope!r} — use scope "
+                "'agent' for your own private edges.")
         return scope
-    raise ValueError(f"Invalid scope {scope!r} — use 'agent', 'global', 'group:<name>' or 'agent:<id>'")
+    if scope == "global" or scope.startswith("group:"):
+        return scope
+    raise ValueError(f"Invalid scope {scope!r} — use 'agent', 'global', or 'group:<name>'")
 
 
 def _rows(result) -> list[dict]:
@@ -245,13 +257,36 @@ class GraphMemory:
                 node["degree"] += 1
         return {"nodes": list(nodes.values()), "edges": edges}
 
-    async def query(self, cypher: str, params: dict | None = None, limit: int = 100) -> list[dict]:
-        """Run raw Cypher. Callers are responsible for read-only guarding."""
-        limit = max(1, min(int(limit), 1000))
+    async def find(self, *, rel: str | None = None, entity: str | None = None,
+                   agent_id: str | None = None, limit: int = 50) -> list[dict]:
+        """Scope-filtered edge search by relationship and/or entity.
+
+        Replaces the old raw-Cypher `query()`: raw Cypher could not have the
+        per-edge scope predicate enforced, so any agent could read every other
+        agent's private edges. This builds a fully parameterized, scope-filtered
+        query instead. `rel` and `entity` are optional filters.
+        """
+        limit = max(1, min(int(limit), 500))
         conn = await self._ensure_open()
-        result = await conn.execute(cypher, params or {})
-        rows = _rows(result)
-        return rows[:limit]
+        agent_scope = f"agent:{agent_id}" if agent_id else "agent:"
+        clauses = [_SCOPE_FILTER]
+        params: dict = {"agent_scope": agent_scope}
+        if rel:
+            clauses.append("r.rel = $rel")
+            params["rel"] = rel
+        if entity:
+            clauses.append("(a.name = $entity OR b.name = $entity)")
+            params["entity"] = entity
+        where = " AND ".join(clauses)
+        result = await conn.execute(
+            "MATCH (a:Entity)-[r:Related]->(b:Entity) "
+            f"WHERE {where} "
+            "RETURN a.name AS src, r.rel AS rel, b.name AS dst, "
+            "r.confidence AS confidence, r.scope AS scope, r.created_by AS created_by "
+            f"LIMIT {limit}",
+            params,
+        )
+        return _rows(result)
 
     def close(self) -> None:
         """Close connection and database. Safe to call twice or before open."""
@@ -322,9 +357,10 @@ class GraphClient:
         return await self._call("export", agent_id=agent_id, limit=limit,
                                 own_only=own_only)
 
-    async def query(self, cypher: str, params: dict | None = None,
-                    limit: int = 100) -> list[dict]:
-        return await self._call("query", cypher=cypher, params=params, limit=limit)
+    async def find(self, *, rel: str | None = None, entity: str | None = None,
+                   agent_id: str | None = None, limit: int = 50) -> list[dict]:
+        return await self._call("find", rel=rel, entity=entity,
+                                agent_id=agent_id, limit=limit)
 
     def close(self) -> None:
         """Nothing to close — sessions are per-call."""
