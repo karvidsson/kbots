@@ -37,8 +37,6 @@ connectors:
       # Add more bots:
       # ops:
       #   token_key: secrets/ops-bot-token
-  telegram:
-    enabled: false
   http:
     enabled: false
     port: 8080
@@ -89,9 +87,18 @@ defaults:
     # (global / agent:<id> / group:<name>) like memories. Agents get the
     # memory_link / memory_related / memory_unlink / memory_graph_query /
     # memory_graph tools. Requires: uv sync --extra graph
+    # NOTE macOS 14: that sync fails — ladybug ships no macOS 14 wheels and its
+    # source build needs the macOS 15 SDK. Workaround (a 2-line patch + local
+    # wheel via the overlay): roadmap/graph-memory-ladybugdb.md → "macOS 14"
     graph:
       enabled: false
       path: data/graph/memory.lbdb   # resolved against the repo root
+      # extract: true        # reflector also mines memories into graph edges
+      #                      # (one cheap LLM call per agent per reflection pass;
+      #                      # backfills the existing store batch by batch, then
+      #                      # keeps absorbing new memories; edge scope inherits
+      #                      # the source memory's scope)
+      # extract_batch: 60    # memories examined per pass
 
 # Schedule oversight (optional): a dedicated channel where agents' scheduled
 # tasks are posted. React ❌ on a card to cancel it; use /schedules for the full
@@ -133,6 +140,7 @@ security:
     level: standard          # lite (articles + filler) | standard (full compression)
     # memory_recall: false   # compress memories at injection time (requires core wiring)
 
+<<<<<<< HEAD
   # Access control (STRONGLY RECOMMENDED). When present, tiers from config/team.json
   # decide who can message which agent and which tools they may trigger. Without
   # this block, ANY user who can post in a routed channel drives agents with their
@@ -150,6 +158,15 @@ security:
   #     - web_search
   #     - team_get
   #     - team_list
+=======
+# Browser janitor: agents drive one real Chrome (chrome_browser tool) and leave
+# it running when a task ends — tabs with video keep burning CPU forever. After
+# this many hours with no chrome_browser activity the janitor closes Chrome
+# cleanly (profile/logins persist; the next task relaunches it). 0 disables.
+browser:
+  idle_quit_hours: 3
+  # tick_seconds: 600
+>>>>>>> main
 
 admin_users:
   discord: ["YOUR_DISCORD_USER_ID"]

@@ -15,6 +15,27 @@ logger = logging.getLogger(__name__)
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
+# Token-endpoint errors that no amount of retrying can clear: the grant itself
+# is gone (revoked, expired past its 6-month idle limit, or the user changed
+# their password) or the client registration is wrong. Every one of these needs
+# a human to re-consent. Anything not listed here — 5xx, rate limits, network
+# blips — stays retryable.
+UNRECOVERABLE_OAUTH_ERRORS = {"invalid_grant", "invalid_client", "unauthorized_client"}
+
+
+class OAuth2AuthRevokedError(RuntimeError):
+    """The stored grant is dead and re-authorisation is the only fix.
+
+    Separate from RuntimeError so long-running watchers can stop retrying
+    instead of hammering a credential that will never come back.
+    """
+
+    def __init__(self, prefix: str, error: str, description: str):
+        self.prefix = prefix
+        self.error = error
+        self.description = description
+        super().__init__(f"OAuth2 refresh failed for {prefix}: {description} ({error})")
+
 
 class OAuth2Token:
     """Manages an OAuth2 access token with auto-refresh."""
@@ -87,7 +108,10 @@ class OAuth2Token:
                 ) as resp:
                     result = await resp.json()
                     if resp.status != 200:
+                        code = str(result.get("error", "") or "")
                         error = result.get("error_description", result.get("error", resp.status))
+                        if code in UNRECOVERABLE_OAUTH_ERRORS:
+                            raise OAuth2AuthRevokedError(self.prefix, code, str(error))
                         raise RuntimeError(f"OAuth2 refresh failed for {self.prefix}: {error}")
         except aiohttp.ClientError as e:
             logger.error(f"OAuth2 refresh failed for {self.prefix}: {e}")

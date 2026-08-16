@@ -336,12 +336,16 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
         # Note: team module reads from team.json directly, no memory backend needed
 
     # Graph memory is single-writer (one process per .lbdb file) and owned by the
-    # main kbots process — never open it from this subprocess.
-    from src.lib.graph_store import set_unavailable
-    set_unavailable(
-        "Graph memory is owned by the main kbots process (single-writer database) "
-        "and is not available via the MCP server — ask the agent in chat instead."
-    )
+    # main kbots process — never open it from this subprocess. Forward graph
+    # calls over the loopback internal API instead (GraphClient); without the
+    # loopback env (standalone MCP run) it stays unavailable with a clear reason.
+    from src.lib.graph_store import init_graph_client, set_unavailable
+    if not init_graph_client():
+        set_unavailable(
+            "Graph memory lives in the main kbots process (single-writer database) "
+            "and this MCP server has no loopback connection to it — start the MCP "
+            "server from a running kbots instance to use graph tools."
+        )
 
     # Initialize middleware
     security_cfg = config.get("security", {})

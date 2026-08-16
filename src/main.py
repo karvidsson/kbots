@@ -539,12 +539,21 @@ async def main() -> None:
         logger.info(f"Permission watch: ON (sweep every {perm_watcher.interval}s, "
                     f"escalation → {perm_watcher.agent or 'alert channel'})")
 
-    # --- Reflector: consolidate each agent's lessons into LESSONS.md (cheap model) ---
-    reflection_cfg = config.get("defaults", {}).get("memory", {}).get("reflection", {})
-    if reflection_cfg.get("enabled", True):
+    # --- Reflector: consolidate each agent's lessons into LESSONS.md (cheap model);
+    # when graph memory is enabled it also extracts edges from memories on the same cadence ---
+    memory_cfg = config.get("defaults", {}).get("memory", {})
+    reflection_cfg = memory_cfg.get("reflection", {})
+    if reflection_cfg.get("enabled", True) or (memory_cfg.get("graph") or {}).get("enabled"):
         from src.core.reflector import Reflector
-        reflector = Reflector(agent_manager, reflection_cfg)
+        reflector = Reflector(agent_manager, reflection_cfg,
+                              graph_cfg=memory_cfg.get("graph"))
         asyncio.create_task(reflector.run(), name="reflector")
+
+    # --- Browser janitor: quit the shared debug Chrome after hours of idleness ---
+    from src.core.browser_janitor import BrowserJanitor
+    janitor = BrowserJanitor(config.get("browser", {}))
+    if janitor.enabled:
+        asyncio.create_task(janitor.run(), name="browser-janitor")
 
     # --- Turn judge: auto-label collected turns for training export (default off) ---
     judge_cfg = tc_cfg.get("judge", {}) or {}

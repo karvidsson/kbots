@@ -13,7 +13,9 @@ KBOTS_INTER_AGENT_DEPTH (threaded into the target's subprocess env by the
 claude_code provider), and the server re-checks it before dispatching.
 """
 
+import functools
 import hmac
+import json
 import logging
 import secrets
 
@@ -23,6 +25,13 @@ from src.core.base import IncomingMessage
 from src.tools.builtin import MAX_INTER_AGENT_DEPTH
 
 logger = logging.getLogger(__name__)
+
+# Graph values (e.g. query rows) can contain non-JSON types — stringify them
+# rather than 500 on serialization.
+_json_dumps = functools.partial(json.dumps, default=str)
+
+# GraphMemory methods the /graph route may dispatch — everything else is 400.
+_GRAPH_METHODS = frozenset({"link", "related", "unlink", "entities", "export", "find"})
 
 
 class InternalAPI:
@@ -49,6 +58,7 @@ class InternalAPI:
     async def start(self) -> None:
         app = web.Application()
         app.router.add_post("/agent-message", self._handle_agent_message)
+        app.router.add_post("/graph", self._handle_graph)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
@@ -65,6 +75,39 @@ class InternalAPI:
     def _authed(self, request: web.Request) -> bool:
         auth = request.headers.get("Authorization", "")
         return auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], self.token)
+
+    async def _handle_graph(self, request: web.Request) -> web.Response:
+        """Execute a graph-memory call for a tool subprocess (GraphClient).
+
+        The .lbdb is single-writer, owned by this process — MCP-subprocess
+        tools forward graph calls here instead of opening the file themselves.
+        """
+        if not self._authed(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"error": "invalid JSON body"}, status=400)
+
+        method = str(body.get("method", ""))
+        kwargs = body.get("kwargs") or {}
+        if method not in _GRAPH_METHODS or not isinstance(kwargs, dict):
+            return web.json_response(
+                {"error": f"unknown graph method {method!r}", "kind": "value"}, status=400)
+
+        from src.lib.graph_store import GraphUnavailableError, get_graph
+        try:
+            result = await getattr(get_graph(), method)(**kwargs)
+        except GraphUnavailableError as e:
+            return web.json_response({"error": str(e), "kind": "unavailable"}, status=503)
+        except (TypeError, ValueError) as e:
+            return web.json_response({"error": str(e), "kind": "value"}, status=400)
+        except Exception as e:
+            logger.exception(f"graph call {method} failed")
+            return web.json_response(
+                {"error": f"Graph call {method} failed: {e}", "kind": "unavailable"},
+                status=500)
+        return web.json_response({"result": result}, dumps=_json_dumps)
 
     async def _handle_agent_message(self, request: web.Request) -> web.Response:
         if not self._authed(request):

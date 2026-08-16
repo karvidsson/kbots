@@ -36,7 +36,7 @@ and change the same two — keep its `viewBox`, see below):
 Keep the screen (`#0a0a0f`) and the slate frame (`#7d8695`) identical across all
 avatars so agents read as one family.
 
-Discord and Telegram crop an avatar to the circle **inscribed** in the square
+Discord crops an avatar to the circle **inscribed** in the square
 image, so the corners of a full-bleed square are cut off — a rounded badge drawn
 edge to edge still loses part of its frame. What makes these survive the crop is
 the `viewBox`: it is wider than the artwork (`-18 -18 196 196` around a badge

@@ -154,6 +154,18 @@ def peek(resource: str, now: float | None = None,
     return current
 
 
+def last_activity(resource: str) -> float | None:
+    """`last_used_at` of the current record, live or stale — None if no record.
+
+    Unlike peek() this deliberately reads expired records too: a reservation
+    that ran out an hour ago is still evidence of when the resource was last
+    driven, which is what idle-housekeeping (browser_janitor) needs.
+    """
+    with _locked(resource) as fd:
+        current = _read(fd, resource)
+    return current.last_used_at if current else None
+
+
 def format_duration(seconds: float) -> str:
     seconds = max(0, int(seconds))
     m, s = divmod(seconds, 60)

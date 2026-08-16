@@ -60,7 +60,6 @@ def build_workspace(mock: bool, agent_prompt: str | None) -> None:
         "connectors": {
             "repl": {"enabled": True},
             "discord": {"enabled": False},
-            "telegram": {"enabled": False},
             "http": {"enabled": False, "port": 8080},
         },
         "defaults": {

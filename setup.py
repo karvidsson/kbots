@@ -1155,7 +1155,6 @@ def step_generate(state: dict):
         },
         "connectors": {
             "discord": discord_cfg,
-            "telegram": {"enabled": False},
             "http": {"enabled": False, "port": 8080},
         },
         "defaults": {

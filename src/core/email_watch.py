@@ -28,6 +28,7 @@ from pathlib import Path
 
 import aiohttp
 
+from src.auth.oauth2 import OAuth2AuthRevokedError
 from src.core.base import IncomingMessage
 
 logger = logging.getLogger(__name__)
@@ -201,13 +202,28 @@ class EmailWatcher:
                         state[agent_id] = history_id
                         self._save_state(state)
                 failures = 0
+            except OAuth2AuthRevokedError as e:
+                # The grant is gone; retrying cannot bring it back. Backing off
+                # is not enough — a 5-minute retry forever is 288 identical
+                # ERROR lines a day, and the real damage is silent: the agent
+                # simply stops being woken by mail and nothing says so. Say it
+                # once, with the command that fixes it, then stop.
+                account_arg = f" --account {account}" if account else ""
+                logger.error(
+                    f"email-watch: STOPPED watching {agent_id} — its Google "
+                    f"authorisation is revoked or expired and cannot refresh "
+                    f"({e.error}: {e.description}). This agent will NOT be woken by "
+                    f"new mail until it is re-authorised: "
+                    f"python scripts/google-reauth.py{account_arg} — then restart the service."
+                )
+                return
             except Exception as e:
                 failures += 1
                 logger.error(f"email-watch: tick failed for {agent_id}: {e}")
             # Re-read each cycle so /email-watch interval changes apply live.
             interval = await self._effective_interval(agent_id, cfg)
-            # Repeated failures (auth broken, network down) back off hard so a
-            # dead refresh token isn't hammered every minute forever.
+            # Repeated failures (network down, Gmail 5xx) back off hard so a
+            # transient outage isn't hammered every minute.
             await asyncio.sleep(interval if failures < 3 else max(interval, 300))
 
     async def run(self) -> None:
