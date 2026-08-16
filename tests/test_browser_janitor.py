@@ -61,14 +61,14 @@ async def test_live_reservation_blocks_quit(overlay, quiet_chrome):
     j = BrowserJanitor({"idle_quit_hours": 3})
     now = time.time()
     runtime_state.set_flag(_FLAG, now - 40 * 3600)     # ancient — would quit
-    ok, _ = tool_reservation.acquire(_RESOURCE, "neon-husky", now=now)
+    ok, _ = tool_reservation.acquire(_RESOURCE, "atlas", now=now)
     assert ok
     try:
         assert await j._tick(now) is False             # agent is driving
         assert quiet_chrome == []
         assert runtime_state.get_flag(_FLAG) == pytest.approx(now)
     finally:
-        tool_reservation.release(_RESOURCE, "neon-husky")
+        tool_reservation.release(_RESOURCE, "atlas")
 
 
 async def test_stale_reservation_counts_as_activity(overlay, quiet_chrome):
