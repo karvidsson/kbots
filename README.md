@@ -30,6 +30,8 @@ Discord message → Router → Agent (project context + memory) → LLM → tool
 
 From clone to a Discord agent that answers you, in four steps. The wizard does the heavy lifting — this section tells you what to have ready.
 
+> 🤖 **Are you a coding agent** (Claude Code or similar) installing kbots on macOS for a human? Skip the interactive wizard — follow **[docs/AGENT_INSTALL_MACOS.md](docs/AGENT_INSTALL_MACOS.md)** instead. It's written for you: you do the whole install, the human only handles Discord and auth approvals at your instruction.
+
 ### What you need
 
 - [ ] **A machine** — Linux VPS (2 CPU, 4GB RAM) for production, or a Mac for local use

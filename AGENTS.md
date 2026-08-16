@@ -159,3 +159,4 @@ gh pr create                           # PR for cross-review
 - **[SCRIPTS.md](SCRIPTS.md)** — Every script and how to run it
 - **[skills/README.md](skills/README.md)** — The skill file format
 - **[docs/PERMISSIONS.md](docs/PERMISSIONS.md)** — Permissions & rights: per-platform setup, failure catalog, permission watch
+- **[docs/AGENT_INSTALL_MACOS.md](docs/AGENT_INSTALL_MACOS.md)** — Agent-led install playbook: a coding agent installs kbots on macOS, human only does Discord/auth handoffs
