@@ -191,3 +191,21 @@ def test_human_names_split_into_words_in_single_word_mode(tmp_path, monkeypatch)
     # tree mode is unchanged: multi-word values only, no word splitting
     tree_names = leaks.overlay_roster_names()
     assert "Lovelace" not in tree_names
+
+
+def test_env_injected_names_work_without_an_overlay(monkeypatch):
+    """CI has no overlay — names arrive via KBOTS_LEAK_NAMES (a repo secret).
+    Multi-word entries follow roster semantics: whole in tree mode, plus
+    word-by-word in single-word mode."""
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    monkeypatch.setenv("KBOTS_LEAK_NAMES", "Ada Lovelace\nzeta-bot\nxy\n")
+
+    single = leaks.overlay_roster_names(single_words=True)
+    assert {"Ada Lovelace", "Lovelace", "zeta-bot"} <= single
+    assert "xy" not in single            # < 4 chars ignored
+
+    tree = leaks.overlay_roster_names()
+    assert "Ada Lovelace" in tree and "zeta-bot" in tree
+    assert "Lovelace" not in tree        # no word-split in tree mode
+
+    assert leaks.roster_hits("ping zeta-bot about it", "msg", single)
