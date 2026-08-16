@@ -126,10 +126,11 @@ git checkout -b fix/description        # create branch
 # make changes, test with: sudo systemctl restart kbots
 git add <files>
 git commit -m "fix: description"
-git push --no-verify -u origin fix/description
+git push -u origin fix/description     # plain push — hooks stay on
 gh pr create                           # PR for cross-review
+gh pr merge --auto --merge             # merges ONLY after CI (incl. leak checks) passes
 # other install reviews and approves
-# merge via GitHub, then both installs: git checkout main && git pull
+# then both installs: git checkout main && git pull
 ```
 
 ### Commit rules
@@ -138,7 +139,10 @@ gh pr create                           # PR for cross-review
   `feat`, `fix`, `docs`, `chore`, `refactor`, `test`, `perf`, `ci`. Scope is optional;
   summary is imperative and lowercase (e.g. `feat(discord): thread replies in approvals`)
 - Every change lands through a **cross-reviewed PR** approved by a maintainer
-- Never use `--no-verify` to sidestep the pre-commit hook guarding `main`
+- Merge with `gh pr merge --auto` so the merge waits for CI — the leak checks in CI
+  are the only ones that run with the full deployment name list on every surface
+- Never use `--no-verify` — not on commits, not on pushes. The hooks guarding
+  `main` and scanning messages for install leaks only protect a repo they run on
 - Check the diff for personal names, company names, and numeric IDs before every commit
 - Force-pushing `main` needs explicit approval — otherwise don't
 

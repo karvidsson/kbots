@@ -164,6 +164,29 @@ def commit_records(rev_range: str, repo: Path = REPO) -> list[tuple[str, str, st
 
 # --- roster check: only where a deployment exists to compare against ---------
 
+def _env_names(*, single_words: bool) -> set[str]:
+    """Roster names injected via KBOTS_LEAK_NAMES (newline-separated).
+
+    CI runners have no overlay, so without this the name check silently
+    skips on the one machine that gates every merge. The deployment stores
+    its names in a GitHub Actions secret — never in the repo — and the
+    workflow feeds them here. Entries follow roster semantics: multi-word
+    entries also match word by word in single-word mode; entries under 4
+    characters are ignored.
+    """
+    raw = os.environ.get("KBOTS_LEAK_NAMES", "")
+    names: set[str] = set()
+    for entry in raw.splitlines():
+        entry = entry.strip()
+        if len(entry) < 4:
+            continue
+        names.add(entry)
+        if single_words and " " in entry:
+            for word in entry.split():
+                if len(word) >= 4:
+                    names.add(word)
+    return names
+
 def overlay_roster_names(*, single_words: bool = False) -> set[str]:
     """Agent/human names from the local overlay roster, if there is one.
 
@@ -179,18 +202,18 @@ def overlay_roster_names(*, single_words: bool = False) -> set[str]:
     work. A single-word agent name is precisely what leaked there, and the cost
     of a false positive is rewording one sentence rather than auditing a repo.
     """
+    names = _env_names(single_words=single_words)
+
     overlay = os.environ.get("KBOTS_OVERLAY", "")
     if not overlay:
-        return set()
+        return names
     roster = Path(overlay) / "config" / "team.json"
     if not roster.exists():
-        return set()
+        return names
     try:
         data = json.loads(roster.read_text())
     except (json.JSONDecodeError, OSError):
-        return set()
-
-    names = set()
+        return names
     for kind, members in (("agents", data.get("agents", [])),
                           ("humans", data.get("humans", []))):
         for member in members:
