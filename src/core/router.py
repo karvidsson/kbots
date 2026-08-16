@@ -71,6 +71,13 @@ class Router:
             if guild_id and str(guild_id) not in guilds:
                 return False
 
+        # Sender filter — empty list means everyone (team tiers still apply).
+        # NB: strict — a listed agent also filters out messages that carry no
+        # sender ID at all (system posts, some webhooks).
+        users = routing.get("users", [])
+        if users and str(message.user_id) not in {str(u) for u in users}:
+            return False
+
         # Mention filter — if mentions: true, only route if bot was mentioned
         # This is checked by the connector before emitting (sets a flag or filters)
         # Here we just accept if it passed the connector's filter
