@@ -102,3 +102,26 @@ def test_admin_owner_can_message_and_use_tools(monkeypatch):
     assert ac.check("111", "run_command", agent_id="bot")["allowed"] is True
     # A non-admin unknown user is denied a non-safe tool.
     assert ac.check("999", "run_command", agent_id="bot")["allowed"] is False
+
+
+# --- HITL denial messages: the agent must be able to tell the user WHY ---
+
+def test_hitl_no_channel_message_names_the_setting():
+    """A denial caused by missing config must say so — the agent relays this to
+    the user, who otherwise can't distinguish it from a human saying no."""
+    from src.core.hitl import hitl_result_message
+    msg = hitl_result_message("send_email", {"status": "denied", "reason": "no_channel"})
+    assert "security.hitl.channel" in msg
+    assert "did NOT run" in msg
+    # The MCP-side gate uses a different reason string for the same condition.
+    msg = hitl_result_message(
+        "send_email", {"status": "denied", "reason": "no discord token or HITL channel"})
+    assert "security.hitl.channel" in msg
+
+
+def test_hitl_human_denial_message_stays_generic():
+    from src.core.hitl import hitl_result_message
+    for outcome in ({"status": "denied", "approver": "111"}, {"status": "timeout"}):
+        msg = hitl_result_message("send_email", outcome)
+        assert outcome["status"] in msg
+        assert "security.hitl.channel" not in msg
