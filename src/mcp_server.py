@@ -438,12 +438,8 @@ def _make_middleware_handler(
                         hitl_result.get("hitl_id", "?"), MCP_AGENT_ID, _name,
                         hitl_result["status"], hitl_result.get("approver"),
                     )
-                return (
-                    f"HITL: Tool '{_name}' was {hitl_result['status']}. The tool did "
-                    "NOT run — nothing is queued or in progress. Tell the user plainly "
-                    "that the call needs approval (or was denied / timed out); do not "
-                    "describe it as running or pending completion."
-                )
+                from src.core.hitl import hitl_result_message
+                return hitl_result_message(_name, hitl_result)
 
         # Record for rate limiting BEFORE execution (prevents TOCTOU race)
         if rate_limiter:
