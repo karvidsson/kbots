@@ -191,14 +191,27 @@ def overlay_roster_names(*, single_words: bool = False) -> set[str]:
         return set()
 
     names = set()
-    for member in list(data.get("agents", [])) + list(data.get("humans", [])):
-        for field in ("id", "name"):
-            value = str(member.get(field) or "").strip()
-            if len(value) < 4:
-                continue
-            if not single_words and re.fullmatch(r"[A-Za-z]+", value):
-                continue
-            names.add(value)
+    for kind, members in (("agents", data.get("agents", [])),
+                          ("humans", data.get("humans", []))):
+        for member in members:
+            for field in ("id", "name"):
+                value = str(member.get(field) or "").strip()
+                if len(value) < 4:
+                    continue
+                if not single_words and re.fullmatch(r"[A-Za-z]+", value):
+                    continue
+                names.add(value)
+                # A human's name leaks one word at a time — "Ada saw the
+                # status" names Ada Lovelace without ever matching the full
+                # roster value, which is exactly how forty commit messages
+                # slipped past this check. Split HUMAN names into their words
+                # in single-word mode. Agent names stay whole: a bot called
+                # "Data Bot" must not turn every mention of 'data' into a
+                # finding.
+                if single_words and kind == "humans" and " " in value:
+                    for word in value.split():
+                        if len(word) >= 4:
+                            names.add(word)
     return names
 
 
