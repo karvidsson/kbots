@@ -83,3 +83,49 @@ async def test_set_hitl_tool_admin_only(tmp_path, overlay, monkeypatch):
     out = await set_hitl(ToolContext(agent_id="a", user_id="111"), enabled=False)
     assert "OFF" in out
     assert runtime_state.get_flag("hitl_enabled") is False
+
+
+# --- Runtime channel override (set_hitl_channel) ---
+
+async def test_channel_override_wins_over_config(tmp_path, overlay):
+    from src.core import runtime_state
+    db = await aiosqlite.connect(tmp_path / "t.db")
+    g = HITLGate({"channel": "config-ch"}, db)
+    assert g.channel_id == "config-ch"
+    runtime_state.set_flag("hitl_channel", "999")
+    assert g.channel_id == "999"          # live — no re-init needed
+    runtime_state.clear_flag("hitl_channel")
+    assert g.channel_id == "config-ch"    # cleared → config again
+    await db.close()
+
+
+async def test_channel_override_fills_empty_config(tmp_path, overlay):
+    from src.core import runtime_state
+    db = await aiosqlite.connect(tmp_path / "t.db")
+    g = HITLGate({"channel": ""}, db)
+    assert not g.channel_id
+    runtime_state.set_flag("hitl_channel", "999")
+    assert g.channel_id == "999"
+    await db.close()
+
+
+async def test_set_hitl_channel_tool(overlay, monkeypatch):
+    from src.core import runtime_state
+    from src.core.base import ToolContext
+    from src.tools import hitl_admin
+
+    monkeypatch.setattr(hitl_admin, "_is_admin", lambda uid: uid == "111")
+    ctx_admin = ToolContext(agent_id="main", user_id="111")
+    ctx_other = ToolContext(agent_id="main", user_id="222")
+
+    out = await hitl_admin.set_hitl_channel(ctx_other, "999")
+    assert out.startswith("ERROR") and not runtime_state.get_flag("hitl_channel")
+
+    out = await hitl_admin.set_hitl_channel(ctx_admin, "not-a-number")
+    assert out.startswith("ERROR")
+
+    out = await hitl_admin.set_hitl_channel(ctx_admin, "999")
+    assert "✅" in out and runtime_state.get_flag("hitl_channel") == "999"
+
+    out = await hitl_admin.set_hitl_channel(ctx_admin, "")
+    assert not runtime_state.get_flag("hitl_channel")
