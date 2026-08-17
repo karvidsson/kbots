@@ -40,6 +40,7 @@ _SECRET_VALUE_PATTERNS = [
     re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"),  # JWT
     re.compile(r"\b[MNO][A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}"),  # Discord bot token
     re.compile(r"(?i)\b(bearer|token|authorization)\s+[A-Za-z0-9._~+/=-]{20,}"),
+    re.compile(r"(?i)X-Webhook-Secret['\"]?\s*[:=]\s*['\"]?[A-Za-z0-9._~+/=-]{12,}"),
 ]
 
 
