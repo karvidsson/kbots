@@ -385,10 +385,28 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     else:
         logger.info("Security alerts: logger only (no alert_channel configured)")
 
+    # Optional lockdown: high-security deployments can drop the most dangerous
+    # tools from the MCP surface entirely (host command execution, live code
+    # authoring, the HITL killswitch). Off by default — these are legitimate
+    # agent tools normally gated per-sender by access control; the flag is for
+    # deployments that never want them reachable over stdio at all.
+    restrict = os.environ.get("KBOTS_MCP_RESTRICT", "").strip().lower() in ("1", "true", "yes")
+    dangerous_prefixes = ("tmux_",)
+    dangerous_names = {"run_command", "computer", "create_tool", "create_skill",
+                       "promote_tool", "set_hitl", "install_mcp"}
+
     # Register each kbots tool as an MCP tool with middleware wrapping
+    skipped = []
     for tool_name, tool_def in kbots_tools.items():
+        if restrict and (tool_name in dangerous_names
+                         or tool_name.startswith(dangerous_prefixes)):
+            skipped.append(tool_name)
+            continue
         _register_tool(mcp, tool_def, vault, hitl, rate_limiter, audit,
                        memory=memory, tool_log_db=tool_log_db, alerter=alerter)
+    if skipped:
+        logger.warning(f"KBOTS_MCP_RESTRICT: withheld {len(skipped)} dangerous tools "
+                       f"from the MCP surface: {', '.join(sorted(skipped))}")
 
     return mcp
 

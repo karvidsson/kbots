@@ -5,58 +5,20 @@ Sessions persist across calls so agents can navigate multi-step flows
 (cookie consent → login → extract data).
 """
 
-import ipaddress
 import logging
-import socket
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 from src.core.base import KBOTS_TMP, ToolContext
 from src.core.tools import tool
+from src.lib.ssrf import install_playwright_guard
+from src.lib.ssrf import validate_url as _validate_url
 
 logger = logging.getLogger(__name__)
-
-# SSRF protection — block internal networks
-_BLOCKED_NETS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
 
 # Session store: {session_id: {browser, context, page, last_used}}
 _sessions: dict[str, dict] = {}
 _SESSION_TTL = 300  # 5 min idle timeout
-
-
-def _validate_url(url: str) -> str | None:
-    """Block internal/private URLs."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return f"Blocked scheme: {parsed.scheme}. Only http/https allowed."
-    hostname = parsed.hostname
-    if not hostname:
-        return "No hostname in URL."
-    try:
-        addrs = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return f"Cannot resolve hostname: {hostname}"
-    for _, _, _, _, sockaddr in addrs:
-        ip = ipaddress.ip_address(sockaddr[0])
-        # An IPv4-mapped IPv6 address (::ffff:a.b.c.d) never matches the IPv4
-        # nets directly — check the embedded IPv4 as well.
-        mapped = getattr(ip, "ipv4_mapped", None)
-        candidates = [ip] + ([mapped] if mapped else [])
-        for cand in candidates:
-            for net in _BLOCKED_NETS:
-                if cand in net:
-                    return f"Blocked: {hostname} resolves to internal address {ip}."
-    return None
 
 
 async def _cleanup_stale():
@@ -97,6 +59,9 @@ async def _get_or_create_session(session_id: str) -> dict:
         viewport={"width": 1280, "height": 720},
     )
     page = await context.new_page()
+    # Re-validate every request (redirects, subresources, JS nav, clicks), not
+    # just the initial open — otherwise a page can reach metadata/loopback.
+    await install_playwright_guard(page)
 
     _sessions[session_id] = {
         "pw": pw,
