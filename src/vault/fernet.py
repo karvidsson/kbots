@@ -18,7 +18,12 @@ from src.core.base import VaultBackend
 logger = logging.getLogger(__name__)
 
 LEGACY_SALT = b"kagents-vault-salt"
-PBKDF2_ITERATIONS = 100_000
+# Vaults created before the KDF params were recorded were derived at 100k
+# iterations. New vaults use the OWASP-recommended floor. The iteration count a
+# given vault was encrypted with is stored in its .kdf sidecar; absent that
+# sidecar an existing secrets.enc is assumed legacy so it still decrypts.
+LEGACY_ITERATIONS = 100_000
+PBKDF2_ITERATIONS = 600_000
 
 
 def _normalise_key(key: str) -> str:
@@ -110,6 +115,7 @@ class FernetVault(VaultBackend):
             vault_path = resolve_config_file("secrets.enc")
         self._vault_path = Path(vault_path)
         self._salt_path = self._vault_path.with_suffix(".salt")
+        self._kdf_path = self._vault_path.with_suffix(".kdf")
         self._secrets: dict[str, str] = {}
         self._fernet: Fernet | None = None
         self._unlocked = False
@@ -142,10 +148,37 @@ class FernetVault(VaultBackend):
             f.write(salt)
         return salt
 
+    def _write_kdf(self, iterations: int) -> None:
+        """Record the KDF iteration count in a sidecar so this exact vault keeps
+        decrypting even as the default changes."""
+        self._kdf_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._kdf_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"iterations": iterations}, f)
+
+    def _load_iterations(self) -> int:
+        """Iteration count this vault was (or will be) encrypted with.
+
+        - .kdf present → use it (the recorded truth for this vault).
+        - no .kdf but secrets.enc exists → a pre-sidecar vault, derived at 100k.
+        - neither → a brand-new vault: adopt the current default and record it.
+        """
+        if self._kdf_path.exists():
+            try:
+                return int(json.loads(self._kdf_path.read_text())["iterations"])
+            except (ValueError, KeyError, OSError):
+                logger.warning(f"Unreadable {self._kdf_path} — assuming legacy iterations")
+                return LEGACY_ITERATIONS
+        if self._vault_path.exists():
+            return LEGACY_ITERATIONS
+        self._write_kdf(PBKDF2_ITERATIONS)
+        return PBKDF2_ITERATIONS
+
     def unlock(self, passphrase: str) -> None:
         """Decrypt the vault into memory. Passphrase is not retained."""
         salt = self._load_salt()
-        key = self._derive_key(passphrase, salt)
+        iterations = self._load_iterations()
+        key = self._derive_key(passphrase, salt, iterations)
         self._fernet = Fernet(key)
 
         if self._vault_path.exists():
@@ -301,18 +334,43 @@ class FernetVault(VaultBackend):
         if self._salt_path.exists():
             raise RuntimeError("Per-instance salt already exists — already migrated")
 
-        # Generate new salt and re-derive key
+        # Generate new salt and re-derive key. Iterations are unchanged here
+        # (use rekey() to also raise the iteration count) so this stays a pure
+        # salt migration with identical semantics to before.
         new_salt = self._generate_salt()
-        new_key = self._derive_key(passphrase, new_salt)
+        new_key = self._derive_key(passphrase, new_salt, self._load_iterations())
         self._fernet = Fernet(new_key)
 
         # Re-encrypt with new key
         self._persist()
         logger.info(f"Vault salt migrated to per-instance salt at {self._salt_path}")
 
+    def rekey(self, passphrase: str) -> dict:
+        """Upgrade the vault's KDF in place: a per-instance random salt (if still
+        on the legacy shared salt) and the current PBKDF2 iteration count.
+        Re-encrypts with the stronger key. Must be unlocked. Returns what changed.
+        """
+        if not self._unlocked:
+            raise RuntimeError("Vault must be unlocked before rekey")
+        changed: dict = {}
+        if not self._salt_path.exists():
+            salt = self._generate_salt()
+            changed["salt"] = "legacy → per-instance random"
+        else:
+            salt = self._salt_path.read_bytes()
+        old_iter = self._load_iterations()
+        new_key = self._derive_key(passphrase, salt, PBKDF2_ITERATIONS)
+        self._fernet = Fernet(new_key)
+        self._write_kdf(PBKDF2_ITERATIONS)
+        if old_iter != PBKDF2_ITERATIONS:
+            changed["iterations"] = f"{old_iter} → {PBKDF2_ITERATIONS}"
+        self._persist()
+        logger.info(f"Vault rekeyed: {changed or 'already current'}")
+        return changed
+
     @staticmethod
-    def _derive_key(passphrase: str, salt: bytes) -> bytes:
+    def _derive_key(passphrase: str, salt: bytes, iterations: int = PBKDF2_ITERATIONS) -> bytes:
         """Derive a Fernet key from a passphrase using PBKDF2."""
         return base64.urlsafe_b64encode(hashlib.pbkdf2_hmac(
-            "sha256", passphrase.encode(), salt, PBKDF2_ITERATIONS, dklen=32
+            "sha256", passphrase.encode(), salt, iterations, dklen=32
         ))

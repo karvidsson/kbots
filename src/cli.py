@@ -7,7 +7,6 @@ Usage:
 """
 
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -28,6 +27,8 @@ def cmd_vault(args):
     """Vault management commands."""
     if args.vault_cmd == "init":
         vault_init(args)
+    elif args.vault_cmd == "rekey":
+        vault_rekey(args)
     else:
         logger.error(f"Unknown vault command: {args.vault_cmd}")
 
@@ -64,29 +65,41 @@ def vault_init(args):
         logger.error("Passphrases don't match")
         sys.exit(1)
 
-    # Encrypt
-    import base64
-    import hashlib
-
-    from cryptography.fernet import Fernet
-
-    # Derive key from passphrase
-    key = base64.urlsafe_b64encode(hashlib.pbkdf2_hmac(
-        # NOTE: legacy salt — never rename; changing it would break unlocking
-        # every existing vault (pre-dates the kagents→kbots rename).
-        "sha256", passphrase.encode(), b"kagents-vault-salt", 100_000, dklen=32
-    ))
-    fernet = Fernet(key)
-
-    payload = json.dumps(secrets).encode()
-    encrypted = fernet.encrypt(payload)
-
-    vault_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(vault_file, "wb") as f:
-        f.write(encrypted)
-    vault_file.chmod(0o600)
+    # Create through FernetVault so the new vault gets a per-instance random salt
+    # and the current (strong) iteration count — the old inline path hardcoded the
+    # shared legacy salt + 100k iterations, so every vault made this way shared a
+    # globally-known salt.
+    from src.vault.fernet import FernetVault
+    vault = FernetVault(vault_path=str(vault_file))
+    vault.unlock(passphrase)  # fresh vault → writes random .salt + .kdf, derives strong key
+    for k, v in secrets.items():
+        vault.set(k, v)       # persists (encrypts) at the new iteration count
+    if not secrets:
+        vault._persist()      # write the empty encrypted vault so secrets.enc exists
 
     logger.info(f"  [ok] Vault created: {vault_file} ({len(secrets)} secrets)")
+
+
+def vault_rekey(args):
+    """Upgrade an existing vault's KDF: per-instance salt + stronger iterations."""
+    vault_file = SCRIPT_DIR / "config" / "secrets.enc"
+    if not vault_file.exists():
+        logger.error(f"No vault at {vault_file} — nothing to rekey.")
+        sys.exit(1)
+
+    import getpass
+
+    from src.vault.fernet import FernetVault
+    passphrase = getpass.getpass("  Vault passphrase: ")
+    vault = FernetVault(vault_path=str(vault_file))
+    try:
+        vault.unlock(passphrase)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+    changed = vault.rekey(passphrase)
+    logger.info(f"  [ok] Vault rekeyed: {changed}" if changed
+                else "  [ok] Vault already uses the current KDF parameters.")
     logger.info("  Passphrase is NOT stored anywhere. Don't lose it.")
 
 
@@ -167,6 +180,7 @@ def main():
     p_vault = subparsers.add_parser("vault", help="Vault management")
     vault_sub = p_vault.add_subparsers(dest="vault_cmd", required=True)
     vault_sub.add_parser("init", help="Create vault from .env")
+    vault_sub.add_parser("rekey", help="Upgrade vault KDF (per-instance salt + stronger iterations)")
     p_vault.set_defaults(func=cmd_vault)
 
     # run
