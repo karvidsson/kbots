@@ -1586,6 +1586,13 @@ class AgentManager:
         api = getattr(self, "internal_api", None)
         if api is not None:
             env.update(api.env)
+        # GitHub token for agent git/gh — injected only into the agent CLI env
+        # here, never the global process env (which non-agent tool subprocesses
+        # would inherit).
+        gh = self.vault.get("github-token") if self.vault else None
+        if gh:
+            env["GH_TOKEN"] = gh
+            env["GITHUB_TOKEN"] = gh
         return env
 
     def _mcp_vault_env(self) -> dict[str, str]:
