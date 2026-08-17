@@ -44,6 +44,46 @@ def resolve_vault_key_file() -> Path:
     return Path(os.environ.get("KBOTS_VAULT_KEY_FILE", "~/.config/kbots-vault-key")).expanduser()
 
 
+def harden_path(path, file_mode: int = 0o600, dir_mode: int = 0o700) -> None:
+    """Best-effort tighten permissions on a data file and its parent dir.
+
+    Data files (SQLite DBs, audit/training JSONL, runtime state) can hold tool
+    args/outputs and flags; on a multi-user host the default umask leaves them
+    world-readable. Never raises — a perms failure must not break startup.
+    """
+    p = Path(path)
+    try:
+        if p.exists():
+            os.chmod(p, file_mode)
+        parent = p.parent
+        if parent.exists():
+            os.chmod(parent, dir_mode)
+    except OSError as e:
+        logger.debug(f"harden_path({path}) failed: {e}")
+
+
+def read_vault_key_file(key_file: Path) -> str:
+    """Read the plaintext vault passphrase, enforcing owner-only permissions.
+
+    The key file holds the passphrase in cleartext — if it is group- or
+    world-readable, encryption at rest is meaningless. On a permissive mode we
+    log a warning and tighten it to 0600 in place (non-fatal so a restarted
+    service still comes up), then read it.
+    """
+    import stat as _stat
+    try:
+        mode = key_file.stat().st_mode
+        if mode & (_stat.S_IRWXG | _stat.S_IRWXO):
+            logger.warning(
+                f"Vault key file {key_file} is group/world-accessible "
+                f"(mode {oct(mode & 0o777)}) — tightening to 0600."
+            )
+            os.chmod(key_file, 0o600)
+    except OSError as e:
+        logger.warning(f"Could not check/tighten vault key file permissions: {e}")
+    return key_file.read_text().strip()
+
+
 def resolve_config_file(name: str) -> Path:
     """Find a config file across layers: overlay → modules → core.
 

@@ -39,6 +39,8 @@ class SQLiteMemory(MemoryBackend):
 
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(db_path, check_same_thread=False)
+        from src.core.base import harden_path
+        harden_path(db_path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")

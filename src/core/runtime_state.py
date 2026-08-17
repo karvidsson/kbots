@@ -44,6 +44,10 @@ def set_flag(name: str, value) -> None:
     data[name] = value
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2) + "\n")
+    try:
+        path.chmod(0o600)  # holds hitl_enabled — don't let other users flip the gate
+    except OSError:
+        pass
 
 
 def clear_flag(name: str) -> None:
