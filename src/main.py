@@ -12,7 +12,7 @@ from pathlib import Path
 import yaml
 
 from src.core.agent_manager import AgentManager
-from src.core.base import resolve_vault_key_file
+from src.core.base import read_vault_key_file, resolve_vault_key_file
 from src.core.preflight import run_preflight
 from src.core.registry import Registry
 from src.core.router import Router
@@ -168,7 +168,7 @@ async def main() -> None:
         # Try key file first (for systemd), then interactive prompt
         key_file = resolve_vault_key_file()
         if key_file.exists():
-            passphrase = key_file.read_text().strip()
+            passphrase = read_vault_key_file(key_file)
         elif not sys.stdin.isatty():
             passphrase = sys.stdin.readline().strip()
         else:
@@ -184,14 +184,13 @@ async def main() -> None:
         # Dev mode — load from .env
         vault.unlock_from_env()
 
-    # Export GitHub token from vault so agents that shell out to `gh` or `git`
-    # pick it up via the standard env vars. Passed through to Claude Code
-    # subprocesses via the env allowlist in src/llm/claude_code.py.
-    gh_token = vault.get("github-token")
-    if gh_token:
-        os.environ["GH_TOKEN"] = gh_token
-        os.environ["GITHUB_TOKEN"] = gh_token
-        logger.info("GitHub token loaded from vault")
+    # GitHub token for agents that shell out to `gh`/`git`. Do NOT put it in the
+    # global process env — every utility-tool subprocess (tmux, video, audio,
+    # computer) would inherit it and could exfiltrate it. It is injected only
+    # into the agent CLI subprocess via AgentManager._subprocess_env (sourced
+    # from the vault per launch).
+    if vault.get("github-token"):
+        logger.info("GitHub token available in vault (injected per agent CLI launch)")
 
     # --- Preflight checks ---
     data_dir = config.get("kbots", {}).get("data_dir", "./data")

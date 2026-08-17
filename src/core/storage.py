@@ -88,6 +88,8 @@ class Storage:
         """Initialize the database and create tables."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(str(self._db_path))
+        from src.core.base import harden_path
+        harden_path(self._db_path)  # holds tool_log args/output — keep owner-only
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA synchronous=NORMAL")
         await self._db.execute("PRAGMA busy_timeout=5000")

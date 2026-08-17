@@ -93,6 +93,20 @@ class CodexCLIProvider(LLMProvider):
     # the engine must not inject it as a system message.
     reads_project_context = True
 
+    # Only allowlisted env vars reach the subprocess — inheriting the whole
+    # parent env would hand a prompt-injected Codex session GH_TOKEN, the
+    # DISCORD_*/ANTHROPIC_* vars, and any vault-loaded secret. Mirrors
+    # claude_code._ENV_ALLOWLIST plus Codex's own config/auth vars. Per-call
+    # context (MCP secrets, internal API token) arrives via extra_env instead.
+    _ENV_ALLOWLIST = {
+        "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "LC_CTYPE",
+        "TERM", "COLORTERM", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
+        "XDG_CACHE_HOME", "XDG_RUNTIME_DIR", "NODE_PATH", "EDITOR",
+        "SSH_AUTH_SOCK", "PKGX_DIR", "PKGX_PANTRY_DIR",
+        # Codex's own config/auth — legitimately its to use, unlike GH/Discord.
+        "CODEX_HOME", "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID",
+    }
+
     def __init__(self, config: dict):
         super().__init__(config)
         self._codex_bin = config.get("codex_bin", "codex")
@@ -119,7 +133,8 @@ class CodexCLIProvider(LLMProvider):
         cwd = Path(project_dir).resolve()
         cwd.mkdir(parents=True, exist_ok=True)
 
-        env = {**os.environ, **(kwargs.get("extra_env") or {})}
+        env = {k: v for k, v in os.environ.items() if k in self._ENV_ALLOWLIST}
+        env.update(kwargs.get("extra_env") or {})
 
         # One retry: a stale/unknown session id drops resume and starts fresh.
         for resuming in ([True, False] if session_id else [False]):

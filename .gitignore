@@ -25,6 +25,7 @@ config/mcp.yaml
 # Secrets — never commit
 config/secrets.enc
 config/secrets.salt
+config/secrets.kdf
 *.key
 *.pem
 

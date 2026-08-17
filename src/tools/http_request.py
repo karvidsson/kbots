@@ -6,56 +6,32 @@ link-local addresses). This is the universal glue — reach for it before writin
 a service-specific tool.
 """
 
-import ipaddress
 import json
 import logging
-import socket
 from urllib.parse import urljoin, urlparse
 
 from src.core.base import ToolContext
 from src.core.tools import tool
+from src.lib.ssrf import validate_url as _validate_url
 
 logger = logging.getLogger(__name__)
 
 _METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD")
 _MAX_BODY = 8000
-
-# SSRF protection — block internal networks (same set as browser.py)
-_BLOCKED_NETS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
+_MAX_READ = 4 * 1024 * 1024  # 4 MB hard cap on the response we pull into memory
 
 
-def _validate_url(url: str) -> str | None:
-    """Block non-http(s) and internal/private URLs. Returns error string or None."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return f"Blocked scheme: {parsed.scheme or '(none)'}. Only http/https allowed."
-    host = parsed.hostname
-    if not host:
-        return "No hostname in URL."
-    try:
-        addrs = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        return f"Cannot resolve hostname: {host}"
-    for *_, sockaddr in addrs:
-        ip = ipaddress.ip_address(sockaddr[0])
-        # An IPv4-mapped IPv6 address (::ffff:a.b.c.d) never matches the IPv4
-        # nets directly — check the embedded IPv4 as well.
-        mapped = getattr(ip, "ipv4_mapped", None)
-        candidates = [ip] + ([mapped] if mapped else [])
-        for cand in candidates:
-            for net in _BLOCKED_NETS:
-                if cand in net:
-                    return f"Blocked: {host} resolves to internal address {ip}."
-    return None
+def _host_allowed(host: str, allowed: str) -> bool:
+    """True if host matches one of the comma/space-separated allowed suffixes.
+
+    'api.github.com' matches an allow entry of 'github.com' or 'api.github.com'.
+    """
+    host = (host or "").lower().rstrip(".")
+    for entry in allowed.replace(",", " ").split():
+        e = entry.strip().lower().lstrip("*.").rstrip(".")
+        if e and (host == e or host.endswith("." + e)):
+            return True
+    return False
 
 
 def _parse_json_arg(value: str, label: str):
@@ -93,6 +69,8 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
         timeout: seconds (capped at 120).
 
     The secret value never appears in the prompt or logs — only the key name.
+    A secret can be pinned to specific hosts by storing secrets/<key>.hosts
+    (e.g. "api.github.com"); it is then refused for any other host.
     """
     method = method.upper().strip()
     if method not in _METHODS:
@@ -120,6 +98,8 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
         return err
 
     # Resolve auth from the vault (never inline the secret)
+    auth_header_names: set[str] = set()
+    origin_host = (urlparse(url).hostname or "").lower()
     if auth_secret:
         header_name = "Authorization"
         vault_key = auth_secret
@@ -129,11 +109,29 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
             header_name = spec
             prefix = ""
         secret = None
+        allowed_hosts = None
         if ctx.vault:
             secret = ctx.vault.get(f"secrets/{vault_key}") or ctx.vault.get(vault_key)
+            # Optional host binding: store secrets/<key>.hosts to pin a secret to
+            # specific hosts. Prevents an agent from exfiltrating a vault secret
+            # to an arbitrary URL (auth_secret + attacker URL was a one-call vault
+            # dump). Enforced when present; when absent we allow but warn.
+            allowed_hosts = (ctx.vault.get(f"secrets/{vault_key}.hosts")
+                             or ctx.vault.get(f"{vault_key}.hosts"))
         if not secret:
             return f"No vault secret found for '{vault_key}'. Add it as secrets/{vault_key}."
+        if allowed_hosts:
+            if not _host_allowed(origin_host, allowed_hosts):
+                return (f"Refusing to send secret '{vault_key}' to '{origin_host}' — "
+                        f"it is bound to hosts [{allowed_hosts}]. Update secrets/{vault_key}.hosts "
+                        "if this host is legitimate.")
+        else:
+            logger.warning(
+                f"http_request: sending vault secret '{vault_key}' to '{origin_host}' with no "
+                f"host binding. Add secrets/{vault_key}.hosts to restrict where it can be sent."
+            )
         hdrs[header_name] = f"{prefix}{secret}"
+        auth_header_names.add(header_name.lower())
 
     try:
         import aiohttp
@@ -159,12 +157,18 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
                         rerr = _validate_url(cur_url)  # block SSRF via redirect
                         if rerr:
                             return rerr
+                        # Drop auth headers when redirected to a different host so
+                        # a redirect can't carry a vault secret to another origin.
+                        if auth_header_names and (urlparse(cur_url).hostname or "").lower() != origin_host:
+                            hdrs = {k: v for k, v in hdrs.items()
+                                    if k.lower() not in auth_header_names}
+                            auth_header_names = set()
                         if resp.status in (301, 302, 303):
                             cur_method, cur_body = "GET", None  # standard method downgrade
                         query = None  # params only apply to the first request
                         continue
                     ctype = resp.headers.get("Content-Type", "")
-                    raw = await resp.read()
+                    raw = await resp.content.read(_MAX_READ)  # bounded — don't OOM on a huge body
                     out = [f"{resp.status} {resp.reason}", f"Content-Type: {ctype}"]
                     if "application/json" in ctype:
                         try:
