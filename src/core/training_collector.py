@@ -62,6 +62,48 @@ def _tools_schema(tools) -> list[dict]:
         return []
 
 
+def _count_lines(path: Path) -> int:
+    """Rows in a JSONL file. Counted rather than loaded — turns.jsonl reaches
+    tens of megabytes and this runs from a chat command."""
+    try:
+        with open(path, "rb") as f:
+            return sum(1 for line in f if line.strip())
+    except OSError:
+        return 0
+
+
+def training_status(path: str | Path, include_tool_trace: bool | None = None) -> dict:
+    """What is actually on disk for a training directory.
+
+    Reports the RESOLVED absolute path, because the configured value is
+    routinely relative (`data_dir: ./data`) and therefore resolves against the
+    service's working directory rather than anywhere a person would look. Three
+    people hunting for turns.jsonl by hand, one of them failing entirely, is
+    what this exists to stop.
+
+    Safe to call when collection is off — it describes the directory the config
+    points at, whether or not anything has ever written there.
+    """
+    d = Path(path).expanduser().resolve()
+    turns, rewards = d / "turns.jsonl", d / "rewards.jsonl"
+    judgments = d / "judgments.jsonl"
+    return {
+        "dir": str(d),
+        "dir_exists": d.is_dir(),
+        "turns": _count_lines(turns) if turns.exists() else 0,
+        "turns_bytes": turns.stat().st_size if turns.exists() else 0,
+        "turns_mtime": (datetime.fromtimestamp(turns.stat().st_mtime, timezone.utc)
+                        .isoformat(timespec="seconds") if turns.exists() else None),
+        # A missing rewards file is the normal state before anyone reacts, and
+        # it is indistinguishable from a broken reward path unless we say which.
+        "rewards_file_exists": rewards.exists(),
+        "rewards": _count_lines(rewards) if rewards.exists() else 0,
+        "judgments_file_exists": judgments.exists(),
+        "judgments": _count_lines(judgments) if judgments.exists() else 0,
+        "include_tool_trace": include_tool_trace,
+    }
+
+
 class TrainingCollector:
     """Append-only per-turn training-data writer (turns.jsonl + rewards.jsonl)."""
 
@@ -76,6 +118,10 @@ class TrainingCollector:
         # cli_session_id -> transcript lines already consumed (per-turn slicing)
         self._offsets: dict[str, int] = {}
         atexit.register(self.close)
+
+    def status(self) -> dict:
+        """What this collector has actually written. See training_status()."""
+        return training_status(self._dir, self._include_tool_trace)
 
     def _write(self, path: Path, entry: dict) -> None:
         try:

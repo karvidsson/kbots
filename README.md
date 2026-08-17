@@ -600,7 +600,9 @@ kbots:
   training_collection: { enabled: true, include_tool_trace: true }
 ```
 
-Every turn is captured to `data/training/turns.jsonl` — the assembled prompt, the **full tool-call trace** (recovered from Claude Code's own transcript), the final response, and outcome signals; 👍/👎 reactions land in `rewards.jsonl` as reward labels. Secrets are redacted; it stays local. Export to whichever trainer you want:
+Every turn is captured to `data/training/turns.jsonl` — the assembled prompt, the **full tool-call trace** (recovered from Claude Code's own transcript), the final response, and outcome signals; 👍/👎 reactions land in `rewards.jsonl` as reward labels. Secrets are redacted; it stays local. `/admin training` prints the **resolved** path and how much of each you actually have — worth running first, since `data_dir` is often relative and resolves against the service's working directory, not wherever you are.
+
+Note that `rewards.jsonl` is only created by the *first* 👍/👎: until someone reacts, reward-based filters have nothing to filter on and quietly fall back to outcome signals. Export to whichever trainer you want:
 
 ```bash
 uv run python scripts/export_training_data.py --dir data/training \

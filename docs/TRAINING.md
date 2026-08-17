@@ -86,6 +86,11 @@ default `--labels human` ignores them entirely.
 
 ## 2. Export a dataset
 
+Run `/admin training` first. It prints the **resolved** directory and the counts
+of turns, rewards and judge labels — `<data_dir>` is commonly the relative
+`./data`, which resolves against the service's working directory rather than
+the repo you are standing in, so guessing the path wastes more time than asking.
+
 ```bash
 uv run python scripts/export_training_data.py --dir <data_dir>/training \
     --format nanogpt sft mlx openai dpo --stats
@@ -93,7 +98,9 @@ uv run python scripts/export_training_data.py --dir <data_dir>/training \
 #   --agent research           only one agent
 #   --skill tool_specialist  only turns run under one skill (a tool-scoped subset)
 #   --tool send_email ...     only turns that actually CALLED one of these tools
-#   --positive-only          only 👍 / non-degraded turns
+#   --positive-only          👍 turns, or non-degraded ones when no 👍 exists
+#                            (with zero rewards recorded this keeps every clean
+#                             turn — "not bad", which is not the same as "good")
 #   --successful-only        drop turns with tool errors or degraded stop reasons
 #   --min-reward 0.5 --since 2026-08-01
 #   --labels any             also use judge auto-labels (§1; default: human only)
