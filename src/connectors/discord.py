@@ -1726,6 +1726,54 @@ class DiscordBot:
                 lines.append(f"⚠️ update `{checkout['short']}` on disk but not running — restart to apply.")
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+        @admin_group.command(
+            name="training",
+            description="Training-data collection: resolved path, turns, rewards",
+        )
+        async def cmd_training(interaction: discord.Interaction):
+            if not self._is_admin(interaction.user.id):
+                await interaction.response.send_message("Not authorized.", ephemeral=True)
+                return
+            from src.core.training_collector import training_status
+            mgr = getattr(self.connector, "_agent_manager", None)
+            tc = getattr(mgr, "training_collector", None) if mgr else None
+            if tc:
+                st = tc.status()
+            else:
+                # Collection is off, so there is no collector to ask. Resolve
+                # the default location anyway — "where would it write?" is worth
+                # answering without having to turn collection on first.
+                st = training_status("./data/training")
+
+            mb = st["turns_bytes"] / (1024 * 1024)
+            lines = [
+                f"**Training collection:** {'ON' if tc else 'OFF'}"
+                + ("" if tc else " — path below is the default, not a configured value"),
+                f"**Path:** `{st['dir']}`" + ("" if st["dir_exists"] else "  ⚠️ does not exist"),
+                f"**Turns:** {st['turns']:,} ({mb:.1f} MB)"
+                + (f", last written {st['turns_mtime']}" if st["turns_mtime"] else ""),
+            ]
+            # The point of the command: distinguish "nobody has reacted yet"
+            # from "the reward path is broken". They look identical from the
+            # exporter, which reports a clean zero for both.
+            if not st["rewards_file_exists"]:
+                lines.append(
+                    "**Rewards:** none — `rewards.jsonl` has never been created. "
+                    "No 👍/👎 has been recorded on any reply. Reward filters "
+                    "(`--positive-only`, `--min-reward`) will exclude EVERY turn.")
+            else:
+                lines.append(f"**Rewards:** {st['rewards']:,} 👍/👎 recorded")
+            if st["judgments_file_exists"]:
+                lines.append(f"**Judge labels:** {st['judgments']:,}")
+            else:
+                lines.append("**Judge labels:** none (judge off or not yet run)")
+            if st["include_tool_trace"] is not None:
+                lines.append(
+                    f"**Tool trace:** {'on' if st['include_tool_trace'] else 'off'} — "
+                    f"read once at startup, so changing it needs `/admin reboot`, "
+                    f"not `/admin reload`.")
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
         @admin_group.command(name="reload", description="Hot-reload skills, tools, and config")
         async def cmd_reload(interaction: discord.Interaction):
             if not self._is_admin(interaction.user.id):

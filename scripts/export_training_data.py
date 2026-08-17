@@ -21,6 +21,7 @@ tool; --skill NAME keeps only turns run under a (tool-scoped) skill. Combine wit
 """
 import argparse
 import json
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -205,6 +206,28 @@ def main():
     turns = _read_jsonl(src / "turns.jsonl")
     rewards = _reward_map(_read_jsonl(src / "rewards.jsonl"))
     judgments = _judge_map(_read_jsonl(src / "judgments.jsonl"))
+
+    # Reward-based filters over a corpus with no rewards exit 0 and say nothing
+    # about why. --positive-only silently degrades to "not degraded" (every
+    # clean turn is neutral, score 0), and --min-reward above 0 excludes
+    # everything. Both look like a verdict on the data rather than the absence
+    # of any labels at all, which sends people hunting for a fault that is not
+    # there — no 👍 has ever been pressed.
+    if (args.positive_only or args.min_reward is not None) and not rewards:
+        where = ("no rewards.jsonl in " + str(src) if not (src / "rewards.jsonl").exists()
+                 else "rewards.jsonl holds no usable rewards")
+        note = ("--positive-only is falling back to outcome signals only — it keeps "
+                "every non-degraded turn, which is not the same as 'good'"
+                if args.positive_only else
+                "--min-reward is comparing against outcome-derived scores only "
+                "(0.0 for a clean turn, -0.25 with tool errors, -1.0 if degraded)")
+        print(
+            f"WARNING: {where} — 0 human rewards recorded.\n"
+            f"         {note}.\n"
+            f"         Rewards come from 👍/👎 reactions on replies. Without any,\n"
+            f"         enable the judge or drop the filter (see docs/TRAINING.md).",
+            file=sys.stderr,
+        )
 
     tool_filter = set(args.tool) if args.tool else None
     kept, labels, by_agent, by_tool = [], Counter(), Counter(), Counter()
