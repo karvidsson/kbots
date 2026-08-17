@@ -3,7 +3,14 @@ name: CI
 on:
   push:
     branches: [main]
+  # `edited` matters for the title/body leak scan below: it reads the
+  # description from the event payload, which is frozen at the triggering
+  # event. Without this, fixing a leaked name in the description leaves the
+  # check permanently red — re-running replays the same stale payload, and the
+  # only way to clear it is an unrelated commit. A guard you cannot satisfy
+  # after obeying it teaches people to ignore it.
   pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
 
 permissions:
   contents: read
