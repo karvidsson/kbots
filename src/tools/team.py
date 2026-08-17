@@ -216,9 +216,9 @@ def resolve_agent_sender(sender: str) -> dict | None:
     never a numeric Discord snowflake, so the Discord-ID lookup above can never
     match and every teammate arrived rendered as an unverified guest.
 
-    Matching is on the slug so the roster's two spellings of the same agent
-    agree: 'Dr.Zoid' and 'dr-zoid' are one teammate, as are 'Neon Husky' and
-    'neon-husky'.
+    Matching is on the slug so the roster's two spellings of one agent agree:
+    a display name and an id routinely disagree on punctuation and spacing,
+    e.g. 'Data.Bot' against 'data-bot', or 'Arc Fox' against 'arc-fox'.
 
     ONLY call this for messages that arrived over the internal inter-agent path.
     The value it matches is set by the agent manager from the calling agent's
