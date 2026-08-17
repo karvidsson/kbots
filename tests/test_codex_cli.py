@@ -1,7 +1,6 @@
 """codex_cli provider — headless codex exec invocation, resume, MCP translation."""
 
 import json
-import os
 import stat
 
 import pytest
@@ -9,13 +8,15 @@ import pytest
 from src.core.base import Message, MessageRole
 from src.llm.codex_cli import CodexCLIProvider, mcp_config_args
 
+# The fake logs argv and signals resume-failure via files next to its own
+# binary — NOT env vars, because the provider passes only an allowlisted env to
+# the subprocess (a security control), so FAKE_CODEX_* env would be stripped.
 FAKE_CODEX = """#!/usr/bin/env python3
 import json, os, sys
-log = os.environ.get("FAKE_CODEX_LOG")
-if log:
-    with open(log, "a") as f:
-        f.write(json.dumps(sys.argv[1:]) + "\\n")
-if "resume" in sys.argv and os.environ.get("FAKE_CODEX_FAIL_RESUME"):
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+with open(os.path.join(here, "argv.log"), "a") as f:
+    f.write(json.dumps(sys.argv[1:]) + "\\n")
+if "resume" in sys.argv and os.path.exists(os.path.join(here, "FAIL_RESUME")):
     sys.stderr.write("session not found\\n")
     sys.exit(1)
 print(json.dumps({"type": "thread.started", "thread_id": "t-123"}))
@@ -31,11 +32,8 @@ def fake_codex(tmp_path):
     bin_path = tmp_path / "fake-codex"
     bin_path.write_text(FAKE_CODEX)
     bin_path.chmod(bin_path.stat().st_mode | stat.S_IEXEC)
-    log = tmp_path / "argv.log"
-    os.environ["FAKE_CODEX_LOG"] = str(log)
+    log = tmp_path / "argv.log"          # fake writes here (its own directory)
     yield bin_path, log
-    os.environ.pop("FAKE_CODEX_LOG", None)
-    os.environ.pop("FAKE_CODEX_FAIL_RESUME", None)
 
 
 def _provider(bin_path, **cfg):
@@ -79,7 +77,7 @@ async def test_resume_passes_session_and_last_message_only(fake_codex, tmp_path)
 
 async def test_stale_resume_falls_back_to_fresh(fake_codex, tmp_path):
     bin_path, log = fake_codex
-    os.environ["FAKE_CODEX_FAIL_RESUME"] = "1"
+    (bin_path.parent / "FAIL_RESUME").write_text("1")
     resp = await _provider(bin_path).complete(
         [Message(role=MessageRole.USER, content="earlier"),
          Message(role=MessageRole.ASSISTANT, content="noted"),
