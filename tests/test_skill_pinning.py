@@ -219,11 +219,9 @@ async def test_restrict_tools_under_all_agent(tmp_path, monkeypatch):
     assert set(p.calls[0]["tools"]) == {"sp_alpha", "sp_beta"}
 
 
-def test_create_skill_authors_local_pinned_yaml(tmp_path, monkeypatch):
+async def test_create_skill_authors_local_pinned_yaml(tmp_path, monkeypatch):
     """The large-model → local-model handoff: create_skill(run_on_local=True)
     writes a skill the engine parses with llm pin + restrict + rounds."""
-    import asyncio
-
     from src.core import digest
     from src.core.base import ToolContext
     from src.tools.ingest import create_skill
@@ -232,11 +230,11 @@ def test_create_skill_authors_local_pinned_yaml(tmp_path, monkeypatch):
     (tmp_path / "skills").mkdir()
     monkeypatch.setattr(digest, "reload_skills", lambda: None)
     ctx = ToolContext(agent_id="atlas", channel_id="c", user_id="u")
-    out = asyncio.get_event_loop().run_until_complete(create_skill(
+    out = await create_skill(
         ctx, name="ping_office", description="ping the office",
         prompt="Ping {target} and confirm in one line.",
         tools="sp_alpha,sp_beta", run_on_local=True,
-        local_model="qwen3.5:9b", max_rounds=4))
+        local_model="qwen3.5:9b", max_rounds=4)
     assert "LOCAL model" in out
     sk = skills_mod._load_skill_file(tmp_path / "skills" / "ping_office.yaml")
     assert sk.llm == {"provider": "local", "model": "qwen3.5:9b"}
@@ -245,11 +243,9 @@ def test_create_skill_authors_local_pinned_yaml(tmp_path, monkeypatch):
     assert sk.parameters[0].name == "target"
 
 
-def test_create_skill_warns_on_long_local_prompt(tmp_path, monkeypatch):
+async def test_create_skill_warns_on_long_local_prompt(tmp_path, monkeypatch):
     """Local operation degrades on long prompts — create_skill warns (non-blocking)
     when run_on_local and the prompt exceeds ~12 lines; silent otherwise."""
-    import asyncio
-
     from src.core import digest
     from src.core.base import ToolContext
     from src.tools.ingest import create_skill
@@ -259,11 +255,11 @@ def test_create_skill_warns_on_long_local_prompt(tmp_path, monkeypatch):
     monkeypatch.setattr(digest, "reload_skills", lambda: None)
     ctx = ToolContext(agent_id="atlas", channel_id="c", user_id="u")
     long_prompt = "\n".join(f"Step {i}: do thing {i}." for i in range(14))
-    out = asyncio.get_event_loop().run_until_complete(create_skill(
+    out = await create_skill(
         ctx, name="long_local", description="d", prompt=long_prompt,
-        tools="sp_alpha", run_on_local=True))
+        tools="sp_alpha", run_on_local=True)
     assert "WARNING" in out and ">12 lines" in out
-    out2 = asyncio.get_event_loop().run_until_complete(create_skill(
+    out2 = await create_skill(
         ctx, name="long_claude", description="d", prompt=long_prompt,
-        tools="sp_alpha", run_on_local=False))
+        tools="sp_alpha", run_on_local=False)
     assert "WARNING" not in out2

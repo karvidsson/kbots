@@ -32,6 +32,14 @@ from src.core.tools import tool
 logger = logging.getLogger(__name__)
 
 _CMD_TIMEOUT = 20          # default per-subprocess timeout (seconds)
+
+# Absolute paths, not bare names: the MCP subprocess the CLI spawns inherits a
+# trimmed PATH that has no /usr/sbin, so `screencapture` resolved to
+# FileNotFoundError ("command not found") even with Screen Recording granted.
+# These are fixed macOS system locations — resolving them via PATH buys nothing.
+_SCREENCAPTURE = "/usr/sbin/screencapture"
+_OSASCRIPT = "/usr/bin/osascript"
+_OPEN = "/usr/bin/open"
 _SE_HINT = (
     "This needs macOS Accessibility permission. Grant it to the process running "
     "kbots: System Settings → Privacy & Security → Accessibility. "
@@ -97,7 +105,7 @@ async def _run(args: list[str], timeout: int = _CMD_TIMEOUT,
 
 
 async def _osascript(script: str, timeout: int = _CMD_TIMEOUT) -> tuple[int | None, str, str]:
-    return await _run(["osascript", "-e", script], timeout=timeout)
+    return await _run([_OSASCRIPT, "-e", script], timeout=timeout)
 
 
 def _se_error(rc: int | None, err: str) -> str | None:
@@ -152,7 +160,7 @@ async def computer(ctx: ToolContext, action: str, x: int = 0, y: int = 0,
         media.mkdir(parents=True, exist_ok=True)
         fd, probe = tempfile.mkstemp(suffix=".png", dir=str(media))
         os.close(fd)
-        rc, _, err = await _run(["screencapture", "-x", probe], timeout=10)
+        rc, _, err = await _run([_SCREENCAPTURE, "-x", probe], timeout=10)
         screen_ok = rc == 0 and Path(probe).stat().st_size > 0
         Path(probe).unlink(missing_ok=True)
         # Short-timeout System Events probe; timeout ⇒ blocked on a prompt ⇒ not granted
@@ -170,7 +178,7 @@ async def computer(ctx: ToolContext, action: str, x: int = 0, y: int = 0,
         media.mkdir(parents=True, exist_ok=True)
         fd, out = tempfile.mkstemp(prefix="computer_screenshot_", suffix=".png", dir=str(media))
         os.close(fd)
-        args = ["screencapture", "-x"]
+        args = [_SCREENCAPTURE, "-x"]
         if display:
             args += ["-D", str(display)]
         args.append(out)
@@ -230,7 +238,7 @@ async def computer(ctx: ToolContext, action: str, x: int = 0, y: int = 0,
     if action == "open_app":
         if not app:
             return "Error: 'app' required for open_app."
-        rc, _, err = await _run(["open", "-a", app], timeout=15)
+        rc, _, err = await _run([_OPEN, "-a", app], timeout=15)
         if rc != 0:
             return f"Could not open '{app}': {err.strip() or 'not found'}"
         return f"Opened {app}."

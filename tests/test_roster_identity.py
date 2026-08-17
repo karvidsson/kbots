@@ -96,9 +96,9 @@ async def test_team_update_refuses_duplicate_discord_binding(tmp_path, monkeypat
     """One Discord app per agent: binding a held ID to a second row is refused.
 
     Deliberately `async def` rather than asyncio.run(): the suite runs
-    asyncio_mode="auto", and calling asyncio.run() from a sync test closes the
-    loop and leaves none current, which breaks whichever later test reaches for
-    get_event_loop() (it was test_skill_pinning).
+    asyncio_mode="auto", so async tests get a fresh loop each and never share
+    loop state across tests. Driving a coroutine by hand from a sync test
+    instead is what made this suite order-dependent under Python 3.14.
     """
     from types import SimpleNamespace
 

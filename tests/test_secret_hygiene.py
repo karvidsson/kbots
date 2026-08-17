@@ -84,7 +84,7 @@ def _stub_public_dns(monkeypatch):
     # Make any hostname "resolve" to a public IP so the SSRF check passes
     # deterministically (no network) and the host-binding logic is exercised.
     monkeypatch.setattr(
-        "src.tools.http_request.socket.getaddrinfo",
+        "src.lib.ssrf.socket.getaddrinfo",
         lambda host, *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))],
     )
 

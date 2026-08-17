@@ -6,56 +6,19 @@ link-local addresses). This is the universal glue — reach for it before writin
 a service-specific tool.
 """
 
-import ipaddress
 import json
 import logging
-import socket
 from urllib.parse import urljoin, urlparse
 
 from src.core.base import ToolContext
 from src.core.tools import tool
+from src.lib.ssrf import validate_url as _validate_url
 
 logger = logging.getLogger(__name__)
 
 _METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD")
 _MAX_BODY = 8000
-
-# SSRF protection — block internal networks (same set as browser.py)
-_BLOCKED_NETS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
-
-
-def _validate_url(url: str) -> str | None:
-    """Block non-http(s) and internal/private URLs. Returns error string or None."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return f"Blocked scheme: {parsed.scheme or '(none)'}. Only http/https allowed."
-    host = parsed.hostname
-    if not host:
-        return "No hostname in URL."
-    try:
-        addrs = socket.getaddrinfo(host, None)
-    except socket.gaierror:
-        return f"Cannot resolve hostname: {host}"
-    for *_, sockaddr in addrs:
-        ip = ipaddress.ip_address(sockaddr[0])
-        # An IPv4-mapped IPv6 address (::ffff:a.b.c.d) never matches the IPv4
-        # nets directly — check the embedded IPv4 as well.
-        mapped = getattr(ip, "ipv4_mapped", None)
-        candidates = [ip] + ([mapped] if mapped else [])
-        for cand in candidates:
-            for net in _BLOCKED_NETS:
-                if cand in net:
-                    return f"Blocked: {host} resolves to internal address {ip}."
-    return None
+_MAX_READ = 4 * 1024 * 1024  # 4 MB hard cap on the response we pull into memory
 
 
 def _host_allowed(host: str, allowed: str) -> bool:
@@ -205,7 +168,7 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
                         query = None  # params only apply to the first request
                         continue
                     ctype = resp.headers.get("Content-Type", "")
-                    raw = await resp.read()
+                    raw = await resp.content.read(_MAX_READ)  # bounded — don't OOM on a huge body
                     out = [f"{resp.status} {resp.reason}", f"Content-Type: {ctype}"]
                     if "application/json" in ctype:
                         try:
