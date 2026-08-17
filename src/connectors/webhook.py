@@ -18,12 +18,18 @@ import asyncio
 import json
 import logging
 import threading
+import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from src.core import triggers as trig
 from src.core.base import Connector, IncomingMessage, VaultBackend
 
 logger = logging.getLogger(__name__)
+
+_MAX_BODY_BYTES = 64 * 1024      # reject oversized POST bodies before reading them
+_RATE_PER_TRIGGER_PER_MIN = 30   # a single leaked secret can't drive unbounded turns
+_RATE_GLOBAL_PER_MIN = 120
 
 
 class WebhookConnector(Connector):
@@ -37,6 +43,26 @@ class WebhookConnector(Connector):
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Sliding-window fire timestamps for rate limiting (per trigger + global).
+        self._fire_log: dict[str, deque] = {}
+        self._global_log: deque = deque()
+
+    def _rate_ok(self, trigger_id: str) -> bool:
+        """True if firing this trigger now stays under the per-trigger and global
+        per-minute caps. Prevents a leaked secret from driving unbounded inference."""
+        now = time.monotonic()
+        cutoff = now - 60
+        g = self._global_log
+        while g and g[0] < cutoff:
+            g.popleft()
+        t = self._fire_log.setdefault(trigger_id, deque())
+        while t and t[0] < cutoff:
+            t.popleft()
+        if len(g) >= _RATE_GLOBAL_PER_MIN or len(t) >= _RATE_PER_TRIGGER_PER_MIN:
+            return False
+        g.append(now)
+        t.append(now)
+        return True
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -63,6 +89,12 @@ class WebhookConnector(Connector):
         or the agent is unknown."""
         if not trig.is_enabled():
             logger.info(f"Trigger {trigger['id']} suppressed — killswitch is OFF")
+            return False
+        if not trigger.get("enabled", True):
+            logger.info(f"Trigger {trigger['id']} suppressed — this trigger is disabled")
+            return False
+        if not self._rate_ok(trigger["id"]):
+            logger.warning(f"Trigger {trigger['id']} rate-limited (>{_RATE_PER_TRIGGER_PER_MIN}/min)")
             return False
         mgr = getattr(self, "_agent_manager", None)
         if not mgr or trigger["agent_id"] not in getattr(mgr, "agent_configs", {}):
@@ -134,7 +166,12 @@ class WebhookConnector(Connector):
                 if not trigger or not trig.verify_secret(
                         trigger, self.headers.get("X-Webhook-Secret", "")):
                     return self._json(401, {"error": "unauthorized"})
-                length = int(self.headers.get("Content-Length", 0) or 0)
+                try:
+                    length = int(self.headers.get("Content-Length", 0) or 0)
+                except ValueError:
+                    return self._json(400, {"error": "bad content-length"})
+                if length > _MAX_BODY_BYTES:
+                    return self._json(413, {"error": "payload too large"})
                 try:
                     payload = json.loads(self.rfile.read(length) or b"{}") if length else {}
                 except json.JSONDecodeError:
