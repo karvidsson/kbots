@@ -7,7 +7,6 @@ Covers:
 - Discord connector reply fallback
 """
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 # --- Token isolation: _discord_headers ---
@@ -63,20 +62,18 @@ class TestDiscordHeaders:
 class TestSendMessageTokenIsolation:
     """send_message in builtin.py must not fall back to default token when bot is specified."""
 
-    def test_specific_bot_missing_returns_error(self):
+    async def test_specific_bot_missing_returns_error(self):
         from src.tools.builtin import send_message
         vault = MagicMock()
         vault.get.return_value = None
         ctx = MagicMock()
         ctx.vault = vault
         ctx.connector_send = None
-        result = asyncio.get_event_loop().run_until_complete(
-            send_message(ctx, "123", "hello", bot="rescue")
-        )
+        result = await send_message(ctx, "123", "hello", bot="rescue")
         assert "Error" in result
         assert "rescue" in result
 
-    def test_no_bot_uses_default(self):
+    async def test_no_bot_uses_default(self):
         from src.tools.builtin import send_message
         vault = MagicMock()
         vault.get.side_effect = lambda k: "tok" if k == "discord-token" else None
@@ -86,9 +83,7 @@ class TestSendMessageTokenIsolation:
         # Will fail at aiohttp but we just need to verify it doesn't error on token lookup
         # Use connector_send path instead
         ctx.connector_send = AsyncMock()
-        result = asyncio.get_event_loop().run_until_complete(
-            send_message(ctx, "123", "hello", bot="")
-        )
+        result = await send_message(ctx, "123", "hello", bot="")
         assert "sent" in result.lower() or "Message" in result
 
 
@@ -97,15 +92,13 @@ class TestSendMessageTokenIsolation:
 class TestSendDiscordFileTokenIsolation:
     """send_discord_file must not fall back to default token when bot is specified."""
 
-    def test_specific_bot_missing_returns_error(self):
+    async def test_specific_bot_missing_returns_error(self):
         from src.tools.discord_tools import send_discord_file
         vault = MagicMock()
         vault.get.return_value = None
         ctx = MagicMock()
         ctx.vault = vault
-        result = asyncio.get_event_loop().run_until_complete(
-            send_discord_file(ctx, "123", "/tmp/test.txt", bot="rescue")
-        )
+        result = await send_discord_file(ctx, "123", "/tmp/test.txt", bot="rescue")
         assert "Error" in result
         assert "rescue" in result
 
@@ -115,7 +108,7 @@ class TestSendDiscordFileTokenIsolation:
 class TestDiscordReplyFallback:
     """When reply() raises Forbidden, connector should fall back to channel.send()."""
 
-    def test_reply_forbidden_falls_back_to_send(self):
+    async def test_reply_forbidden_falls_back_to_send(self):
         import discord
 
         # We test the logic directly rather than importing the full connector
@@ -139,4 +132,4 @@ class TestDiscordReplyFallback:
             channel.send.assert_called_once_with(content)
             return True
 
-        assert asyncio.get_event_loop().run_until_complete(_simulate_send())
+        assert await _simulate_send()
