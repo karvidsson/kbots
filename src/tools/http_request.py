@@ -58,6 +58,19 @@ def _validate_url(url: str) -> str | None:
     return None
 
 
+def _host_allowed(host: str, allowed: str) -> bool:
+    """True if host matches one of the comma/space-separated allowed suffixes.
+
+    'api.github.com' matches an allow entry of 'github.com' or 'api.github.com'.
+    """
+    host = (host or "").lower().rstrip(".")
+    for entry in allowed.replace(",", " ").split():
+        e = entry.strip().lower().lstrip("*.").rstrip(".")
+        if e and (host == e or host.endswith("." + e)):
+            return True
+    return False
+
+
 def _parse_json_arg(value: str, label: str):
     """Parse a JSON-string argument. Returns (parsed, None) or (None, error)."""
     if not value or not value.strip():
@@ -93,6 +106,8 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
         timeout: seconds (capped at 120).
 
     The secret value never appears in the prompt or logs — only the key name.
+    A secret can be pinned to specific hosts by storing secrets/<key>.hosts
+    (e.g. "api.github.com"); it is then refused for any other host.
     """
     method = method.upper().strip()
     if method not in _METHODS:
@@ -120,6 +135,8 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
         return err
 
     # Resolve auth from the vault (never inline the secret)
+    auth_header_names: set[str] = set()
+    origin_host = (urlparse(url).hostname or "").lower()
     if auth_secret:
         header_name = "Authorization"
         vault_key = auth_secret
@@ -129,11 +146,29 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
             header_name = spec
             prefix = ""
         secret = None
+        allowed_hosts = None
         if ctx.vault:
             secret = ctx.vault.get(f"secrets/{vault_key}") or ctx.vault.get(vault_key)
+            # Optional host binding: store secrets/<key>.hosts to pin a secret to
+            # specific hosts. Prevents an agent from exfiltrating a vault secret
+            # to an arbitrary URL (auth_secret + attacker URL was a one-call vault
+            # dump). Enforced when present; when absent we allow but warn.
+            allowed_hosts = (ctx.vault.get(f"secrets/{vault_key}.hosts")
+                             or ctx.vault.get(f"{vault_key}.hosts"))
         if not secret:
             return f"No vault secret found for '{vault_key}'. Add it as secrets/{vault_key}."
+        if allowed_hosts:
+            if not _host_allowed(origin_host, allowed_hosts):
+                return (f"Refusing to send secret '{vault_key}' to '{origin_host}' — "
+                        f"it is bound to hosts [{allowed_hosts}]. Update secrets/{vault_key}.hosts "
+                        "if this host is legitimate.")
+        else:
+            logger.warning(
+                f"http_request: sending vault secret '{vault_key}' to '{origin_host}' with no "
+                f"host binding. Add secrets/{vault_key}.hosts to restrict where it can be sent."
+            )
         hdrs[header_name] = f"{prefix}{secret}"
+        auth_header_names.add(header_name.lower())
 
     try:
         import aiohttp
@@ -159,6 +194,12 @@ async def http_request(ctx: ToolContext, method: str, url: str, headers: str = "
                         rerr = _validate_url(cur_url)  # block SSRF via redirect
                         if rerr:
                             return rerr
+                        # Drop auth headers when redirected to a different host so
+                        # a redirect can't carry a vault secret to another origin.
+                        if auth_header_names and (urlparse(cur_url).hostname or "").lower() != origin_host:
+                            hdrs = {k: v for k, v in hdrs.items()
+                                    if k.lower() not in auth_header_names}
+                            auth_header_names = set()
                         if resp.status in (301, 302, 303):
                             cur_method, cur_body = "GET", None  # standard method downgrade
                         query = None  # params only apply to the first request
