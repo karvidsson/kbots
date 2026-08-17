@@ -36,7 +36,10 @@ From clone to a Discord agent that answers you, in four steps. The wizard does t
 
 - [ ] **A machine** — Linux VPS (2 CPU, 4GB RAM) for production, or a Mac for local use
 - [ ] **Python 3.12+** (the wizard installs `uv` and everything else itself)
-- [ ] **A Claude plan with Claude Code access** — a **Pro or Max** subscription (agents think with Claude Code, no API key needed). Max is recommended if you'll run several agents, since it has higher usage limits. Pay-as-you-go **API/Console billing** also works (`claude auth login --console`).
+- [ ] **An LLM engine** — kbots is engine-agnostic; agents pick a provider per agent:
+  - **Claude Code CLI** (recommended, and what the setup wizard assumes for your first agent): a **Claude Pro or Max** subscription, no API key needed — Max has the higher usage limits if you'll run several agents. Pay-as-you-go **API/Console billing** also works (`claude auth login --console`).
+  - **OpenAI Codex CLI**: a ChatGPT plan, `codex login` — set `llm.provider: codex_cli` on any agent.
+  - **Any OpenAI-compatible endpoint**, including fully local models via Ollama / LM Studio ([docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md)) — usable per agent or as the tier router that keeps simple turns off your paid plan.
 - [ ] **A Discord account** and a server where you have admin rights
 - [ ] ~10 minutes
 
