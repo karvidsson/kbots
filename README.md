@@ -645,7 +645,7 @@ The payoff of keeping Core free of personal data, real config, domain tools, and
 
 ## How kbots compares
 
-Two different questions get asked as "which agent framework should I use?" One is *"I want a running assistant on my own hardware, reachable from my chat app"* — that's a **harness**, and kbots' peers are [OpenClaw](https://github.com/openclaw/openclaw), [Hermes Agent](https://github.com/NousResearch/hermes-agent), and (on the memory axis) [Letta](https://github.com/letta-ai/letta). The other is *"I'm a developer building an agent into my product"* — that's a **framework**, and the peers are [Microsoft Agent Framework](https://learn.microsoft.com/en-us/agent-framework/overview/), [LangGraph](https://github.com/langchain-ai/langgraph), [CrewAI](https://github.com/crewAIInc/crewAI), and the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python). They are different answers, not worse ones. Both charts below; comparison as of **August 2026** — every project here moves fast.
+"Which agent framework?" is two different questions. For *a running assistant on your own hardware, reachable from chat*, you're choosing a **harness** — kbots' peers are [OpenClaw](https://github.com/openclaw/openclaw), [Hermes Agent](https://github.com/NousResearch/hermes-agent), and [Letta](https://github.com/letta-ai/letta). For *agents built into your own product*, you're choosing a **framework** — [Microsoft Agent Framework](https://learn.microsoft.com/en-us/agent-framework/overview/), [LangGraph](https://github.com/langchain-ai/langgraph), [CrewAI](https://github.com/crewAIInc/crewAI), or the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python). Comparison as of **August 2026**.
 
 ### The harnesses (ready-to-run)
 
@@ -676,13 +676,7 @@ Two different questions get asked as "which agent framework should I use?" One i
 | [CrewAI](https://github.com/crewAIInc/crewAI) (MIT, ~57k★, Python) | role-based agent teams ("crews") + event-driven "flows"; model-agnostic incl. local models | your problem decomposes into collaborating role-specialists inside your own app |
 | [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) (MIT, ~28k★, Python) | lightweight multi-agent library — handoffs, guardrails, sessions, tracing; 100+ models via LiteLLM; MCP | you want the thinnest possible first-party loop and will host everything yourself |
 
-A framework gives you primitives and a blank `main.py`; you own the service, the persistence, the channel integrations, and the ops. A harness gives you a running system and takes opinions in exchange. kbots' opinion: **one process, one database, chat as the UI, everything else is a module.**
-
-### What the others do better
-
-- **OpenClaw** is the ecosystem play: more channels than kbots has connectors *planned*, a huge plugin registry, hundreds of contributors, and packaging polish born of ~386k stars. Its scale cuts both ways — [CVE-2026-25253](https://www.proarch.com/blog/threats-vulnerabilities/openclaw-rce-vulnerability-cve-2026-25253) (one-click RCE, CVSS 8.8, patched v2026.1.29), [nearly 600 CVEs since launch — ~2.3 a day](https://days-since-openclaw-cve.com/), tens of thousands of exposed instances, and the ClawHavoc campaign that seeded its skill registry with over a thousand malicious skills. None of that makes OpenClaw wrong; it makes *attack surface* the price of ecosystem, which is exactly why kbots ships fewer integrations, keeps agent-created tools private-by-default, and puts secrets behind a passphrase-unlocked vault instead of env vars.
-- **Hermes Agent** is the strongest engineering peer: real execution sandboxing (six backends, hardened containers) where kbots runs tools in-process, autonomous skill self-improvement, and a shareable skill format. If you need untrusted-code isolation today, Hermes has it and kbots does not.
-- **Letta** has the deepest memory model in the field — a self-improving memory hierarchy vs kbots' pragmatic FTS + semantic recall + lessons. If long-horizon memory *is* the product, start there.
+A framework gives you primitives and a blank `main.py`; a harness gives you a running system and takes opinions in exchange. kbots' opinion: **one process, one database, chat as the UI, everything else is a module.**
 
 ### Where kbots loses, plainly
 
@@ -690,7 +684,14 @@ No sandbox for in-process tool execution (validation is a filter, not a boundary
 
 ### Where kbots wins
 
-Zero-maintenance ops (one process + SQLite — nothing else to run, back up, or upgrade), an encrypted credential vault others don't have, HITL approval gates in the chat you already use, agents that write their own tools under a private-until-promoted trust model, LLM-agnostic down to local models, tool-direct scheduled actions that cost zero LLM calls, and a training pipeline that turns your agents' own work into fine-tuning data for local specialist models. And the three-layer split means the engine stays a clean `git pull` while everything yours lives in your own private repos.
+- **Zero-maintenance ops** — one process + SQLite; nothing else to run, back up, or upgrade
+- **Encrypted credential vault** (Fernet, passphrase-unlocked) instead of secrets in env vars
+- **HITL approval gates** in the chat you already use — per-tool, fail-closed, live-toggleable
+- **Agents write their own tools**, private to their creator until human-approved promotion
+- **LLM-agnostic down to local models**, with a quality-first tier router
+- **Tool-direct scheduled actions** that cost zero LLM calls
+- **Training pipeline**: your agents' own work becomes fine-tuning data for local specialist models
+- **Three-layer split**: the engine stays a clean `git pull`; everything yours lives in your own private repos
 
 ## Docs
 
