@@ -14,12 +14,65 @@ so loop blocking is negligible in practice.
 import atexit
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 SENSITIVE_KEYS = {"password", "secret", "token", "key", "api_key", "passphrase", "credential"}
+
+# Value-shape patterns for secrets that appear INSIDE otherwise-innocent fields
+# (e.g. a token embedded in a `command` string or a URL). Key-name redaction
+# alone misses these — a `Bearer ghp_…` in an argument named `command` would
+# pass straight through. Kept deliberately specific to limit false positives.
+_SECRET_VALUE_PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"\bgh[posru]_[A-Za-z0-9]{20,}"),                 # ghp_/gho_/ghs_/ghu_/ghr_
+    re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"\bsk-[A-Za-z0-9]{20,}"),                        # OpenAI-style
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),               # Slack
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),                         # AWS access key id
+    re.compile(r"\bASIA[0-9A-Z]{16}\b"),                         # AWS temp key id
+    re.compile(r"\bAIza[0-9A-Za-z_-]{35}\b"),                    # Google API key
+    re.compile(r"\bya29\.[A-Za-z0-9_-]{20,}"),                   # Google OAuth token
+    re.compile(r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}"),  # JWT
+    re.compile(r"\b[MNO][A-Za-z0-9_-]{23,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{27,}"),  # Discord bot token
+    re.compile(r"(?i)\b(bearer|token|authorization)\s+[A-Za-z0-9._~+/=-]{20,}"),
+]
+
+
+def scrub_value(s: str) -> str:
+    """Mask any secret-shaped substrings inside a string. Idempotent-ish."""
+    if not isinstance(s, str) or len(s) < 8:
+        return s
+    for pat in _SECRET_VALUE_PATTERNS:
+        s = pat.sub("[REDACTED]", s)
+    return s
+
+
+def redact_secrets(obj):
+    """Recursively redact secrets from any JSON-ish value.
+
+    Combines key-name redaction (an argument literally named `token`) with
+    value-shape scrubbing (a token embedded in a `command`/`url`/`body` string).
+    Use this for anything persisted or shown to humans — audit log, tool log,
+    training data, HITL approval messages.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if isinstance(k, str) and any(s in k.lower() for s in SENSITIVE_KEYS):
+                out[k] = "[REDACTED]"
+            else:
+                out[k] = redact_secrets(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [redact_secrets(v) for v in obj]
+    if isinstance(obj, str):
+        return scrub_value(obj)
+    return obj
 
 
 class AuditLog:
@@ -35,6 +88,10 @@ class AuditLog:
     def _ensure_open(self):
         if self._file is None or self._file.closed:
             self._file = open(self._path, "a", buffering=1)  # line-buffered
+            try:
+                self._path.chmod(0o600)  # audit log holds redacted-but-sensitive trace
+            except OSError:
+                pass
 
     def log_tool(self, agent_id: str, tool_name: str, args: dict,
                  result: str, success: bool, duration_ms: int,
@@ -139,15 +196,11 @@ def _iso_now() -> str:
 
 
 def _redact(data: dict) -> dict:
-    """Redact sensitive values from a dict."""
+    """Redact sensitive values from a dict (key-name + value-shape scrubbing).
+
+    Thin wrapper kept for existing callers; delegates to redact_secrets so
+    embedded secrets (a token inside a `command` string) are caught too.
+    """
     if not isinstance(data, dict):
         return data
-    redacted = {}
-    for k, v in data.items():
-        if any(s in k.lower() for s in SENSITIVE_KEYS):
-            redacted[k] = "[REDACTED]"
-        elif isinstance(v, dict):
-            redacted[k] = _redact(v)
-        else:
-            redacted[k] = v
-    return redacted
+    return redact_secrets(data)

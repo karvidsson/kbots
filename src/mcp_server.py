@@ -26,8 +26,8 @@ import aiohttp
 from mcp.server.fastmcp import FastMCP
 
 from src.core.alerts import WEB_FACING_TOOLS, AlertSender
-from src.core.audit import AuditLog
-from src.core.base import PROJECT_ROOT, ToolContext, ToolDef, resolve_vault_key_file
+from src.core.audit import AuditLog, redact_secrets, scrub_value
+from src.core.base import PROJECT_ROOT, ToolContext, ToolDef, read_vault_key_file, resolve_vault_key_file
 from src.core.content_safety import sanitize, score_injection
 from src.core.rate_limiter import RateLimiter
 from src.core.registry import Registry
@@ -206,10 +206,9 @@ class MCPHitlGate:
 
 
 def _redact_for_display(args: dict) -> str:
-    sensitive = {"secret", "token", "key", "password", "passphrase", "credential"}
-    safe = {k: ("[REDACTED]" if any(s in k.lower() for s in sensitive) else v)
-            for k, v in args.items()}
-    return json.dumps(safe)[:300]
+    # Redact by key name AND by value shape — a secret passed in a `command`/
+    # `url`/`body` argument is posted to the HITL approval channel otherwise.
+    return json.dumps(redact_secrets(args), default=str)[:300]
 
 
 # --- Tool log (SQLite) ---
@@ -277,8 +276,8 @@ def _log_tool_to_db(conn, agent_id: str, tool_name: str, input_data: dict | None
                 "INSERT INTO tool_log (agent_id, session_id, tool_name, input, output, success, duration_ms) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (agent_id, None, tool_name,
-                 json.dumps(input_data)[:2000] if input_data else None,
-                 output[:2000] if output else None,
+                 json.dumps(redact_secrets(input_data), default=str)[:2000] if input_data else None,
+                 scrub_value(output)[:2000] if output else None,
                  int(success), duration_ms),
             )
             conn.commit()
@@ -634,7 +633,7 @@ def main():
     if vault_path.exists():
         key_file = resolve_vault_key_file()
         if key_file.exists():
-            passphrase = key_file.read_text().strip()
+            passphrase = read_vault_key_file(key_file)
         else:
             import getpass
             passphrase = getpass.getpass("Vault passphrase: ")

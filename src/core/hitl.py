@@ -241,16 +241,15 @@ class HITLGate:
 
 
 def _redact_args(args: dict) -> str:
-    """Redact sensitive values from tool arguments for logging."""
+    """Redact sensitive values from tool arguments for logging/approval display.
+
+    Uses the shared redactor so secrets embedded in a `command`/`url`/`body`
+    value are masked too, not just arguments named like a secret.
+    """
     import json
-    redacted = {}
-    sensitive_keys = {"password", "secret", "token", "key", "api_key", "passphrase"}
-    for k, v in args.items():
-        if any(s in k.lower() for s in sensitive_keys):
-            redacted[k] = "[REDACTED]"
-        else:
-            redacted[k] = v
-    return json.dumps(redacted)
+
+    from src.core.audit import redact_secrets
+    return json.dumps(redact_secrets(args), default=str)
 
 
 def hitl_result_message(tool_name: str, result: dict) -> str:

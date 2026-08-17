@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.core.audit import _redact
+from src.core.audit import _redact, scrub_value
 from src.llm.claude_code import session_transcript_path
 
 logger = logging.getLogger(__name__)
@@ -84,6 +84,10 @@ class TrainingCollector:
                 if f is None or f.closed:
                     f = open(path, "a", buffering=1)
                     self._files[str(path)] = f
+                    try:
+                        path.chmod(0o600)  # full transcripts — keep owner-only
+                    except OSError:
+                        pass
                 f.write(json.dumps(entry, default=str) + "\n")
         except Exception as e:  # never let logging break a turn
             logger.debug(f"training write failed: {e}")
@@ -106,9 +110,9 @@ class TrainingCollector:
                 "user_id": getattr(message, "user_id", None),
                 "skill": getattr(message, "skill", None),
                 "reply_message_id": str(reply_message_id) if reply_message_id else None,
-                "input": (user_content or "")[:_MAX_INPUT],
+                "input": scrub_value(user_content or "")[:_MAX_INPUT],
                 "response": {
-                    "content": (getattr(response, "content", "") or "")[:_MAX_INPUT],
+                    "content": scrub_value(getattr(response, "content", "") or "")[:_MAX_INPUT],
                     "model": getattr(response, "model", None),
                     "tokens_used": getattr(response, "tokens_used", None),
                     "stop_reason": getattr(response, "stop_reason", None),
@@ -171,9 +175,9 @@ class TrainingCollector:
                     if isinstance(out, list):
                         out = " ".join(str(b.get("text", "")) for b in out if isinstance(b, dict))
                     steps.append({"type": "tool_result", "is_error": bool(block.get("is_error")),
-                                  "output": (str(out) if out is not None else "")[:_MAX_FIELD]})
+                                  "output": scrub_value(str(out) if out is not None else "")[:_MAX_FIELD]})
                 elif bt == "text" and (block.get("text") or "").strip():
-                    steps.append({"type": "text", "text": block["text"][:_MAX_FIELD]})
+                    steps.append({"type": "text", "text": scrub_value(block["text"])[:_MAX_FIELD]})
                 if len(steps) >= _MAX_STEPS:
                     return steps
         return steps
