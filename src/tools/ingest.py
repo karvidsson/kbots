@@ -32,19 +32,11 @@ from urllib.request import (
 from src.core.base import KBOTS_TMP, PROJECT_ROOT, ToolContext
 from src.core.tools import get_all_tools, tool
 
+# Single source of truth for the blocklist (this module keeps its own IP-pinned
+# connection classes below, but shares the network list to avoid drift).
+from src.lib.ssrf import BLOCKED_NETS as _BLOCKED_NETS
+
 logger = logging.getLogger(__name__)
-
-_BLOCKED_NETS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
-
 
 _PROJECT_ROOT = PROJECT_ROOT
 _OVERLAY = os.environ.get("KBOTS_OVERLAY", "")

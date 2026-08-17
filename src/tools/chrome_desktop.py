@@ -25,7 +25,6 @@ the agent across restarts. Revoking = deleting the profile's directory.
 """
 
 import asyncio
-import ipaddress
 import logging
 import os
 import platform
@@ -34,11 +33,12 @@ import socket
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 from src.core import tool_reservation
 from src.core.base import KBOTS_TMP, PROJECT_ROOT, ToolContext
 from src.core.tools import tool
+from src.lib.ssrf import install_playwright_guard
+from src.lib.ssrf import validate_url as _validate_url
 
 logger = logging.getLogger(__name__)
 
@@ -65,18 +65,6 @@ _RESERVED_ACTIONS = ("open", "login", "click", "fill", "get_text", "screenshot",
 _ALTERNATIVE = ("Use the `browser` tool instead — it is headless and per-session "
                 "isolated, so it is safe to run concurrently.")
 
-# SSRF protection — same blocklist as the browser tool
-_BLOCKED_NETS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-    ipaddress.ip_network("fe80::/10"),
-]
-
 # Single attached-Chrome connection, reused across calls.
 # _state["profile_pages"] maps profile name -> pinned Page for that profile's window.
 _state: dict = {}
@@ -88,29 +76,6 @@ def _debug_dir() -> Path:
                                str(Path.home() / ".kbots-chrome-debug")))
 
 
-def _validate_url(url: str) -> str | None:
-    """Block internal/private URLs (SSRF)."""
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        return f"Blocked scheme: {parsed.scheme}. Only http/https allowed."
-    hostname = parsed.hostname
-    if not hostname:
-        return "No hostname in URL."
-    try:
-        addrs = socket.getaddrinfo(hostname, None)
-    except socket.gaierror:
-        return f"Cannot resolve hostname: {hostname}"
-    for _, _, _, _, sockaddr in addrs:
-        ip = ipaddress.ip_address(sockaddr[0])
-        # An IPv4-mapped IPv6 address (::ffff:a.b.c.d) never matches the IPv4
-        # nets directly — check the embedded IPv4 as well.
-        mapped = getattr(ip, "ipv4_mapped", None)
-        candidates = [ip] + ([mapped] if mapped else [])
-        for cand in candidates:
-            for net in _BLOCKED_NETS:
-                if cand in net:
-                    return f"Blocked: {hostname} resolves to internal address {ip}."
-    return None
 
 
 def _port_up() -> bool:
@@ -213,6 +178,10 @@ async def _profile_page(profile: str, create: bool = False):
         fresh = [p for ctx in browser.contexts for p in ctx.pages if p not in before]
         if fresh:
             pages[profile] = fresh[-1]
+            try:
+                await install_playwright_guard(fresh[-1])  # re-validate every request
+            except Exception as e:
+                logger.debug(f"chrome guard install failed: {e}")
             return fresh[-1]
     return (f"Opened a window on profile '{profile}' but its tab never surfaced "
             f"over CDP. Check action='status' and retry.")
