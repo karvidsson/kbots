@@ -540,7 +540,10 @@ class AgentManager:
         # Inject user context from team system
         try:
             from src.tools.team import build_user_context
-            user_context = build_user_context(message.user_id)
+            user_context = build_user_context(
+                message.user_id,
+                inter_agent_sender=getattr(message, "_inter_agent_sender", "") or "",
+            )
             if user_context:
                 context_blocks.append(user_context)
         except ImportError:
@@ -1224,6 +1227,9 @@ class AgentManager:
             content=content,
         )
         msg._inter_agent_depth = depth  # type: ignore[attr-defined]
+        # Set on the fallback path too: without it a message that lands here
+        # because the target has no home channel would still read as a guest.
+        msg._inter_agent_sender = from_agent  # type: ignore[attr-defined]
         task = asyncio.create_task(
             self.handle_internal_message(target, msg),
             name=f"inter-agent:{from_agent}->{target}",

@@ -99,6 +99,10 @@ def _build_inter_agent_message(
     )
     # Carry depth through the message so the target agent's ToolContext inherits it
     msg._inter_agent_depth = ctx.inter_agent_depth + 1  # type: ignore[attr-defined]
+    # Provenance: the sender is the calling agent's own identity, taken from the
+    # tool context rather than from anything in the message. That is what lets
+    # the receiver resolve it by name without trusting the message body.
+    msg._inter_agent_sender = ctx.agent_id  # type: ignore[attr-defined]
     return msg
 
 

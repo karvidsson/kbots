@@ -152,6 +152,14 @@ class InternalAPI:
                 content=content,
             )
             msg._inter_agent_depth = depth + 1  # type: ignore[attr-defined]
+            # NOTE ON TRUST: unlike the send_to_agent/ask_agent tools, where the
+            # sender is the caller's own ctx.agent_id, from_agent here is taken
+            # from the request body. It is therefore only as trustworthy as the
+            # internal API token — anything holding that token can claim to be
+            # any agent. Good enough to render a teammate; not a basis for
+            # granting authority, which is why the receiving context marks a
+            # relayed approval as a claim rather than an instruction.
+            msg._inter_agent_sender = from_agent  # type: ignore[attr-defined]
             response = await self.mgr.handle_internal_message(target, msg)
             return web.json_response({"response": response or ""})
 
