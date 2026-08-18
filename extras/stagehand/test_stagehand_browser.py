@@ -155,3 +155,22 @@ async def test_missing_sdk_message(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", no_stagehand)
     out = await sb.smart_browser(_ctx(), "goto", url="https://example.com")
     assert "uv sync --extra stagehand" in out
+
+
+async def test_page_url_handles_async_method():
+    """page.url is an async METHOD on Stagehand's wrapper — the first live
+    test failed on exactly this ('coroutine' has no attribute 'startswith')."""
+    class AsyncPage:
+        async def url(self):
+            return "https://example.com/x"
+
+    class SyncMethodPage:
+        def url(self):
+            return "https://a/b"
+
+    class PropertyPage:
+        url = "https://c/d"
+
+    assert await sb._page_url(AsyncPage()) == "https://example.com/x"
+    assert await sb._page_url(SyncMethodPage()) == "https://a/b"
+    assert await sb._page_url(PropertyPage()) == "https://c/d"
