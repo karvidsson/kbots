@@ -315,15 +315,22 @@ async def _close_session(session: str) -> bool:
     return True
 
 
-def _page_url(page) -> str:
+async def _page_url(page) -> str:
+    """page.url is an ASYNC method on Stagehand's page wrapper (verified live:
+    calling it returns a coroutine — treating it as a string was the bug the
+    first live test caught)."""
     url = page.url
-    return url() if callable(url) else str(url)
+    if callable(url):
+        url = url()
+    if asyncio.iscoroutine(url):
+        url = await url
+    return str(url)
 
 
 async def _guard_landed_url(session: str, page) -> str | None:
     """Post-navigation SSRF check — no request hook exists, so verify where
     we ended up and burn the session if it's a blocked address."""
-    landed = _page_url(page)
+    landed = await _page_url(page)
     if landed.startswith("about:"):
         return None
     err = _validate_url(landed)
@@ -381,7 +388,7 @@ async def smart_browser(ctx: ToolContext, action: str, url: str = "",
         lines = []
         for name, sess in _sessions.items():
             backend = sess.get("backend", {})
-            lines.append(f"- '{name}': {_page_url(sess['page'])} "
+            lines.append(f"- '{name}': {await _page_url(sess['page'])} "
                          f"(model: {backend.get('model', '?')}, "
                          f"idle {int(time.time() - sess['last_used'])}s)")
         return "Open sessions:\n" + "\n".join(lines)
@@ -411,7 +418,8 @@ async def smart_browser(ctx: ToolContext, action: str, url: str = "",
             if blocked:
                 return blocked
             title = await page.title()
-            return f"Opened **{title or _page_url(page)}** | URL: {_page_url(page)}"
+            url_now = await _page_url(page)
+            return f"Opened **{title or url_now}** | URL: {url_now}"
 
         if action == "act":
             result = await sh.act(instruction, page=page)
@@ -427,7 +435,7 @@ async def smart_browser(ctx: ToolContext, action: str, url: str = "",
                     "selector, or configure stagehand.model + the "
                     "'secrets/stagehand-api-key' vault key for a stronger model.")
             return f"Act {'succeeded' if ok else 'FAILED'}: {msg}" \
-                   f"\nURL now: {_page_url(page)}{hint}"
+                   f"\nURL now: {await _page_url(page)}{hint}"
 
         if action == "observe":
             result = await sh.observe(instruction, page=page)
@@ -457,7 +465,7 @@ async def smart_browser(ctx: ToolContext, action: str, url: str = "",
             data = await page.screenshot()
             Path(path).write_bytes(data)
             title = await page.title()
-            return f"Screenshot saved: {path}\nPage: **{title}** | URL: {_page_url(page)}"
+            return f"Screenshot saved: {path}\nPage: **{title}** | URL: {await _page_url(page)}"
 
     except Exception as e:
         return f"Browser error: {e}"
