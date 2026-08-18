@@ -206,9 +206,10 @@ async def test_graph_html_escapes_rel(tmp_path):
         data = await gm.export(agent_id="alice")
         html = _render_graph_html(data["nodes"], data["edges"], "T")
         # The injected closing tag must be escaped in the embedded JSON payload,
-        # leaving only the document's own single real </script>.
+        # leaving only the document's own real </script> tags (D3 loader + app).
         assert "<\\/script>" in html
-        assert html.count("</script>") == 1
+        assert html.count("</script>") == 2
+        assert "onerror=alert(1)>" not in html.split("<script>")[0]
     finally:
         gm.close()
 

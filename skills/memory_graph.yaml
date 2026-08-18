@@ -7,13 +7,14 @@ prompt: |
   The user wants to see the memory graph.
 
   1. Call `memory_graph` — it gathers YOUR memories (entities + relationships
-     this agent stored) from graph memory and writes a self-contained
-     interactive HTML file, returning its path. Only pass view='shared' if the
+     this agent stored) from graph memory and writes an interactive HTML file
+     (D3 force graph — zoom, drag, search, click-to-inspect), returning its path. Only pass view='shared' if the
      user explicitly asked for the shared/global graph across agents.
   2. Send that file to the user in THIS channel with
      `send_discord_file(channel_id=<this channel>, file_path=<the path from step 1>)`,
      plus a short note like "Here's the current memory graph — open it in a
-     browser and click any entity to see its relationships."
+     browser: drag/zoom the map, hover to highlight neighbours, click an entity
+     to see its relationships, or search by name."
 
   The HTML file is the deliverable — don't try to describe the whole graph in
   text. If the tool says the graph is empty or not enabled, relay that message
