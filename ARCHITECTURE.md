@@ -458,8 +458,21 @@ Tool packs that ship with the engine:
 | **Tmux** | list, send, read, new |
 | **Android** | android_device (screenshot, tap, swipe, type, key, launch, open_url, install — emulator or real phone via ADB, see [docs/ANDROID.md](docs/ANDROID.md)) |
 | **Inter-agent** | send_message, ask_agent, send_to_agent |
+| **Design** | render_diagram (Mermaid, offline via vendored mermaid.js), render_svg, render_html, html_to_pdf, create_slides |
+| **Process mapping** | process_model_save, process_model_load, process_model_gaps, process_render, process_publish — see below |
 
 *Tools flagged for HITL in config pause until a human approves them with a Discord reaction.*
+
+### Process Mapping
+
+Business processes and Wardley maps are captured as a **structured model first, diagram second**. The agent fills a JSON model (`kind: process` — actors, steps, decisions, handoffs, systems, metrics, exceptions; or `kind: wardley` — anchors, components with visibility/evolution and a stage rationale, links, inertia, movement) and the engine does the deterministic work:
+
+- `process_model_save` validates (dangling edges, unlabeled decisions, coordinates outside 0..1, dependencies pointing the wrong way …), **patch-merges** into `<project_dir>/processes/<slug>/model.json` so an interview can add a little each turn, and returns the **ranked next questions** — picked from a method question bank (SIPOC, RACI/swimlanes, value stream mapping, BPMN discovery, Lean wastes, 5 Whys, TOC, service blueprint, event storming, Wardley's canvas and evolution cheat sheet — `src/lib/process_questions.py`) according to which model fields are empty, hedged ("usually", "?") or contradictory. That is how the agent "asks the right questions": never a generic checklist, always the gap.
+- `process_model_gaps` re-ranks on demand, optionally through a lens (`sipoc`, `raci`, `vsm`, `bpmn`, `wastes`, `wardley`, `blueprint`, `events`) — the coach mode for a live workshop.
+- `process_render` emits diagram text (`src/lib/process_model.py`) and renders it locally: Mermaid `flowchart` / `swimlane-beta` (lane per actor, with a flowchart-with-subgraphs fallback) / `sequenceDiagram` (handoffs) / `journey` through `render_diagram`, and Wardley maps through a self-contained SVG emitter (`src/lib/wardley_svg.py`, no website or CDN involved) plus an `.owm` text twin. Results go to Discord with `send_discord_file`.
+- `process_publish` promotes a finished process into the **codex** (`<overlay>/codex/processes/<slug>.md` + PNG, registered in `_index.md`) so every agent sees it in its startup `<codex-index>` and can use it as business knowledge. It is a deliberate, user-confirmed step.
+
+Slash commands: `/map_process` (notes, image/whiteboard photo, interview, update, publish), `/wardley_map`, `/process_questions` (`skills/*.yaml`). Images reach the model through `download_file` + the CLI's `Read` (vision); the skills instruct inventory-first extraction and put every unreadable label or unverifiable arrow into `open_questions` rather than guessing.
 
 To wire in your own integration, place a Python file with a `@tool` decorated function in `src/tools/`.
 
@@ -468,7 +481,7 @@ To wire in your own integration, place a Python file with a `@tool` decorated fu
 1. **Create the file** — `src/tools/my_tool.py`, or `<layer2-module>/tools/my_tool.py` when it's a domain tool
 2. **Decorate with `@tool`** — supply a name and description, plus `hitl=True` if the tool should be gated
 3. **Type-hint parameters** — annotations (str, int, bool, Optional, list) are all the schema generator needs
-4. **Accept `ctx: ToolContext`** — your handle to `ctx.vault` (secrets), `ctx.config` (config dict), and `ctx.storage` (SQLite)
+4. **Accept `ctx: ToolContext`** — your handle to `ctx.vault` (secrets), `ctx.memory` (memory backend), `ctx.project_dir`, `ctx.agent_id` / `ctx.channel_id` (see `src/core/base.py`)
 5. **Return a string** — whatever comes back is what the LLM sees as the result
 
 ```python

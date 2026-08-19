@@ -80,6 +80,9 @@ else
     uv sync
 fi
 
+# --- Vendored browser assets (best-effort; offline hosts fall back to CDN) ---
+"$REPO_ROOT/scripts/vendor-mermaid.sh" || true
+
 # --- Layer 2: KBOTS_MODULES modules ---
 if [ -n "${KBOTS_MODULES:-}" ]; then
     IFS=':' read -ra modules_dirs <<< "$KBOTS_MODULES"

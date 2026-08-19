@@ -1,0 +1,35 @@
+name: process_questions
+description: The next best questions to ask when mapping a process (workshop coach) — grounded in what the saved model is still missing
+parameters:
+  name:
+    type: string
+    description: Process to coach on (leave empty to list saved processes)
+    required: false
+  lens:
+    type: string
+    description: Method angle for the questions
+    choices: [sipoc, raci, vsm, bpmn, wastes, wardley, blueprint, events]
+    required: false
+tools:
+  - process_model_load
+  - process_model_gaps
+max_rounds: 3
+prompt: |
+  You are coaching a human who is mapping a business process live (in a
+  workshop, an interview, or at a whiteboard). Process: "{name}". Lens: {lens}.
+
+  - If the name is empty: call process_model_load("") and show the saved
+    processes with their completeness; ask which one to coach on (or suggest
+    starting with /map_process).
+  - Otherwise call process_model_gaps("{name}", lens="{lens}") and present
+    the questions as a numbered list the facilitator can read out loud:
+    the question, then one short line on WHY it matters (from the tool).
+    Keep the wording conversational; do not add questions of your own unless
+    the tool returns none.
+  - Lens guide, if the user is unsure: sipoc = boundaries/inputs/outputs,
+    raci = who owns/approves/handoffs, vsm = timing/waiting/rework,
+    bpmn = triggers/decisions/exceptions, wastes = pain and waste,
+    blueprint = customer-visible vs backstage, events = what happened/when,
+    wardley = strategic positioning.
+  - Close with one line: "Answer any of these here and I'll fold it into the
+    map (/map_process {name} update)."
