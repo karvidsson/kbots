@@ -74,6 +74,10 @@ It's a good fit for operational scripts whose output is already formatted for hu
 
 A skill dropped into `agents/<name>/skills/` belongs to that agent alone. To keep names from colliding, such skills receive an automatic prefix (e.g., `kbots:my_skill`).
 
+## Multi-Step Interviews
+
+A skill can drive a conversation across many turns: the channel session persists, so a prompt that says "ask ONE question, then STOP FOR THE USER" continues naturally when the user answers. `process_map.yaml` / `process_wardley.yaml` use this with `process_model_save` patch-merging each answer into a saved model, and `process_questions.yaml` turns the same gap analysis into a coach for live workshops.
+
 ## Creating Skills via Chat
 
 An agent can also build a skill mid-conversation through its `create_skill` tool:

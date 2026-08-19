@@ -13,7 +13,9 @@ Typical uses:
 - create_slides: markdown outline → PowerPoint deck
 
 Diagram/HTML rendering loads Pico.css / Tailwind / mermaid.js from jsDelivr,
-so the host needs outbound network access.
+so the host needs outbound network access — except Mermaid, which is served
+from a vendored copy (src/lib/vendor/mermaid.min.js, fetched by
+scripts/vendor-mermaid.sh) when present, so render_diagram works offline.
 """
 
 import base64
@@ -38,6 +40,10 @@ logger = logging.getLogger(__name__)
 
 _PW_HINT = "Error: playwright not installed. Run: uv add playwright && playwright install chromium"
 _PPTX_HINT = "python-pptx not installed. Run: uv sync --extra design (then restart the service)"
+
+MERMAID_VENDOR = PROJECT_ROOT / "src" / "lib" / "vendor" / "mermaid.min.js"
+MERMAID_CDN = "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs"
+_mermaid_cache: dict[str, str] = {}
 
 PAGE_SIZES = ["A4", "A3", "A5", "Letter", "Legal", "Tabloid"]
 HTML_STYLES = ["clean", "tailwind", "none"]
@@ -326,6 +332,42 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 
 
+def _vendored_mermaid() -> str | None:
+    """Contents of the vendored mermaid.min.js (IIFE build), cached; None if absent."""
+    if "js" in _mermaid_cache:
+        return _mermaid_cache["js"] or None
+    js = ""
+    try:
+        if MERMAID_VENDOR.is_file():
+            js = MERMAID_VENDOR.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning(f"vendored mermaid unreadable: {e}")
+    _mermaid_cache["js"] = js
+    return js or None
+
+
+def _mermaid_html(diagram: str, theme_vars: dict) -> str:
+    """Render page for a Mermaid diagram — vendored script when available, else CDN ESM."""
+    vendored = _vendored_mermaid()
+    loader = f"<script>{vendored.replace('</script', '<\\/script')}</script>" if vendored else ""
+    import_line = "" if vendored else f'import mermaid from "{MERMAID_CDN}";'
+    return f"""<!doctype html><html><head><meta charset="utf-8">{loader}</head>
+<body style="background:#FFFFFF;margin:0;padding:16px">
+<div id="container"></div>
+<script type="module">
+  {import_line}
+  mermaid.initialize({{startOnLoad: false, theme: "base",
+                       themeVariables: {json.dumps(theme_vars)}}});
+  try {{
+    const {{svg}} = await mermaid.render("diagram", {json.dumps(diagram)});
+    document.getElementById("container").innerHTML = svg;
+    window.__result = {{ok: true}};
+  }} catch (e) {{
+    window.__result = {{ok: false, error: String(e.message || e)}};
+  }}
+</script></body></html>"""
+
+
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
@@ -337,7 +379,7 @@ async def render_diagram(ctx: ToolContext, diagram: str, output_file: str = "",
     diagrams, class/ER diagrams, gantt charts, pie charts, mind maps.
 
     The diagram is styled with the deployment's brand colors automatically.
-    Requires outbound network (mermaid.js from CDN).
+    Uses the vendored mermaid.js when present (offline), else the CDN.
     """
     if format not in ("png", "svg"):
         return f"Invalid format '{format}'. Valid: png, svg"
@@ -350,23 +392,10 @@ async def render_diagram(ctx: ToolContext, diagram: str, output_file: str = "",
         "primaryColor": c["primary"], "primaryTextColor": "#FFFFFF",
         "secondaryColor": c["accent"], "tertiaryColor": c["surface"],
         "lineColor": c["secondary"], "textColor": c["text"],
+        "edgeLabelBackground": c["surface"],
         "fontFamily": brand["font_family"],
     }
-    html = f"""<!doctype html><html><head><meta charset="utf-8"></head>
-<body style="background:#FFFFFF;margin:0;padding:16px">
-<div id="container"></div>
-<script type="module">
-  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
-  mermaid.initialize({{startOnLoad: false, theme: "base",
-                       themeVariables: {json.dumps(theme_vars)}}});
-  try {{
-    const {{svg}} = await mermaid.render("diagram", {json.dumps(diagram)});
-    document.getElementById("container").innerHTML = svg;
-    window.__result = {{ok: true}};
-  }} catch (e) {{
-    window.__result = {{ok: false, error: String(e.message || e)}};
-  }}
-</script></body></html>"""
+    html = _mermaid_html(diagram, theme_vars)
 
     out = _output_path(ctx, output_file, f"diagram-{_timestamp()}.{format}")
     if isinstance(out, str):
