@@ -1,4 +1,4 @@
-name: wardley_map
+name: process_wardley
 description: Build a Wardley map from notes, a photo or a guided conversation (rendered offline), then publish to the codex
 parameters:
   name:

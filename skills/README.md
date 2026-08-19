@@ -76,7 +76,7 @@ A skill dropped into `agents/<name>/skills/` belongs to that agent alone. To kee
 
 ## Multi-Step Interviews
 
-A skill can drive a conversation across many turns: the channel session persists, so a prompt that says "ask ONE question, then STOP FOR THE USER" continues naturally when the user answers. `map_process.yaml` / `wardley_map.yaml` use this with `process_model_save` patch-merging each answer into a saved model, and `process_questions.yaml` turns the same gap analysis into a coach for live workshops.
+A skill can drive a conversation across many turns: the channel session persists, so a prompt that says "ask ONE question, then STOP FOR THE USER" continues naturally when the user answers. `process_map.yaml` / `process_wardley.yaml` use this with `process_model_save` patch-merging each answer into a saved model, and `process_questions.yaml` turns the same gap analysis into a coach for live workshops.
 
 ## Creating Skills via Chat
 

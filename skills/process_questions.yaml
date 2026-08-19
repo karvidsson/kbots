@@ -20,7 +20,7 @@ prompt: |
 
   - If the name is empty: call process_model_load("") and show the saved
     processes with their completeness; ask which one to coach on (or suggest
-    starting with /map_process).
+    starting with /process_map).
   - Otherwise call process_model_gaps("{name}", lens="{lens}") and present
     the questions as a numbered list the facilitator can read out loud:
     the question, then one short line on WHY it matters (from the tool).
@@ -32,4 +32,4 @@ prompt: |
     blueprint = customer-visible vs backstage, events = what happened/when,
     wardley = strategic positioning.
   - Close with one line: "Answer any of these here and I'll fold it into the
-    map (/map_process {name} update)."
+    map (/process_map {name} update)."

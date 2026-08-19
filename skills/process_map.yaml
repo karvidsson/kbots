@@ -1,4 +1,4 @@
-name: map_process
+name: process_map
 description: Map a business process from notes, a photo or an interview — flowchart / swimlane / sequence, then publish to the codex
 parameters:
   name:

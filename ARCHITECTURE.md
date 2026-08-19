@@ -472,7 +472,7 @@ Business processes and Wardley maps are captured as a **structured model first, 
 - `process_render` emits diagram text (`src/lib/process_model.py`) and renders it locally: Mermaid `flowchart` / `swimlane-beta` (lane per actor, with a flowchart-with-subgraphs fallback) / `sequenceDiagram` (handoffs) / `journey` through `render_diagram`, and Wardley maps through a self-contained SVG emitter (`src/lib/wardley_svg.py`, no website or CDN involved) plus an `.owm` text twin. Results go to Discord with `send_discord_file`.
 - `process_publish` promotes a finished process into the **codex** (`<overlay>/codex/processes/<slug>.md` + PNG, registered in `_index.md`) so every agent sees it in its startup `<codex-index>` and can use it as business knowledge. It is a deliberate, user-confirmed step.
 
-Slash commands: `/map_process` (notes, image/whiteboard photo, interview, update, publish), `/wardley_map`, `/process_questions` (`skills/*.yaml`). Images reach the model through `download_file` + the CLI's `Read` (vision); the skills instruct inventory-first extraction and put every unreadable label or unverifiable arrow into `open_questions` rather than guessing.
+Slash commands, all under the `/process-` prefix: `/process-map` (notes, image/whiteboard photo, interview, update, publish), `/process-wardley`, `/process-questions` (`skills/process_*.yaml`). Images reach the model through `download_file` + the CLI's `Read` (vision); the skills instruct inventory-first extraction and put every unreadable label or unverifiable arrow into `open_questions` rather than guessing.
 
 To wire in your own integration, place a Python file with a `@tool` decorated function in `src/tools/`.
 
