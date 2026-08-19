@@ -330,6 +330,23 @@ def scaffold_agent(
     content = claude_md or default_claude_md(display_name, description, agent_dir, personality)
     written.extend(write_identity(agent_dir, content))
 
+    # --- per-agent codex ---
+    # Role-specific knowledge base; its _index.md is injected at session start
+    # (src/core/startup_context.py) alongside the shared overlay codex.
+    codex_index = agent_dir / "codex" / "_index.md"
+    if not codex_index.exists():
+        codex_index.parent.mkdir(parents=True, exist_ok=True)
+        codex_index.write_text(
+            f"# {display_name} — Codex Index\n\n"
+            "Role-specific knowledge for this agent. Catalogue documents here as you "
+            "add them — this index is injected at session start so the agent knows "
+            "what exists. Shared business knowledge belongs in the deployment codex "
+            "instead (overlay codex/).\n\n"
+            "## Documents\n\n"
+            "*(none yet)*\n"
+        )
+        written.append(codex_index)
+
     # --- .mcp.json ---
     mcp_json_path = agent_dir / ".mcp.json"
     if not mcp_json_path.exists():

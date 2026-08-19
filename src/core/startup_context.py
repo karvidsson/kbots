@@ -19,16 +19,13 @@ TEAM_FILE = resolve_config_file("team.json")
 
 
 def _resolve_codex_index() -> Path:
-    """Find codex index: overlay agents/<agent>/codex/ → core codex/."""
+    """Find the shared codex index: overlay codex/ → core codex/."""
     overlay = os.environ.get("KBOTS_OVERLAY")
     if overlay:
         p = Path(overlay) / "codex" / "_index.md"
         if p.exists():
             return p
     return PROJECT_ROOT / "codex" / "_index.md"
-
-
-CODEX_INDEX = _resolve_codex_index()
 
 
 def _build_team_summary() -> str | None:
@@ -78,17 +75,37 @@ def _build_team_summary() -> str | None:
     return "\n".join(lines)
 
 
-def _build_codex_index() -> str | None:
-    """Build a codex awareness block from the index file."""
-    if not CODEX_INDEX.exists():
-        return None
+def _build_codex_index(project_dir: str | None = None) -> str | None:
+    """Build codex awareness blocks: shared codex index plus the agent's own.
 
-    try:
-        content = CODEX_INDEX.read_text()
-    except OSError:
-        return None
+    The shared index (overlay codex/ → core codex/) applies to every agent.
+    An agent may additionally keep a private codex at <project_dir>/codex/;
+    when its _index.md exists it is injected as a separate block so the agent
+    knows its role-specific knowledge base on top of the shared one.
+    """
+    blocks = []
 
-    return f"<codex-index>\n{content.strip()}\n</codex-index>"
+    shared = _resolve_codex_index()
+    if shared.exists():
+        try:
+            blocks.append(f"<codex-index>\n{shared.read_text().strip()}\n</codex-index>")
+        except OSError:
+            pass
+
+    if project_dir:
+        own = Path(project_dir) / "codex" / "_index.md"
+        if own.exists():
+            try:
+                blocks.append(
+                    "<agent-codex-index>\n"
+                    f"Your own codex (role-specific knowledge) lives in {own.parent}/ — "
+                    "read files from it as needed.\n"
+                    f"{own.read_text().strip()}\n</agent-codex-index>"
+                )
+            except OSError:
+                pass
+
+    return "\n\n".join(blocks) if blocks else None
 
 
 def _build_lessons(project_dir: str | None) -> str | None:
@@ -177,8 +194,8 @@ async def build_startup_context(agent_id: str, memory=None, project_dir=None) ->
         except Exception as e:
             logger.debug(f"Pinned memory fetch failed: {e}")
 
-    # Codex index (awareness of available business knowledge)
-    codex = _build_codex_index()
+    # Codex index (awareness of available business knowledge, shared + own)
+    codex = _build_codex_index(project_dir)
     if codex:
         blocks.append(codex)
 
