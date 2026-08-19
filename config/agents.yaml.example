@@ -31,6 +31,9 @@ agents:
     # compression:             # per-agent override (inherits from config.yaml defaults)
     #   enabled: true
     #   level: lite
+    # chrome_instance:         # dedicated debug Chrome for this agent (default: shared
+    #   port: 9223             # instance on 9222). Own cookies, own turn-taking lane.
+    #   # dir: ~/.kbots-chrome-<agent>   # data dir (this is the default)
     routing:
       discord:
         account: main         # bot account (namespace — each bot routes independently)
