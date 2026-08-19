@@ -224,17 +224,23 @@ class GraphMemory:
         return _rows(result)
 
     async def export(self, *, agent_id: str | None = None, limit: int = 400,
-                     own_only: bool = False) -> dict:
+                     own_only: bool = False, all_scopes: bool = False) -> dict:
         """Edges + their endpoints, for visualization.
 
         Default: everything visible to the agent (own + global + group edges).
         own_only: just this agent's memories — edges it created or scoped to it.
+        all_scopes: every edge regardless of scope — the fleet-wide admin view.
+            Callers must gate this themselves (memory_graph restricts it to
+            coordinator/privileged agents); the store trusts its caller.
         Returns {"nodes": [{name, type, degree}], "edges": [{src, rel, dst, ...}]}.
         """
         limit = max(1, min(int(limit), 2000))
         conn = await self._ensure_open()
         agent_scope = f"agent:{agent_id}" if agent_id else "agent:"
-        if own_only:
+        if all_scopes:
+            where = "r.rel IS NOT NULL"
+            params = {}
+        elif own_only:
             where = "(r.created_by = $agent OR r.scope = $agent_scope)"
             params = {"agent": agent_id or "", "agent_scope": agent_scope}
         else:
@@ -353,9 +359,9 @@ class GraphClient:
         return await self._call("entities", agent_id=agent_id, limit=limit)
 
     async def export(self, *, agent_id: str | None = None, limit: int = 400,
-                     own_only: bool = False) -> dict:
+                     own_only: bool = False, all_scopes: bool = False) -> dict:
         return await self._call("export", agent_id=agent_id, limit=limit,
-                                own_only=own_only)
+                                own_only=own_only, all_scopes=all_scopes)
 
     async def find(self, *, rel: str | None = None, entity: str | None = None,
                    agent_id: str | None = None, limit: int = 50) -> list[dict]:

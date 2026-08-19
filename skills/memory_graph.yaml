@@ -8,8 +8,11 @@ prompt: |
 
   1. Call `memory_graph` — it gathers YOUR memories (entities + relationships
      this agent stored) from graph memory and writes an interactive HTML file
-     (D3 force graph — zoom, drag, search, click-to-inspect), returning its path. Only pass view='shared' if the
-     user explicitly asked for the shared/global graph across agents.
+     (D3 force graph — zoom, drag, search, click-to-inspect), returning its path.
+     Pass view='shared' only if the user asked for the shared/global graph, and
+     view='all' only if they asked for the whole fleet's graph (every agent's
+     edges, colour-coded by owner — works only for coordinator/privileged
+     agents; if the tool refuses, relay its message).
   2. Send that file to the user in THIS channel with
      `send_discord_file(channel_id=<this channel>, file_path=<the path from step 1>)`,
      plus a short note like "Here's the current memory graph — open it in a

@@ -123,6 +123,42 @@ async def test_export_for_visualization(tmp_path):
 
 
 @needs_ladybug
+async def test_export_all_scopes(tmp_path):
+    gm = _gm(tmp_path)
+    try:
+        await gm.link("A", "knows", "B", scope="agent", created_by="alice")
+        await gm.link("C", "runs", "D", scope="agent", created_by="bob")
+        await gm.link("A", "uses", "D", scope="global", created_by="alice")
+        # the fleet view sees every edge, private ones included
+        data = await gm.export(all_scopes=True)
+        assert len(data["edges"]) == 3
+        assert {n["name"] for n in data["nodes"]} == {"A", "B", "C", "D"}
+        # scope filtering still applies without the flag
+        assert len((await gm.export(agent_id="carol"))["edges"]) == 1
+    finally:
+        gm.close()
+
+
+@needs_ladybug
+async def test_memory_graph_all_view_is_gated(tmp_path, monkeypatch):
+    """view='all' reveals private edges — unprivileged agents must be refused."""
+    from src.tools import graph as graph_tools
+    gm = _gm(tmp_path)
+    monkeypatch.setattr(graph_store, "_graph", gm)
+    try:
+        await gm.link("Alice", "prefers", "Tea", scope="agent", created_by="alice")
+        monkeypatch.setattr(graph_tools, "_may_view_all", lambda agent_id: False)
+        out = await memory_graph(_ctx("bob"), view="all")
+        assert "privileged" in out and "Tea" not in out
+        monkeypatch.setattr(graph_tools, "_may_view_all", lambda agent_id: True)
+        ctx = ToolContext(agent_id="bob", project_dir=str(tmp_path))
+        out = await memory_graph(ctx, title="Fleet", view="all")
+        assert "memory-graph-" in out and "1 relationships" in out
+    finally:
+        gm.close()
+
+
+@needs_ladybug
 async def test_export_own_only(tmp_path):
     gm = _gm(tmp_path)
     try:

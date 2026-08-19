@@ -123,19 +123,21 @@ class Reflector:
                     f"graph extraction {'ON' if self.extract_enabled else 'off'})")
         while True:
             try:
-                if self.enabled or self.extract_enabled:
-                    now = time.time()
-                    for agent_id in list(getattr(self.mgr, "agent_configs", {})):
-                        if not self._due(agent_id, now):
-                            continue
-                        if self.enabled:
-                            await self._reflect(agent_id)
-                        if self.extract_enabled:
-                            try:
-                                await self._extract_graph(agent_id)
-                            except Exception as e:
-                                logger.error(f"Graph extraction failed for {agent_id}: {e}")
+                now = time.time()
+                for agent_id in list(getattr(self.mgr, "agent_configs", {})):
+                    if self.enabled and self._due(agent_id, now):
+                        await self._reflect(agent_id)
                         runtime_state.set_flag(f"reflector_last_{agent_id}", time.time())
+                    # Extraction runs every tick, not on the reflection interval:
+                    # _extract_graph early-returns on an empty batch (one cheap
+                    # cursor query), so a quiet agent costs nothing, while a
+                    # busy agent's backlog drains at extract_batch/tick instead
+                    # of extract_batch/24h.
+                    if self.extract_enabled:
+                        try:
+                            await self._extract_graph(agent_id)
+                        except Exception as e:
+                            logger.error(f"Graph extraction failed for {agent_id}: {e}")
             except Exception as e:
                 logger.error(f"Reflector tick failed: {e}", exc_info=True)
             await asyncio.sleep(self.tick)
