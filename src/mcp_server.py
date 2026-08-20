@@ -318,15 +318,18 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     # with "Memory backend not configured for this agent" when config.yaml
     # forgets to set defaults.memory.backend explicitly.
     memory = None
-    defaults = config.get("defaults", {})
-    mem_cfg = defaults.get("memory", {})
+    # Same resolution as main.py, from the same helper. This process and the
+    # main one MUST agree on the file, or an agent's tool calls read a
+    # different store from the one its own turns were recorded against.
+    from src.core.base import memory_config as _memory_config
+    mem_cfg = _memory_config(config)
     backend_name = mem_cfg.get("backend", "sqlite")
     if backend_name == "sqlite":
         import atexit as _atexit
 
         from src.memory.sqlite import SQLiteMemory
         memory = SQLiteMemory(config=mem_cfg)
-        logger.info("Memory backend: SQLite (inline)")
+        logger.info(f"Memory backend: SQLite (inline) — {mem_cfg['path']}")
 
         def _close_memory_db():
             try:
