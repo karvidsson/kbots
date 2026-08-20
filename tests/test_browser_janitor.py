@@ -71,18 +71,43 @@ async def test_live_reservation_blocks_quit(overlay, quiet_chrome):
         tool_reservation.release(_RESOURCE, "atlas")
 
 
-async def test_stale_reservation_counts_as_activity(overlay, quiet_chrome):
-    """An expired reservation still marks WHEN the browser was last driven."""
+async def test_stale_reservation_extends_a_window_but_cannot_start_one(overlay, quiet_chrome):
+    """An expired reservation marks when the TOOL last ran, not this browser.
+
+    This test used to assert the opposite, and that assertion was the bug: a
+    reservation record outlives the browser it describes, so on a fresh sighting
+    it dated a just-launched Chrome to the last tool run — days earlier — and
+    the janitor closed it on the very next tick. Anything driving the port over
+    raw CDP writes no reservation at all, so the verdict never changed.
+
+    The corrected contract: the window starts when the browser is first seen up,
+    and a reservation NEWER than that start still pushes it forward.
+    """
     j = BrowserJanitor({"idle_quit_hours": 3})
     now = time.time()
     ok, _ = tool_reservation.acquire(_RESOURCE, "a", now=now - 2 * 3600)
     assert ok                                          # 2h old → expired (TTL 10m)
     assert tool_reservation.peek(_RESOURCE) is None
-    assert await j._tick(now) is False                 # 2h idle < 3h window
+
+    assert await j._tick(now) is False                 # first sighting: fresh window
     assert quiet_chrome == []
-    # ...but 4h later it quits
-    assert await j._tick(now + 2 * 3600) is True
+    # The 2h-old record must NOT have back-dated the window...
+    assert await j._tick(now + 2 * 3600) is False
+    assert quiet_chrome == []
+    # ...but the browser is still bounded: 3h after it was first seen, it goes.
+    assert await j._tick(now + 3 * 3600 + 1) is True
     assert quiet_chrome == ["cdp"]
+
+
+async def test_a_newer_reservation_pushes_the_window_forward(overlay, quiet_chrome):
+    j = BrowserJanitor({"idle_quit_hours": 3})
+    now = time.time()
+    assert await j._tick(now) is False                 # window starts here
+    ok, _ = tool_reservation.acquire(_RESOURCE, "a", now=now + 2 * 3600)
+    assert ok                                          # expires on its own (TTL 10m)
+    # 3h after the window opened, but only 1h after the drive: still alive.
+    assert await j._tick(now + 3 * 3600 + 1) is False
+    assert quiet_chrome == []
 
 
 async def test_port_down_resets_window(overlay, monkeypatch):
