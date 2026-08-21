@@ -34,6 +34,15 @@ Treat the layout above as a suggestion — arrange things however suits your bus
 
 3. **Whether to read the codex or hit an API is decided per query.** Because `_index.md` spells out which data comes from APIs and which from codex files, an agent won't fall back on stale codex content when a live source exists.
 
+## Shared vs Per-Agent Codex
+
+There are two codex levels, both injected at session start (`src/core/startup_context.py`):
+
+- **Shared codex** — this directory (or `$KBOTS_OVERLAY/codex/` in a deployment). Knowledge every agent needs: company profile, brand voice, compliance. Its `_index.md` is injected as `<codex-index>`.
+- **Per-agent codex** — `agents/<agent>/codex/` inside the agent's own project directory. Role-specific knowledge only that agent cares about: an ops agent's runbooks, a marketing agent's campaign briefs. Its `_index.md` is injected as `<agent-codex-index>`. New agents get a starter one scaffolded automatically.
+
+Put knowledge at the narrowest level that needs it: shared if two or more agents use it, per-agent otherwise.
+
 ## Adding Content
 
 ### New document

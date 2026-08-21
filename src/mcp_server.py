@@ -21,6 +21,7 @@ import time
 import urllib.parse
 import uuid
 from pathlib import Path
+from typing import get_type_hints
 
 import aiohttp
 from mcp.server.fastmcp import FastMCP
@@ -317,15 +318,18 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     # with "Memory backend not configured for this agent" when config.yaml
     # forgets to set defaults.memory.backend explicitly.
     memory = None
-    defaults = config.get("defaults", {})
-    mem_cfg = defaults.get("memory", {})
+    # Same resolution as main.py, from the same helper. This process and the
+    # main one MUST agree on the file, or an agent's tool calls read a
+    # different store from the one its own turns were recorded against.
+    from src.core.base import memory_config as _memory_config
+    mem_cfg = _memory_config(config)
     backend_name = mem_cfg.get("backend", "sqlite")
     if backend_name == "sqlite":
         import atexit as _atexit
 
         from src.memory.sqlite import SQLiteMemory
         memory = SQLiteMemory(config=mem_cfg)
-        logger.info("Memory backend: SQLite (inline)")
+        logger.info(f"Memory backend: SQLite (inline) — {mem_cfg['path']}")
 
         def _close_memory_db():
             try:
@@ -397,13 +401,25 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
 
     # Register each kbots tool as an MCP tool with middleware wrapping
     skipped = []
+    failed = []
     for tool_name, tool_def in kbots_tools.items():
         if restrict and (tool_name in dangerous_names
                          or tool_name.startswith(dangerous_prefixes)):
             skipped.append(tool_name)
             continue
-        _register_tool(mcp, tool_def, vault, hitl, rate_limiter, audit,
-                       memory=memory, tool_log_db=tool_log_db, alerter=alerter)
+        # One malformed tool must not cost the agent all the others. Registration
+        # touches user-authored signatures, so it is exactly where a bad edit
+        # shows up — degrade to "that tool is missing", never "no tools at all".
+        try:
+            _register_tool(mcp, tool_def, vault, hitl, rate_limiter, audit,
+                           memory=memory, tool_log_db=tool_log_db, alerter=alerter)
+        except Exception as e:
+            failed.append(tool_name)
+            logger.error(f"Tool '{tool_name}' failed to register and is UNAVAILABLE: "
+                         f"{type(e).__name__}: {e}")
+    if failed:
+        logger.error(f"{len(failed)} tool(s) unavailable this session: "
+                     f"{', '.join(sorted(failed))}")
     if skipped:
         logger.warning(f"KBOTS_MCP_RESTRICT: withheld {len(skipped)} dangerous tools "
                        f"from the MCP surface: {', '.join(sorted(skipped))}")
@@ -578,14 +594,36 @@ def _register_tool(
     # Copy the original function's signature minus 'ctx' onto the handler.
     # FastMCP.from_function will introspect this to build the JSON schema.
     import inspect
+
+    # Resolve the hints against the TOOL's module, not ours. A tool module using
+    # `from __future__ import annotations` has string annotations, and pydantic
+    # would later evaluate them in the handler's globals — this module — where a
+    # name like `LENS_CHOICES` does not exist. That raises PydanticUserError at
+    # schema build and, before the guard in build_server, killed the whole
+    # server over one tool (seen 2026-08-19 with process_model_gaps).
+    try:
+        resolved = get_type_hints(tool_def.func, include_extras=True)
+    except Exception as e:  # unresolvable annotation — fall back to the raw strings
+        logger.warning(f"{tool_def.name}: could not resolve type hints ({e}); "
+                       f"using raw annotations")
+        resolved = getattr(tool_def.func, "__annotations__", {})
+
+    # Copy the original function's signature minus 'ctx' onto the handler, with
+    # the RESOLVED annotations substituted in. FastMCP builds its schema from
+    # __signature__, so resolving only __annotations__ would leave the strings
+    # in the path that actually matters.
     orig_sig = inspect.signature(tool_def.func)
-    new_params = [p for name, p in orig_sig.parameters.items() if name != "ctx"]
-    handler.__signature__ = orig_sig.replace(parameters=new_params)
+    new_params = [
+        p.replace(annotation=resolved.get(name, p.annotation))
+        for name, p in orig_sig.parameters.items() if name != "ctx"
+    ]
+    handler.__signature__ = orig_sig.replace(
+        parameters=new_params,
+        return_annotation=resolved.get("return", orig_sig.return_annotation))
     handler.__name__ = tool_def.name
     handler.__doc__ = desc
-    # Copy type hints minus 'ctx'
-    orig_hints = getattr(tool_def.func, "__annotations__", {})
-    handler.__annotations__ = {k: v for k, v in orig_hints.items() if k != "ctx"}
+    handler.__annotations__ = {k: v for k, v in resolved.items()
+                               if k not in ("ctx", "return")}
 
     mcp_tool = MCPTool.from_function(
         handler,

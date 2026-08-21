@@ -33,7 +33,12 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from src.core.agent_scaffold import scaffold_agent
+    from src.core.agent_scaffold import (
+        AGENT_NAME_RULE,
+        agent_name_error,
+        scaffold_agent,
+        suggest_agent_name,
+    )
     from src.core.base import resolve_vault_key_file
     from src.vault.fernet import FernetVault
 except ImportError:
@@ -52,13 +57,22 @@ CYAN = "\033[36m"
 RESET = "\033[0m"
 
 
-def banner():
-    print(f"""
-{BOLD}{CYAN}╔══════════════════════════════════════╗
-║           kbots Setup Wizard         ║
-║    The Agent Routing System          ║
-╚══════════════════════════════════════╝{RESET}
-""")
+TAGLINE = "one process · LLM-agnostic · trains itself"
+
+
+def banner(title: str = "kbots Setup Wizard"):
+    """Boxed banner, built rather than hand-drawn.
+
+    The two hand-drawn boxes had drifted: settings.py rendered 38 characters
+    inside a 40-character border, so it printed crooked. Centring in code means
+    a retitle cannot misalign it again.
+    """
+    lines = [title, TAGLINE]
+    inner = max(len(line) for line in lines) + 8
+    top = "╔" + "═" * inner + "╗"
+    bottom = "╚" + "═" * inner + "╝"
+    body = "\n".join(f"║{line.center(inner)}║" for line in lines)
+    print(f"\n{BOLD}{CYAN}{top}\n{body}\n{bottom}{RESET}\n")
 
 
 def header(text: str):
@@ -160,6 +174,29 @@ def ask_id(prompt: str, required: bool = False) -> str:
             "Right-click the server/user/channel → Copy ID.")
         if not required and not ask_yn("Try again?", default=True):
             return ""
+
+
+def ask_agent_name(prompt: str, default: str = "") -> str:
+    """Ask for an agent's internal name, validating it here and now.
+
+    This used to be a bare ask(). The name was not checked until scaffold_agent
+    ran, many steps later, and a capitalised name then aborted the whole wizard
+    and rolled back — so a single typo cost every answer given since. Validating
+    at the point of entry is the difference between a two-second correction and
+    starting over.
+    """
+    while True:
+        raw = ask(prompt, default)
+        problem = agent_name_error(raw)
+        if not problem:
+            return raw
+        err(problem)
+        suggestion = suggest_agent_name(raw)
+        if suggestion:
+            info(f"Suggested: {suggestion}")
+            if ask_yn(f"Use '{suggestion}'?", default=True):
+                return suggestion
+        info(f"Internal name: {AGENT_NAME_RULE}.")
 
 
 def ask_ids(label: str) -> list[str]:
@@ -827,8 +864,10 @@ def step_agent(state: dict):
     info("Configure your primary AI agent.")
     print()
 
-    agent_name = ask("Agent internal name (lowercase, no spaces)", "main")
-    display_name = ask("Display name (shown in Discord)", agent_name.upper())
+    agent_name = ask_agent_name(
+        "Agent internal name (used for its folder and config key)", "main")
+    display_name = ask("Display name (shown in Discord — capitals fine here)",
+                       agent_name.upper())
     description = ask("One-line description", "Primary agent")
     model = ask_choice("LLM model", ["sonnet", "opus"], default="sonnet")
 
@@ -1258,8 +1297,10 @@ def step_ops_instance(state: dict):
     overlay: Path = state["overlay"]
     vault: FernetVault = state["vault"]
 
-    agent_name = ask("Ops agent internal name", "engineer")
-    display_name = ask("Display name", agent_name.capitalize() + " Bot")
+    agent_name = ask_agent_name(
+        "Ops agent internal name (used for its folder and config key)", "engineer")
+    display_name = ask("Display name (shown in Discord — capitals fine here)",
+                       agent_name.capitalize() + " Bot")
     description = ask("Description", "Privileged ops agent — unsandboxed, owner-only")
     model = ask_choice("Model", ["sonnet", "opus"], default="opus")
 

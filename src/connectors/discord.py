@@ -33,6 +33,22 @@ def _normalize_bot_content(text: str) -> str:
     return re.sub(r"\s+", " ", t).strip().lower()
 
 
+# Gateway intents requested when an account does not name its own. Reactions
+# must be listed for BOTH scopes: Discord gates guild and DM reaction events on
+# separate bits, and agent home channels are DMs. Requesting only
+# guild_reactions means 👍/👎, ✅/❌ and the schedule-cancel ❌ are never
+# delivered where the owner actually presses them — silently, since an intent
+# you did not ask for produces no error, just no events.
+DEFAULT_INTENTS = [
+    "guilds",
+    "guild_messages",
+    "dm_messages",
+    "message_content",
+    "guild_reactions",
+    "dm_reactions",
+]
+
+
 class DiscordConnector(Connector):
     """Multi-bot Discord connector with slash command support.
 
@@ -91,9 +107,7 @@ class DiscordConnector(Connector):
                 logger.error(f"No token for Discord account '{account_name}' (key: {token_key})")
                 continue
 
-            intents_list = account_cfg.get("intents", [
-                "guilds", "guild_messages", "dm_messages", "message_content", "guild_reactions",
-            ])
+            intents_list = account_cfg.get("intents", DEFAULT_INTENTS)
             max_messages = account_cfg.get("max_messages", 1000)
 
             bot = DiscordBot(
@@ -527,7 +541,7 @@ class DiscordBot:
 
         # Build intents
         intents = discord.Intents.none()
-        for intent_name in (intents_list or ["guilds", "guild_messages", "dm_messages", "message_content"]):
+        for intent_name in (intents_list or DEFAULT_INTENTS):
             setattr(intents, intent_name, True)
 
         self.client = discord.Client(

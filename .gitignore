@@ -48,3 +48,7 @@ agents/rescue/*
 
 # macOS Finder metadata
 .DS_Store
+
+# Vendored browser assets — fetched by scripts/vendor-mermaid.sh
+src/lib/vendor/mermaid.min.js
+src/lib/vendor/.mermaid-version

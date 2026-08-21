@@ -17,18 +17,67 @@ logger = logging.getLogger(__name__)
 
 TEAM_FILE = resolve_config_file("team.json")
 
+# Words allowed above the question when an agent needs a decision. A number is
+# followed; "be concise" is interpreted.
+DECISION_WORD_BUDGET = 100
+
+_REPLY_CONTRACT = f"""<reply-contract>
+How to end a turn. This overrides any habit of reporting your work.
+
+Pick exactly one of three shapes.
+
+1. NOTHING NEEDED — nothing failed and no judgement of the owner's is
+   required. Reply with exactly NO_REPLY and nothing else. This is the
+   default for routine completions. A finished task is not news.
+
+2. DONE — you finished something the owner asked for and it needs no
+   decision. Two or three lines: what changed, and the one fact that proves
+   it (a count, an id, a path, a URL). No method, no narration of the route
+   you took, no list of what you checked.
+
+3. DECISION — you need the owner's judgement or taste. Use this shape, in
+   this order, at the TOP of the message:
+
+       DECISION: <one line: what is being chosen between>
+       OPTIONS:  A <one line>  /  B <one line>
+       I'D PICK: <one line, and why>
+       IF NO REPLY: <what you will do by default>
+
+   Everything above the question is at most {DECISION_WORD_BUDGET} words.
+   Evidence, reasoning and alternatives go BELOW that block, or in a file you
+   name so they can be opened on demand. Never make the owner read the
+   evidence to find the question.
+
+Rules that apply to all three:
+- Ask for one decision per message. Two questions get one answer.
+- Never ask for a decision you can make and reverse yourself. Make it, say
+  which default you took in one line, and move on.
+- Being thorough is about the work, not the message. Do the full
+  investigation, then report the part that changes what the owner does.
+- If you catch yourself explaining why something was hard, delete it.
+</reply-contract>"""
+
+
+def _build_reply_contract() -> str:
+    """The output contract every agent gets, in every session.
+
+    Concision guidance already existed as one line inside the codex index and
+    was reliably ignored: it competed with the roster, the version banner and
+    the index itself, and it was a matter of style rather than structure.
+    This is a separate block with a shape and a number, because those get
+    followed where adjectives do not.
+    """
+    return _REPLY_CONTRACT
+
 
 def _resolve_codex_index() -> Path:
-    """Find codex index: overlay agents/<agent>/codex/ → core codex/."""
+    """Find the shared codex index: overlay codex/ → core codex/."""
     overlay = os.environ.get("KBOTS_OVERLAY")
     if overlay:
         p = Path(overlay) / "codex" / "_index.md"
         if p.exists():
             return p
     return PROJECT_ROOT / "codex" / "_index.md"
-
-
-CODEX_INDEX = _resolve_codex_index()
 
 
 def _build_team_summary() -> str | None:
@@ -78,17 +127,37 @@ def _build_team_summary() -> str | None:
     return "\n".join(lines)
 
 
-def _build_codex_index() -> str | None:
-    """Build a codex awareness block from the index file."""
-    if not CODEX_INDEX.exists():
-        return None
+def _build_codex_index(project_dir: str | None = None) -> str | None:
+    """Build codex awareness blocks: shared codex index plus the agent's own.
 
-    try:
-        content = CODEX_INDEX.read_text()
-    except OSError:
-        return None
+    The shared index (overlay codex/ → core codex/) applies to every agent.
+    An agent may additionally keep a private codex at <project_dir>/codex/;
+    when its _index.md exists it is injected as a separate block so the agent
+    knows its role-specific knowledge base on top of the shared one.
+    """
+    blocks = []
 
-    return f"<codex-index>\n{content.strip()}\n</codex-index>"
+    shared = _resolve_codex_index()
+    if shared.exists():
+        try:
+            blocks.append(f"<codex-index>\n{shared.read_text().strip()}\n</codex-index>")
+        except OSError:
+            pass
+
+    if project_dir:
+        own = Path(project_dir) / "codex" / "_index.md"
+        if own.exists():
+            try:
+                blocks.append(
+                    "<agent-codex-index>\n"
+                    f"Your own codex (role-specific knowledge) lives in {own.parent}/ — "
+                    "read files from it as needed.\n"
+                    f"{own.read_text().strip()}\n</agent-codex-index>"
+                )
+            except OSError:
+                pass
+
+    return "\n\n".join(blocks) if blocks else None
 
 
 def _build_lessons(project_dir: str | None) -> str | None:
@@ -177,12 +246,14 @@ async def build_startup_context(agent_id: str, memory=None, project_dir=None) ->
         except Exception as e:
             logger.debug(f"Pinned memory fetch failed: {e}")
 
-    # Codex index (awareness of available business knowledge)
-    codex = _build_codex_index()
+    # Codex index (awareness of available business knowledge, shared + own)
+    codex = _build_codex_index(project_dir)
     if codex:
         blocks.append(codex)
 
-    if not blocks:
-        return None
+    # Reply contract LAST, so it is the final thing read before the owner's
+    # message. It is unconditional: an agent with no roster, no codex and no
+    # memory still has to answer in the agreed shape.
+    blocks.append(_build_reply_contract())
 
     return "\n\n".join(blocks)

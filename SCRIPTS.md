@@ -237,6 +237,15 @@ Links the generated units — timers plus the service — into `/etc/systemd/sys
 sudo bash scripts/install-systemd.sh <overlay-dir> [--enable-service]
 ```
 
+### `scripts/vendor-mermaid.sh` — Vendor mermaid.js for Offline Diagrams
+
+Fetches a pinned `mermaid.min.js` (`MERMAID_VERSION`, ≥ 11.16 for `wardley-beta`/`swimlane-beta`) into `src/lib/vendor/` so `render_diagram` and the process-mapping tools draw diagrams without the CDN. `scripts/sync.sh` runs it best-effort on every deploy; when the file is missing, rendering falls back to jsDelivr. `--force` re-downloads.
+
+```bash
+scripts/vendor-mermaid.sh            # fetch if missing / outdated
+MERMAID_VERSION=11.16.1 scripts/vendor-mermaid.sh --force
+```
+
 ### `scripts/compress-context.sh` — Context Compression
 Compresses agent context files in bulk — codex docs, skill prompts — to cut input tokens. Safe to re-run: files that haven't changed are skipped, and agent identity files (AGENTS.md) are left out by default.
 ```bash
