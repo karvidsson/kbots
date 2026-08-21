@@ -26,6 +26,7 @@ async def memory_store(
     type: str = "semantic",
     category: str = "general",
     tags: str = "",
+    scope: str = "agent",
 ) -> str:
     """Store a piece of information in persistent memory.
 
@@ -34,6 +35,10 @@ async def memory_store(
         type: Memory type — semantic (facts/knowledge), episodic (events/experiences), procedural (how-to/processes)
         category: Category (general, project, people, business, etc.)
         tags: Comma-separated tags
+        scope: Visibility — agent (default, private to you), global (facts about
+            the world, the business, or the team that every agent should know),
+            or group:<name> (shared with a named group). Keep personal working
+            notes agent-scoped; share only established facts.
     """
     # Map friendly names to DB-valid types
     type_map = {"fact": "semantic", "preference": "semantic", "episode": "episodic",
@@ -46,6 +51,9 @@ async def memory_store(
     coerced = type not in ("semantic", "episodic", "procedural")
     if coerced:
         type = "semantic"
+    if scope != "agent" and scope != "global" and not scope.startswith("group:"):
+        return (f"Invalid scope {scope!r} — use 'agent' (private), 'global', "
+                "or 'group:<name>'.")
     memory = _get_memory(ctx)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
 
@@ -55,15 +63,15 @@ async def memory_store(
         agent_id=ctx.agent_id,
         tags=tag_list,
         category=category,
-        scope="agent",
-        scope_target=ctx.agent_id,
+        scope=scope,
+        scope_target=ctx.agent_id if scope == "agent" else None,
     )
 
     note = ""
     if coerced:
         note = (f"\nNote: type '{requested}' is not a valid memory type — stored as "
                 f"'semantic'. Valid types: semantic, episodic, procedural.")
-    return f"Stored memory (id: {memory_id}): {content[:80]}...{note}"
+    return f"Stored memory (id: {memory_id}, scope: {scope}): {content[:80]}...{note}"
 
 
 @tool(name="memory_search", description="Search long-term memory", category="memory")

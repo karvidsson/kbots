@@ -54,9 +54,18 @@ def test_the_box_is_actually_closed(cli, capsys):
         assert mid.startswith("║") and mid.endswith("║")
 
 
-def test_the_tagline_is_the_one_the_project_already_uses(cli):
-    """Three variants of the same sentence is two too many."""
-    assert cli.TAGLINE in (ROOT / "pyproject.toml").read_text() + (ROOT / "README.md").read_text()
+def test_the_tagline_makes_the_same_claims_as_pyproject(cli):
+    """Three variants of the same sentence is two too many.
+
+    Matched on the claims rather than the exact string: punctuation differs
+    between a TOML description and a boxed banner, and an earlier version of
+    this test broke when README's image alt-text was reworded, which is not a
+    drift anyone needed telling about.
+    """
+    canonical = (ROOT / "pyproject.toml").read_text().lower()
+    for claim in ("one process", "llm-agnostic", "trains itself"):
+        assert claim in cli.TAGLINE.lower(), f"banner dropped {claim!r}"
+        assert claim in canonical, f"pyproject no longer claims {claim!r}"
 
 
 def test_the_old_tagline_is_gone_everywhere():
