@@ -59,7 +59,7 @@ def test_the_capital_letter_case_points_at_the_display_name():
     ("Botson", "botson"),
     ("MAIN", "main"),
     ("My Bot 2", "my-bot-2"),
-    ("  Neon Husky  ", "neon-husky"),
+    ("  Data Bot  ", "data-bot"),
     ("2fast", "fast"),
     ("bot!", "bot"),
 ])
