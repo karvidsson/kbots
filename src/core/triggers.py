@@ -20,10 +20,11 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import re
 import secrets as _secrets
 from pathlib import Path
+
+from src.core.base import overlay_state_path, overlay_state_read_path
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +33,18 @@ _EVENT_RE = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
 
 
 def _path() -> Path | None:
-    overlay = os.environ.get("KBOTS_OVERLAY", "")
-    return Path(overlay) / _FILENAME if overlay else None
+    """Written under the overlay's data/ dir, not the read-only overlay root."""
+    return overlay_state_path(_FILENAME)
+
+
+def _read_path() -> Path | None:
+    """Read the current file, falling back to the pre-migration root-level one."""
+    return overlay_state_read_path(_FILENAME)
 
 
 def _load_doc() -> dict:
-    path = _path()
-    if not path or not path.exists():
+    path = _read_path()
+    if not path:
         return {"enabled": True, "triggers": []}
     try:
         data = json.loads(path.read_text())

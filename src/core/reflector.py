@@ -18,12 +18,11 @@ CLAUDE.md / .mcp.json), with no tools, so it's a single cheap completion.
 import asyncio
 import json
 import logging
-import os
 import time
 from pathlib import Path
 
 from src.core import runtime_state
-from src.core.base import Message, MessageRole
+from src.core.base import Message, MessageRole, resolve_kbots_tmp
 
 logger = logging.getLogger(__name__)
 
@@ -113,8 +112,14 @@ class Reflector:
         return (now - float(last)) >= self.interval_h * 3600
 
     def _work_dir(self) -> str:
-        """Neutral cwd for the LLM call — no agent CLAUDE.md/.mcp.json to load."""
-        d = Path(os.environ.get("KBOTS_OVERLAY", ".")) / "tmp" / "reflector"
+        """Neutral cwd for the LLM call — no agent CLAUDE.md/.mcp.json to load.
+
+        Via resolve_kbots_tmp() rather than a hand-rolled $KBOTS_OVERLAY/tmp:
+        that bypassed the KBOTS_TMP override, which is the one escape hatch a
+        hardened host has when the overlay root is mounted read-only. The mkdir
+        raised there, and it is the first thing the reflector does.
+        """
+        d = resolve_kbots_tmp() / "reflector"
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
 

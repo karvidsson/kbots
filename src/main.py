@@ -523,6 +523,48 @@ async def main() -> None:
                     logger.error(f"Restart recovery for {agent_id} failed: {e}")
         asyncio.create_task(_deliver_recovery(), name="restart-recovery")
 
+    # --- Identity reconcile: an agent whose Discord ACCOUNT name disagrees with
+    # its config gets one turn to rename itself. Off by default: a rename is
+    # outward-facing and rate-limited at two per hour, so an established fleet
+    # should opt in rather than discover it after a restart.
+    if (config.get("identity", {}) or {}).get("reconcile_on_boot", False):
+        from src.core.identity_boot import build_identity_message, pending_renames
+
+        async def _deliver_identity():
+            await asyncio.sleep(25)  # after restart-recovery, connectors online
+            discord_conn = active_connectors.get("discord")
+            if not discord_conn:
+                return
+            live_names = {
+                acct: bot.client.user.name
+                for acct, bot in getattr(discord_conn, "bots", {}).items()
+                if getattr(bot, "client", None) and bot.client.user
+            }
+            from src.core.identity_boot import owner_discord_id, record_attempt
+            from src.tools.team import _load_team
+            owner_id = owner_discord_id(_load_team())
+            for pending in pending_renames(
+                    live_names, agent_manager.agent_configs, data_dir):
+                agent_id = pending["agent_id"]
+                home = await agent_manager._resolve_home_channel(agent_id)
+                if not home:
+                    logger.warning(
+                        f"Identity reconcile: {agent_id} has no home channel — skipped")
+                    continue
+                connector_name, channel_id, _ = home
+                logger.info(
+                    f"Identity reconcile -> {agent_id}: account is "
+                    f"{pending['live_name']!r}, configured as "
+                    f"{pending['configured_name']!r}")
+                record_attempt(data_dir, agent_id, pending["configured_name"])
+                try:
+                    await agent_manager.handle_message(
+                        agent_id, build_identity_message(
+                            pending, owner_id, connector_name, channel_id))
+                except Exception as e:
+                    logger.error(f"Identity reconcile for {agent_id} failed: {e}")
+        asyncio.create_task(_deliver_identity(), name="identity-reconcile")
+
     # --- Android emulator reaper: shut the emulator down once nobody uses it ---
     # Must live here, in the long-running service: the failure mode is "no agent
     # calls android_device again", so a check inside the tool would never run for

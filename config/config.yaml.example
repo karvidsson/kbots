@@ -110,6 +110,20 @@ schedules:
   channel: ""                # e.g. "YOUR_SCHEDULES_CHANNEL_ID"
   bot: ""                    # optional bot account to post as (default: first)
 
+# Identity reconcile (optional): a Discord ACCOUNT is named in the developer
+# portal and nothing reconciles that with agents.yaml, so a bot can keep the
+# name it was registered under while its config calls it something else. Turn
+# this on and, on boot, any agent whose account name disagrees with its
+# display_name gets ONE turn to rename itself, set its avatar and greet its
+# owner. A successful rename removes the trigger, so it does not repeat; a
+# rename Discord refuses is retried at most twice, ever.
+#
+# OFF by default on purpose. Renaming a bot account is outward-facing and
+# Discord allows only two username changes per hour, so an established fleet
+# should opt in rather than discover it after a restart.
+identity:
+  reconcile_on_boot: false
+
 # Goal workstreams (optional): long-running multi-agent collaborations. A goal
 # gets its own auto-created Discord channel; participants (each with its own
 # bot account) are routed there dynamically from data/goals.db — no agents.yaml

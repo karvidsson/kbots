@@ -15,9 +15,10 @@ killswitch for all scheduled inference.
 
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
+
+from src.core.base import overlay_state_path, overlay_state_read_path
 
 logger = logging.getLogger(__name__)
 
@@ -25,35 +26,13 @@ _FILENAME = "schedules.json"
 
 
 def _path() -> Path | None:
-    """Where the store is written: the overlay's data/ directory.
-
-    It used to sit at the overlay ROOT. A hardened service unit
-    (ProtectSystem=strict) grants ReadWritePaths to the subdirectories it
-    needs, which leaves that root read-only. The file loaded fine and every
-    write failed silently, so a fired schedule never recorded `last_run` and a
-    `once` schedule re-fired every tick, indefinitely.
-    """
-    overlay = os.environ.get("KBOTS_OVERLAY", "")
-    return Path(overlay) / "data" / _FILENAME if overlay else None
-
-
-def _legacy_path() -> Path | None:
-    """The pre-migration location at the overlay root. Read, never written.
-
-    An install that predates the move keeps its schedules: they load from
-    here and the next save lands in _path(), migrating the store forward.
-    """
-    overlay = os.environ.get("KBOTS_OVERLAY", "")
-    return Path(overlay) / _FILENAME if overlay else None
+    """Written under the overlay's data/ dir, not the read-only overlay root."""
+    return overlay_state_path(_FILENAME)
 
 
 def _read_path() -> Path | None:
-    """The file to load from: the current location, else the legacy one."""
-    path = _path()
-    if path and path.exists():
-        return path
-    legacy = _legacy_path()
-    return legacy if legacy and legacy.exists() else None
+    """Read the current file, falling back to the pre-migration root-level one."""
+    return overlay_state_read_path(_FILENAME)
 
 
 def _load_doc() -> dict:
