@@ -346,7 +346,24 @@ def _vendored_mermaid() -> str | None:
     return js or None
 
 
-def _mermaid_html(diagram: str, theme_vars: dict) -> str:
+def _edge_label_css(text_color: str) -> str:
+    """Make edge labels legible.
+
+    Mermaid's flowchart stylesheet colours `.label text` and every `span` with
+    nodeTextColor (here white, so node text reads against the filled shapes).
+    An edge label is a bare span sitting on `edgeLabelBackground` — also white
+    — so the text renders correctly and is invisible. Branch conditions on
+    decision diamonds disappear, which makes a flowchart read as complete while
+    hiding the one thing a decision is for.
+
+    themeCSS is injected into the generated SVG, so this survives both the PNG
+    path and a standalone .svg. Scoped to edge labels only.
+    """
+    return (f"span.edgeLabel, span.edgeLabel p, .edgeLabel .label text "
+            f"{{ color: {text_color} !important; fill: {text_color} !important; }}")
+
+
+def _mermaid_html(diagram: str, theme_vars: dict, theme_css: str = "") -> str:
     """Render page for a Mermaid diagram — vendored script when available, else CDN ESM."""
     vendored = _vendored_mermaid()
     loader = f"<script>{vendored.replace('</script', '<\\/script')}</script>" if vendored else ""
@@ -357,7 +374,8 @@ def _mermaid_html(diagram: str, theme_vars: dict) -> str:
 <script type="module">
   {import_line}
   mermaid.initialize({{startOnLoad: false, theme: "base",
-                       themeVariables: {json.dumps(theme_vars)}}});
+                       themeVariables: {json.dumps(theme_vars)},
+                       themeCSS: {json.dumps(theme_css)}}});
   try {{
     const {{svg}} = await mermaid.render("diagram", {json.dumps(diagram)});
     document.getElementById("container").innerHTML = svg;
@@ -395,7 +413,7 @@ async def render_diagram(ctx: ToolContext, diagram: str, output_file: str = "",
         "edgeLabelBackground": c["surface"],
         "fontFamily": brand["font_family"],
     }
-    html = _mermaid_html(diagram, theme_vars)
+    html = _mermaid_html(diagram, theme_vars, _edge_label_css(c["text"]))
 
     out = _output_path(ctx, output_file, f"diagram-{_timestamp()}.{format}")
     if isinstance(out, str):
