@@ -8,6 +8,7 @@ Comparing the two tells you whether a deployed update has actually taken effect.
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -93,7 +94,36 @@ def commits_between(old: str, new: str, limit: int = 15) -> str:
 
 
 def _default_data_dir() -> Path:
+    """Where version.json lives when the caller does not say.
+
+    main.py WRITES this with the configured data_dir, which on an overlay
+    install is the overlay's data/. Every reader called with no argument and
+    landed on PROJECT_ROOT/data instead, so `platform_version` reported the
+    commit from whenever that stale copy was last written and answered "an
+    update is on disk but NOT running yet" about a deploy that had in fact
+    taken. The one check you would run to confirm a deploy was the one that
+    could not see it.
+
+    Prefer the overlay when it holds a version.json, since that is what the
+    running engine wrote. set_data_dir() pins it exactly for a process that
+    knows its own config.
+    """
+    if _data_dir_override is not None:
+        return _data_dir_override
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    if overlay and (Path(overlay) / "data" / _VERSION_FILE).exists():
+        return Path(overlay) / "data"
     return PROJECT_ROOT / "data"
+
+
+_data_dir_override: Path | None = None
+
+
+def set_data_dir(data_dir: Path | str | None) -> None:
+    """Pin the location for readers in THIS process. Both entrypoints call it
+    at boot; the MCP server is a separate process and must call it too."""
+    global _data_dir_override
+    _data_dir_override = Path(data_dir) if data_dir else None
 
 
 def write_running_version(data_dir: Path | None = None) -> dict:

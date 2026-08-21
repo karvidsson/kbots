@@ -11,6 +11,7 @@ from pathlib import Path
 
 import yaml
 
+from src.core import runtime_state
 from src.core.agent_manager import AgentManager
 from src.core.base import read_vault_key_file, resolve_vault_key_file
 from src.core.preflight import run_preflight
@@ -422,6 +423,36 @@ async def main() -> None:
     for connector in active_connectors.values():
         connector.on_message = router.route
 
+    # --- Server auto-setup: a new Discord server provisions itself ---
+    # The channels are created by the connector deterministically. What comes
+    # back here is only the part that needs an agent: its nickname, its avatar,
+    # and telling the owner what it just did. If this turn fails the server is
+    # still correctly wired, which is the ordering that matters.
+    if "discord" in active_connectors:
+        from src.core.server_setup import build_setup_message
+
+        async def _on_guild_setup(agent_id, guild_id, guild_name, outcomes):
+            channels = {o.key: o.channel_id for o in outcomes if o.channel_id}
+            home = channels.get("platform_updates") or channels.get("alerts")
+            if not home:
+                logger.warning(
+                    f"Server setup for '{guild_name}' wired no channel the agent "
+                    f"can post in — skipping the introduction turn")
+                return
+            from src.core.identity_boot import configured_name
+            cfg = (agent_manager.agent_configs or {}).get(agent_id) or {}
+            account = ((cfg.get("routing") or {}).get("discord") or {}).get("account", "")
+            await agent_manager.handle_message(agent_id, build_setup_message(
+                agent_id, guild_id, guild_name, outcomes, "discord", home,
+                display_name=configured_name(agent_manager.agent_configs, agent_id),
+                account=str(account)))
+
+        active_connectors["discord"].set_setup_context(
+            config,
+            str(config.get("kbots", {}).get("data_dir", "./data")),
+            _on_guild_setup,
+        )
+
     # --- Start connectors ---
     for conn_name, connector in active_connectors.items():
         try:
@@ -444,6 +475,7 @@ async def main() -> None:
     # --- Platform version: freeze the running commit; announce real updates ---
     from src.core import version as _version
     data_dir = Path(config.get("kbots", {}).get("data_dir", "./data"))
+    _version.set_data_dir(data_dir)  # so in-process readers agree with the writer
     _prev = _version.read_running_version(data_dir)
     _running = _version.write_running_version(data_dir)
     _run_v = _running.get("version") or _running["short"]
@@ -454,7 +486,14 @@ async def main() -> None:
         _changes = _version.commits_between(_prev["commit"], _running["commit"])
         _detail = f"\n```\n{_changes}\n```" if _changes else ""
         if alerter:
-            alerter.send_bg(
+            # Its own channel when one is wired, else the alert channel, which is
+            # where this has always gone. "The platform changed" and "something
+            # attacked your agent" are different audiences, but an install that
+            # has not run server setup must not lose the notice entirely.
+            _updates = (runtime_state.get_flag("platform_updates_channel", None)
+                        or (config.get("platform", {}) or {}).get("updates_channel", ""))
+            alerter.post_bg(
+                _updates,
                 f"🔄 **Platform updated** — now running **{_run_v}** (was {_prev_v}). "
                 f"`{_running['short']}`{_detail}"
             )
