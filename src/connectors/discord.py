@@ -612,10 +612,23 @@ class DiscordBot:
         # Record this bot's Discord identity in the roster so other agents recognize
         # it as a teammate (resolve_discord_user / user-context) rather than an
         # unknown guest — the bots know their own id only once connected.
+        # The name recorded here must be the CONFIGURED one, not client.user.name.
+        # The live Discord name is set in the developer portal and nothing
+        # reconciles it with config, so an account named differently from its
+        # agent added a roster row under a name no config knows. That row is then
+        # the name the agent reads back as its own and hands to set_agent_avatar,
+        # which resolves it to a vault key that was never created and fails with
+        # "no bot token found" — the avatar unreachable for a reason that had
+        # nothing to do with avatars.
         try:
+            from src.core.identity_boot import agent_for_account, configured_name
             from src.tools.team import record_bot_identity
             if self.client.user:
-                record_bot_identity(self.client.user.name, str(self.client.user.id))
+                configs = getattr(self.connector, "_agent_configs", {}) or {}
+                agent_id = agent_for_account(configs, "discord", self.account_name)
+                name = (configured_name(configs, agent_id) if agent_id
+                        else self.client.user.name)  # an account no agent claims
+                record_bot_identity(name, str(self.client.user.id))
         except Exception as e:
             logger.debug(f"roster identity sync failed: {e}")
 

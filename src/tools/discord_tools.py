@@ -592,6 +592,114 @@ async def discord_set_nickname(
 
 
 @tool(
+    name="discord_set_bot_name",
+    description=(
+        "Rename a bot's Discord ACCOUNT username (what shows in DMs, the API "
+        "and the roster), not just a per-server nickname. Discord allows only "
+        "two username changes per hour, so the name is validated before the "
+        "request is sent and a rate limit is never retried automatically."
+    ),
+    category="discord",
+)
+async def discord_set_bot_name(ctx: ToolContext, name: str, bot: str = "") -> str:
+    """Rename the bot account via PATCH /users/@me.
+
+    Args:
+        name: The new account username, 2 to 32 characters.
+        bot: Which bot account to rename (e.g. 'milo'). Empty for default.
+    """
+    name = (name or "").strip()
+    # Validate BEFORE sending. A rejected request still spends one of the two
+    # changes Discord allows per hour, so a typo would cost half the budget
+    # and the retry would be the one that gets rate limited.
+    if not 2 <= len(name) <= 32:
+        return (f"Not sent: a Discord username must be 2 to 32 characters, "
+                f"{name!r} is {len(name)}. A rejected request still spends one "
+                f"of the two changes allowed per hour.")
+
+    headers = _discord_headers(ctx.vault, bot=bot)
+    if not headers:
+        return f"No Discord token found for bot '{bot or 'main'}' in the vault."
+
+    async with aiohttp.ClientSession() as session:
+        async with session.patch(
+            f"{DISCORD_API}/users/@me", headers=headers, json={"username": name},
+        ) as resp:
+            if resp.status == 200:
+                body = await resp.json()
+                return f"Bot account renamed to {body.get('username', name)!r}."
+            text = (await resp.text())[:300]
+            if resp.status == 429:
+                return (f"Rate limited by Discord (two username changes per hour). "
+                        f"NOT retried automatically: {text}")
+            if resp.status == 400:
+                return (f"Discord rejected the name {name!r} (it may be taken, "
+                        f"reserved, or contain disallowed characters): {text}")
+            return f"Rename failed: HTTP {resp.status}: {text}"
+
+
+@tool(
+    name="discord_send_dm",
+    description=(
+        "Send a direct message to a user, opening the DM channel first. Use "
+        "when there is no shared channel to post in. Reports a closed-DM "
+        "privacy setting distinctly from a real failure."
+    ),
+    category="discord",
+)
+async def discord_send_dm(
+    ctx: ToolContext, user_id: str, content: str, bot: str = ""
+) -> str:
+    """Open a DM channel and post to it.
+
+    Args:
+        user_id: The Discord user ID to message.
+        content: The message text, at most 2000 characters.
+        bot: Which bot account sends it (e.g. 'milo'). Empty for default.
+    """
+    if not str(user_id).strip():
+        return "Not sent: user_id is required."
+    if not (content or "").strip():
+        return "Not sent: content is empty."
+    if len(content) > 2000:
+        return f"Not sent: Discord messages cap at 2000 characters, this is {len(content)}."
+
+    headers = _discord_headers(ctx.vault, bot=bot)
+    if not headers:
+        return f"No Discord token found for bot '{bot or 'main'}' in the vault."
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{DISCORD_API}/users/@me/channels", headers=headers,
+            json={"recipient_id": str(user_id).strip()},
+        ) as resp:
+            if resp.status not in (200, 201):
+                text = (await resp.text())[:300]
+                # A closed DM is a choice the user made, not a fault to debug.
+                if resp.status == 403:
+                    return (f"Could not open a DM with {user_id}: they do not accept "
+                            f"direct messages from this bot (privacy setting or no "
+                            f"shared server). Nothing was sent.")
+                return f"Could not open a DM channel with {user_id}: HTTP {resp.status}: {text}"
+            channel_id = str((await resp.json()).get("id", ""))
+
+        if not channel_id:
+            return f"Discord returned no DM channel id for {user_id}. Nothing was sent."
+
+        async with session.post(
+            f"{DISCORD_API}/channels/{channel_id}/messages",
+            headers=headers, json={"content": content},
+        ) as resp:
+            if resp.status in (200, 201):
+                return f"DM sent to {user_id} (channel {channel_id})."
+            text = (await resp.text())[:300]
+            if resp.status == 403:
+                return (f"DM channel {channel_id} opened, but posting was refused: "
+                        f"{user_id} has DMs closed to this bot.")
+            return f"DM channel opened but the message failed: HTTP {resp.status}: {text}"
+
+
+@tool(
     name="discord_delete_message",
     description=(
         "Delete a message the bot itself sent (works in DMs, where no human "

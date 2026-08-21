@@ -27,7 +27,7 @@ def test_map_is_bounded(overlay):
     for i in range(feedback_map._MAX + 20):
         feedback_map.record(f"m{i}", "a", ["x"])
     import json
-    data = json.loads((overlay / "feedback_map.json").read_text())
+    data = json.loads((overlay / "data" / "feedback_map.json").read_text())
     assert len(data) == feedback_map._MAX          # oldest pruned
     assert "m0" not in data and f"m{feedback_map._MAX + 19}" in data
 

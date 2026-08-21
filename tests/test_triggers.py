@@ -23,7 +23,7 @@ def test_create_returns_unique_secret_stored_hashed(overlay):
     r2, s2 = trig.create_trigger("event_b", "atlas", "c", "do b", "u")
     assert s1 != s2 and len(s1) > 20
     # only the hash is stored, never the plaintext
-    raw = (overlay / "triggers.json").read_text()
+    raw = (overlay / "data" / "triggers.json").read_text()
     assert s1 not in raw and s2 not in raw
     assert "secret_hash" in raw
     # verify checks the right secret, constant-time

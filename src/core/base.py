@@ -167,6 +167,41 @@ def resolve_config_file(name: str) -> Path:
     return PROJECT_ROOT / "config" / name
 
 
+def overlay_state_path(name: str) -> Path | None:
+    """Where a small shared state file is WRITTEN: the overlay's data/ directory.
+
+    Five of these (schedules, runtime flags, triggers, session consent, the
+    feedback map) each resolved their own path against the overlay ROOT. A
+    hardened service unit grants ReadWritePaths to the subdirectories it needs,
+    which leaves that root read-only, so inside the service every write failed
+    while the same code worked perfectly from a shell. One of them suppressed
+    the error and re-fired a `once` schedule every tick, forever.
+
+    One helper rather than a sixth copy of the same two lines.
+    """
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) / "data" / name if overlay else None
+
+
+def overlay_state_legacy_path(name: str) -> Path | None:
+    """The pre-migration location at the overlay root. Read, never written."""
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) / name if overlay else None
+
+
+def overlay_state_read_path(name: str) -> Path | None:
+    """The file to READ: the current location, else the legacy one, else None.
+
+    State written before the move keeps governing until the first write carries
+    it forward, so an existing install loses nothing on upgrade.
+    """
+    path = overlay_state_path(name)
+    if path and path.exists():
+        return path
+    legacy = overlay_state_legacy_path(name)
+    return legacy if legacy and legacy.exists() else None
+
+
 # === Messages ===
 
 @dataclass
