@@ -132,11 +132,22 @@ uv run python vault-manage.py
 ### `scripts/chrome-debug.sh` — Debug Chrome for the `chrome_browser` Tool (macOS)
 Launches a separate Google Chrome with remote debugging enabled so the `chrome_browser` tool can drive your **real** browser — genuine fingerprint and logged-in sessions — to reach sites that block the headless `browser` tool. It runs on a debug profile seeded from your real one (cookies/logins carry over), leaving your everyday Chrome untouched. A dedicated profile dir is required because Chrome 136+ refuses remote debugging on the default profile for security.
 ```bash
-scripts/chrome-debug.sh            # start (or reuse) the debug Chrome
-scripts/chrome-debug.sh --refresh  # re-seed logins from your live profile
-scripts/chrome-debug.sh --status   # is the debug port up?
+scripts/chrome-debug.sh              # start (or reuse) the debug Chrome
+scripts/chrome-debug.sh --refresh    # re-seed logins from your live profile
+scripts/chrome-debug.sh --status     # is the debug port up?
+scripts/chrome-debug.sh --install    # supervise under launchd (recommended)
+scripts/chrome-debug.sh --uninstall  # remove the launchd job
 ```
 The `chrome_browser` tool auto-runs this on first use, so you normally don't call it directly. Env: `KBOTS_CHROME_DEBUG_PORT` (default 9222), `KBOTS_CHROME_DEBUG_DIR` (default `~/.kbots-chrome-debug`).
+
+**Supervision (`--install`):** an ad-hoc debug Chrome dies silently on a crash, a Chrome self-update relaunch (which drops CLI flags), ⌘Q, or a reboot — and CDP with it. `--install` writes a `com.kbots.chrome-debug` LaunchAgent with `KeepAlive`, so launchd restarts it with the right flags every time. On every successful start the script writes an endpoint discovery file (`$KBOTS_OVERLAY/data/chrome-debug.json`: port, user-data-dir, pid) which the `chrome_browser` tool uses to verify the responder on the port is *our* Chrome — a squatted port or the user's own flag-ignoring Chrome now gets a clear refusal instead of a confusing session. Note your own everyday Chrome **cannot** expose CDP (Chrome ≥136 ignores the flag on the default profile); logins the agents need belong in the debug Chrome's named profiles via the sign-in-once flow.
+
+**Dedicated per-agent instances:** by default every agent shares one debug Chrome (identity separation via named profiles, but one CDP port — any attached agent can reach any profile's tabs, and driving is serialized). For an agent holding real credentials, give it its own Chrome in `agents.yaml`:
+```yaml
+  atlas:
+    chrome_instance: {port: 9223}          # dir defaults to ~/.kbots-chrome-<agent>
+```
+That agent then gets its own data dir (real cookie isolation), its own reservation lane (parallel driving), and its own endpoint file. Supervise it too: `KBOTS_CHROME_DEBUG_PORT=9223 KBOTS_CHROME_DEBUG_DIR=~/.kbots-chrome-atlas scripts/chrome-debug.sh --install` (the label becomes `com.kbots.chrome-debug-9223`). Cost: one Chrome's RAM per dedicated agent.
 
 ## Testing
 
@@ -224,6 +235,15 @@ Links the generated units — timers plus the service — into `/etc/systemd/sys
 ```bash
 # Called by setup.py, or run manually:
 sudo bash scripts/install-systemd.sh <overlay-dir> [--enable-service]
+```
+
+### `scripts/vendor-mermaid.sh` — Vendor mermaid.js for Offline Diagrams
+
+Fetches a pinned `mermaid.min.js` (`MERMAID_VERSION`, ≥ 11.16 for `wardley-beta`/`swimlane-beta`) into `src/lib/vendor/` so `render_diagram` and the process-mapping tools draw diagrams without the CDN. `scripts/sync.sh` runs it best-effort on every deploy; when the file is missing, rendering falls back to jsDelivr. `--force` re-downloads.
+
+```bash
+scripts/vendor-mermaid.sh            # fetch if missing / outdated
+MERMAID_VERSION=11.16.1 scripts/vendor-mermaid.sh --force
 ```
 
 ### `scripts/compress-context.sh` — Context Compression

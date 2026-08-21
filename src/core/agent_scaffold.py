@@ -18,6 +18,45 @@ TIERS = ("privileged", "coordinator", "assistant")
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
+AGENT_NAME_RULE = ("lowercase letters, digits, '-' or '_', starting with a "
+                   "letter, max 32 characters")
+
+
+def agent_name_error(name: str) -> str | None:
+    """Why `name` cannot be used as an agent id, or None if it can.
+
+    The agent name becomes a directory, a YAML key and an env-var component, so
+    the rule is narrow on purpose. Callers that take it from a human should ask
+    THIS before doing any other work, and re-prompt — the name arriving here for
+    the first time inside scaffold_agent means the failure surfaces after
+    everything else is already done.
+    """
+    if not name:
+        return "Name is empty"
+    if _NAME_RE.match(name):
+        return None
+    if name != name.lower():
+        return (f"{name!r} has capital letters. Agent names are {AGENT_NAME_RULE}. "
+                f"The display name shown in Discord is a separate question and "
+                f"can be capitalised however you like.")
+    if name[0].isdigit() or name[0] in "-_":
+        return f"{name!r} must start with a lowercase letter ({AGENT_NAME_RULE})"
+    if len(name) > 32:
+        return f"{name!r} is {len(name)} characters ({AGENT_NAME_RULE})"
+    return f"{name!r} contains characters that are not allowed ({AGENT_NAME_RULE})"
+
+
+def suggest_agent_name(raw: str) -> str:
+    """A usable agent name derived from whatever the human typed.
+
+    'Botson' -> 'botson', 'My Bot 2' -> 'my-bot-2'. Returns '' when nothing
+    usable survives, so a caller can tell the difference between a fixable typo
+    and input it should simply reject.
+    """
+    slug = re.sub(r"[^a-z0-9_-]+", "-", (raw or "").strip().lower()).strip("-_")
+    slug = re.sub(r"^[^a-z]+", "", slug)[:32].rstrip("-_")
+    return slug if _NAME_RE.match(slug) else ""
+
 # The agent's identity/instructions live in ONE canonical file, named for the
 # cross-CLI convention most agent CLIs read natively (Codex, opencode, Amp…).
 # CLIs with their own filename get a thin stub that imports it, so the content
@@ -276,10 +315,9 @@ def scaffold_agent(
     overlay = Path(overlay).resolve()
     engine_root = Path(engine_root).resolve() if engine_root else PROJECT_ROOT
 
-    if not _NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid agent name {name!r} — lowercase letters, digits, '-'/'_', max 32 chars"
-        )
+    name_error = agent_name_error(name)
+    if name_error:
+        raise ValueError(f"Invalid agent name: {name_error}")
     if tier not in TIERS:
         raise ValueError(f"Invalid tier {tier!r} — one of {', '.join(TIERS)}")
     if not (overlay / "config").is_dir():
@@ -329,6 +367,23 @@ def scaffold_agent(
 
     content = claude_md or default_claude_md(display_name, description, agent_dir, personality)
     written.extend(write_identity(agent_dir, content))
+
+    # --- per-agent codex ---
+    # Role-specific knowledge base; its _index.md is injected at session start
+    # (src/core/startup_context.py) alongside the shared overlay codex.
+    codex_index = agent_dir / "codex" / "_index.md"
+    if not codex_index.exists():
+        codex_index.parent.mkdir(parents=True, exist_ok=True)
+        codex_index.write_text(
+            f"# {display_name} — Codex Index\n\n"
+            "Role-specific knowledge for this agent. Catalogue documents here as you "
+            "add them — this index is injected at session start so the agent knows "
+            "what exists. Shared business knowledge belongs in the deployment codex "
+            "instead (overlay codex/).\n\n"
+            "## Documents\n\n"
+            "*(none yet)*\n"
+        )
+        written.append(codex_index)
 
     # --- .mcp.json ---
     mcp_json_path = agent_dir / ".mcp.json"

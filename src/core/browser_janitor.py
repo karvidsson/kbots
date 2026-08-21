@@ -34,6 +34,26 @@ _RESOURCE = "chrome_browser"
 
 _FLAG = "browser_last_activity"
 
+# When this launchd job exists, the debug Chrome is a supervised service and
+# launchd owns its lifecycle. See _supervised().
+_SUPERVISED_LABEL = "com.kbots.chrome-debug"
+
+
+def _supervised() -> bool:
+    """True when the debug Chrome runs as a KeepAlive launchd job.
+
+    The janitor may then never quit it. launchd would restart it within
+    seconds and the two would fight in a loop for as long as both are
+    installed — the browser bouncing every tick, and every CDP consumer seeing
+    an endpoint that dies at random.
+
+    The janitor's reason for existing (video tabs decoding around the clock)
+    becomes the supervised job's problem to bound, because an operator who
+    installs a KeepAlive job has said explicitly that they want the browser up.
+    """
+    return (Path.home() / "Library" / "LaunchAgents"
+            / f"{_SUPERVISED_LABEL}.plist").is_file()
+
 
 def _debug_dir() -> Path:
     """The user-data-dir of the debug Chrome (mirror of chrome-debug.sh)."""
@@ -89,6 +109,7 @@ class BrowserJanitor:
         cfg = config or {}
         self.idle_h = float(cfg.get("idle_quit_hours", 3))
         self.tick = float(cfg.get("tick_seconds", 600))
+        self._stood_down = False
 
     @property
     def enabled(self) -> bool:
@@ -97,19 +118,25 @@ class BrowserJanitor:
     def _last_activity(self, now: float) -> float | None:
         """High-water mark of browser use: reservation record vs stored flag.
 
-        Returns None on first sighting (flag initialised to `now`), so a
-        browser found already running gets a full idle window, never an
-        immediate kill.
+        Returns None on a fresh window (flag initialised to `now`), so a
+        browser found newly up gets a full idle window, never an immediate kill.
         """
         try:
             flag = float(runtime_state.get_flag(_FLAG) or 0)
         except (TypeError, ValueError):
             flag = 0.0
-        rec = tool_reservation.last_activity(_RESOURCE) or 0.0
-        last = max(flag, rec)
-        if not last:
+        if not flag:
+            # Fresh window: the port was down and has just come up, or this is
+            # the first sighting. The reservation record OUTLIVES the browser it
+            # describes, so consulting it here dated a brand-new Chrome to the
+            # last time the chrome_browser tool ran — days ago — and the janitor
+            # closed it on the next tick. A browser driven over raw CDP never
+            # writes a reservation at all, so that verdict never changed and
+            # every launch was killed within one tick, forever.
             runtime_state.set_flag(_FLAG, now)
             return None
+        rec = tool_reservation.last_activity(_RESOURCE) or 0.0
+        last = max(flag, rec)
         if last > flag:
             runtime_state.set_flag(_FLAG, last)
         return last
@@ -117,6 +144,12 @@ class BrowserJanitor:
     async def _tick(self, now: float | None = None) -> bool:
         """One housekeeping pass. Returns True when it quit the browser."""
         now = now if now is not None else time.time()
+        if _supervised():
+            if not self._stood_down:
+                self._stood_down = True
+                logger.info(f"browser-janitor: {_SUPERVISED_LABEL} is installed — "
+                            f"launchd owns the debug Chrome, standing down")
+            return False
         if not _port_up():
             if runtime_state.get_flag(_FLAG):
                 runtime_state.set_flag(_FLAG, 0)   # next launch starts a fresh window
