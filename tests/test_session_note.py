@@ -36,12 +36,23 @@ def test_no_note_on_brand_new_conversation():
     assert prompt == "hi"
 
 
-def test_extra_dir_args():
+def test_extra_dir_args(tmp_path, monkeypatch):
+    """Was: no extra_dirs meant no --add-dir at all. That is what left every
+    agent unable to open the screenshot its own tool had just written, so the
+    shared temp dir is now granted unconditionally and a home-relative path is
+    still expanded. See tests/test_agent_sandbox_dirs.py."""
     from src.llm.claude_code import _extra_dir_args
-    assert _extra_dir_args(None) == []
-    args = _extra_dir_args(["~/dev/app", "/opt/x"])
-    assert args[0] == "--add-dir" and args[1].endswith("/dev/app") and "~" not in args[1]
-    assert args[2:] == ["--add-dir", "/opt/x"]
+
+    monkeypatch.setenv("KBOTS_TMP", str(tmp_path))
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    assert _extra_dir_args(None) == ["--add-dir", str(tmp_path)]
+
+    app = tmp_path / "dev" / "app"
+    app.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    args = _extra_dir_args(["~/dev/app"])
+    assert args[2:] == ["--add-dir", str(app)]
+    assert "~" not in args[3]
 
 
 async def test_messages_record_provider_and_model(tmp_path):

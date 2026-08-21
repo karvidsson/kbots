@@ -865,6 +865,8 @@ class AgentManager:
                         disallowed_tools=disallowed_tools,
                         mcp_config=mcp_config,
                         extra_dirs=agent_cfg.get("extra_dirs"),
+                        sandbox_dirs=(self.defaults.get("sandbox", {}) or {}
+                                      ).get("additional_dirs"),
                         extra_env=self._subprocess_env(),
                         agent_id=agent_id,
                         channel_id=message.channel_id,

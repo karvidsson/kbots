@@ -16,7 +16,14 @@ import re
 import tempfile
 from pathlib import Path
 
-from src.core.base import LLMProvider, LLMResponse, Message, MessageRole, ToolDef
+from src.core.base import (
+    LLMProvider,
+    LLMResponse,
+    Message,
+    MessageRole,
+    ToolDef,
+    agent_session_dirs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -191,11 +198,17 @@ def _extract_reset_hint(text: str) -> str | None:
     return m.group(0).strip() if m else None
 
 
-def _extra_dir_args(extra_dirs) -> list[str]:
-    """--add-dir args for agents granted workspaces beyond their agent dir."""
+def _extra_dir_args(extra_dirs, configured=None) -> list[str]:
+    """--add-dir args for every directory this session may reach.
+
+    The shared temp dir and the codex are added for EVERY agent, not only ones
+    with an extra_dirs entry: an agent that cannot open the screenshot its own
+    tool just wrote is broken by construction, and no per-agent configuration
+    should be required to fix that. See base.agent_session_dirs.
+    """
     args: list[str] = []
-    for d in extra_dirs or []:
-        args.extend(["--add-dir", str(Path(d).expanduser())])
+    for d in agent_session_dirs(extra_dirs, configured):
+        args.extend(["--add-dir", d])
     return args
 
 
@@ -338,9 +351,10 @@ class ClaudeCodeProvider(LLMProvider):
         if mcp_config:
             args.extend(["--mcp-config", str(mcp_config)])
 
-        # Extra working directories (agents.yaml extra_dirs) — extends the CLI
-        # sandbox beyond the agent dir, e.g. a product repo the agent owns.
-        args.extend(_extra_dir_args(kwargs.get("extra_dirs")))
+        # Working directories beyond the agent dir. Always the shared temp dir
+        # and the codex; then anything the deployment or this agent adds.
+        args.extend(_extra_dir_args(kwargs.get("extra_dirs"),
+                                    kwargs.get("sandbox_dirs")))
 
         # Allowed tools
         if allowed_tools:

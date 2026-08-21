@@ -12,7 +12,7 @@ from pathlib import Path
 
 import yaml
 
-from src.core.base import PROJECT_ROOT, resolve_kbots_tmp
+from src.core.base import PROJECT_ROOT, agent_session_dirs, resolve_kbots_tmp
 
 TIERS = ("privileged", "coordinator", "assistant")
 
@@ -421,7 +421,16 @@ def scaffold_agent(
     settings_path = claude_dir / "settings.json"
     if not settings_path.exists():
         settings = {
-            "permissions": {"allow": cc_allow_for_tier(tier), "deny": []},
+            "permissions": {
+                "allow": cc_allow_for_tier(tier),
+                "deny": [],
+                # The allow-list and the working-directory boundary are separate
+                # gates: a Read rule over the temp dir grants nothing unless the
+                # directory is in scope too. The engine passes the same set via
+                # --add-dir on every session, so this is what an agent dir opened
+                # by hand sees, and it keeps the two from disagreeing.
+                "additionalDirectories": agent_session_dirs(),
+            },
             "env": {
                 # Include Homebrew paths — node/npx live there on macOS and
                 # stdio MCP servers (npx ...) silently fail to launch without it.
