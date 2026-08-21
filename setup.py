@@ -509,11 +509,13 @@ def step_overlay(state: dict):
         env_block = f"\n# kbots environment\nexport KBOTS_OVERLAY={overlay}\n"
         if state.get("kbots_modules"):
             env_block += f"export KBOTS_MODULES={state['kbots_modules']}\n"
-        with open(profile, "a") as f:
-            f.write(env_block)
+        _write_profile_block(profile, env_block)
         _track_undo(state, f"~/{profile.name} env exports",
                     lambda p=profile, b=env_block: _strip_profile_block(p, b))
         ok(f"Added kbots env vars to ~/{profile.name}")
+    elif _relocate_profile_block(profile):
+        ok(f"Moved kbots env vars above the interactive guard in ~/{profile.name} "
+           f"(they were invisible to cron and non-interactive ssh)")
     else:
         info(f"KBOTS_OVERLAY already in ~/{profile.name}")
 
@@ -1992,6 +1994,70 @@ def _strip_profile_block(profile_path: Path, block: str) -> None:
         content = profile_path.read_text()
         if block and block in content:
             profile_path.write_text(content.replace(block, ""))
+
+
+# Debian/Ubuntu ~/.bashrc returns early for non-interactive shells. Anything
+# exported below this guard does not exist in cron, in `ssh host '<cmd>'`, or
+# in a script-driven `bash -c` — exactly the shells that run kbots tooling
+# unattended. The export has to go ABOVE it.
+_PROFILE_GUARDS = (
+    re.compile(r"^\s*case\s+\$-\s+in"),                        # case $- in *i*) ;; *) return;; esac
+    re.compile(r"^\s*\[\s*-z\s+[\"']?\$PS1[\"']?\s*\]\s*&&\s*return"),   # [ -z "$PS1" ] && return
+    re.compile(r"^\s*\[\[\s*\$-\s*!=\s*\*i\*\s*\]\]\s*&&\s*return"),     # [[ $- != *i* ]] && return
+)
+
+
+def _guard_index(lines: list[str]) -> int | None:
+    """Index of the interactive-shell guard, or None if the profile has none."""
+    for i, line in enumerate(lines):
+        if any(g.match(line) for g in _PROFILE_GUARDS):
+            return i
+    return None
+
+
+def _write_profile_block(profile_path: Path, block: str) -> None:
+    """Add `block` to the profile, above the interactive guard if there is one.
+
+    The block is written verbatim so _strip_profile_block still matches it.
+    """
+    content = profile_path.read_text() if profile_path.exists() else ""
+    lines = content.splitlines(keepends=True)
+    idx = _guard_index(lines)
+    if idx is None:
+        with open(profile_path, "a") as f:
+            f.write(block)
+        return
+    lines.insert(idx, block.lstrip("\n"))
+    profile_path.write_text("".join(lines))
+
+
+def _relocate_profile_block(profile_path: Path) -> bool:
+    """Move an already-installed kbots export block above the guard.
+
+    Setup's idempotency check is "is KBOTS_OVERLAY in the file", so without
+    this every host installed before the fix keeps its export stranded below
+    the guard forever and re-running setup silently leaves it there.
+    Returns True if anything moved.
+    """
+    if not profile_path.exists():
+        return False
+    lines = profile_path.read_text().splitlines(keepends=True)
+    idx = _guard_index(lines)
+    if idx is None:
+        return False
+    is_export = re.compile(r"^\s*export\s+KBOTS_(OVERLAY|MODULES)=").match
+    moved = [line for line in lines[idx:] if is_export(line)]
+    if not moved:
+        return False
+    kept = [line for i, line in enumerate(lines)
+            if not (i >= idx and (is_export(line)
+                                  or line.strip() == "# kbots environment"))]
+    new_idx = _guard_index(kept)
+    if new_idx is None:
+        return False
+    kept[new_idx:new_idx] = ["# kbots environment\n", *moved, "\n"]
+    profile_path.write_text("".join(kept))
+    return True
 
 
 def _rollback(state: dict) -> None:
