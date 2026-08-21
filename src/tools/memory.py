@@ -38,8 +38,13 @@ async def memory_store(
     # Map friendly names to DB-valid types
     type_map = {"fact": "semantic", "preference": "semantic", "episode": "episodic",
                 "procedure": "procedural", "process": "procedural"}
+    requested = type
     type = type_map.get(type, type)
-    if type not in ("semantic", "episodic", "procedural"):
+    # An unknown type used to become 'semantic' in silence, so a caller using
+    # the file-memory vocabulary ('reference', 'feedback', 'user', 'project')
+    # got a memory filed under a type it never asked for and no way to notice.
+    coerced = type not in ("semantic", "episodic", "procedural")
+    if coerced:
         type = "semantic"
     memory = _get_memory(ctx)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
@@ -54,7 +59,11 @@ async def memory_store(
         scope_target=ctx.agent_id,
     )
 
-    return f"Stored memory (id: {memory_id}): {content[:80]}..."
+    note = ""
+    if coerced:
+        note = (f"\nNote: type '{requested}' is not a valid memory type — stored as "
+                f"'semantic'. Valid types: semantic, episodic, procedural.")
+    return f"Stored memory (id: {memory_id}): {content[:80]}...{note}"
 
 
 @tool(name="memory_search", description="Search long-term memory", category="memory")
@@ -138,8 +147,16 @@ async def memory_semantic_search(
 
 
 @tool(name="memory_forget", description="Remove a memory by ID", category="memory")
-async def memory_forget(ctx: ToolContext, memory_id: int) -> str:
-    """Remove a specific memory from the database."""
+async def memory_forget(ctx: ToolContext, memory_id: str) -> str:
+    """Remove a specific memory from the database.
+
+    Args:
+        memory_id: The UUID returned by memory_store or shown by memory_search.
+    """
+    # memories.id is a TEXT column holding UUIDs, and memory_store returns one.
+    # Declaring this int made the tool impossible to call at all: no value both
+    # passed schema validation and matched a row, so no memory could ever be
+    # deleted through the documented path. The backend accepts either form.
     memory = _get_memory(ctx)
     await memory.forget(memory_id)
     return f"Memory {memory_id} removed."
