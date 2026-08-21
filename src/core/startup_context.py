@@ -17,6 +17,58 @@ logger = logging.getLogger(__name__)
 
 TEAM_FILE = resolve_config_file("team.json")
 
+# Words allowed above the question when an agent needs a decision. A number is
+# followed; "be concise" is interpreted.
+DECISION_WORD_BUDGET = 100
+
+_REPLY_CONTRACT = f"""<reply-contract>
+How to end a turn. This overrides any habit of reporting your work.
+
+Pick exactly one of three shapes.
+
+1. NOTHING NEEDED — nothing failed and no judgement of the owner's is
+   required. Reply with exactly NO_REPLY and nothing else. This is the
+   default for routine completions. A finished task is not news.
+
+2. DONE — you finished something the owner asked for and it needs no
+   decision. Two or three lines: what changed, and the one fact that proves
+   it (a count, an id, a path, a URL). No method, no narration of the route
+   you took, no list of what you checked.
+
+3. DECISION — you need the owner's judgement or taste. Use this shape, in
+   this order, at the TOP of the message:
+
+       DECISION: <one line: what is being chosen between>
+       OPTIONS:  A <one line>  /  B <one line>
+       I'D PICK: <one line, and why>
+       IF NO REPLY: <what you will do by default>
+
+   Everything above the question is at most {DECISION_WORD_BUDGET} words.
+   Evidence, reasoning and alternatives go BELOW that block, or in a file you
+   name so they can be opened on demand. Never make the owner read the
+   evidence to find the question.
+
+Rules that apply to all three:
+- Ask for one decision per message. Two questions get one answer.
+- Never ask for a decision you can make and reverse yourself. Make it, say
+  which default you took in one line, and move on.
+- Being thorough is about the work, not the message. Do the full
+  investigation, then report the part that changes what the owner does.
+- If you catch yourself explaining why something was hard, delete it.
+</reply-contract>"""
+
+
+def _build_reply_contract() -> str:
+    """The output contract every agent gets, in every session.
+
+    Concision guidance already existed as one line inside the codex index and
+    was reliably ignored: it competed with the roster, the version banner and
+    the index itself, and it was a matter of style rather than structure.
+    This is a separate block with a shape and a number, because those get
+    followed where adjectives do not.
+    """
+    return _REPLY_CONTRACT
+
 
 def _resolve_codex_index() -> Path:
     """Find the shared codex index: overlay codex/ → core codex/."""
@@ -199,7 +251,9 @@ async def build_startup_context(agent_id: str, memory=None, project_dir=None) ->
     if codex:
         blocks.append(codex)
 
-    if not blocks:
-        return None
+    # Reply contract LAST, so it is the final thing read before the owner's
+    # message. It is unconditional: an agent with no roster, no codex and no
+    # memory still has to answer in the agreed shape.
+    blocks.append(_build_reply_contract())
 
     return "\n\n".join(blocks)
