@@ -170,7 +170,7 @@ GUARDED_BASHRC = (
     "alias ll='ls -alF'\n"
 )
 
-BLOCK = "\n# kbots environment\nexport KBOTS_OVERLAY=/home/u/kbots-overlay\n"
+BLOCK = "\n# kbots environment\nexport KBOTS_OVERLAY=/srv/kbots-overlay\n"
 
 
 def _lines(text):
@@ -280,4 +280,4 @@ def test_overlay_is_detected_from_the_shell_profile_a_stale_shell_never_read(
     monkeypatch.setattr("pathlib.Path.home", staticmethod(lambda: home))
 
     found = vm.detect_overlay()
-    assert found == ("/home/u/kbots-overlay", "~/.bashrc")
+    assert found == ("/srv/kbots-overlay", "~/.bashrc")
