@@ -231,8 +231,10 @@ async def main() -> None:
 
     # --- Memory backends ---
     memory_backends = {}
+    from src.core.base import memory_config as _memory_config
+    from src.core.base import warn_on_split_store as _warn_on_split_store
+    mem_config = _memory_config(config)
     for backend_name, backend_cls in registry.memory_backends.items():
-        mem_config = defaults.get("memory", {})
         try:
             memory_backends[backend_name] = backend_cls(config=mem_config)
             logger.info(f"Memory backend: {backend_name}")
@@ -243,9 +245,16 @@ async def main() -> None:
 
     # --- Graph memory (optional, additive to sqlite; opens lazily on first use) ---
     from src.lib.graph_store import close_graph, init_graph
-    graph = init_graph(defaults.get("memory", {}))
+    graph = init_graph(mem_config)
     if graph:
         logger.info(f"Graph memory: LadybugDB ({graph.path})")
+
+    for legacy in _warn_on_split_store(config):
+        logger.warning(
+            f"Legacy memory store still present at {legacy}, outside the configured "
+            f"data_dir. Nothing reads it — confirm it is migrated, then delete it. "
+            f"Two stores is how a scrub or an audit silently reads stale data."
+        )
 
     # --- Security: HITL, rate limiting, audit, content safety ---
     from src.core.audit import AuditLog

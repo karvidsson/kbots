@@ -45,6 +45,11 @@ class SQLiteMemory(MemoryBackend):
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("PRAGMA synchronous=NORMAL")
+        # Deleting a row normally only unlinks it: the text stays readable in
+        # the freed page until something happens to overwrite it. For a store
+        # whose delete is called to honour an erasure request, that is the
+        # whole point, so pay the small write cost and zero the bytes.
+        self.db.execute("PRAGMA secure_delete=ON")
 
         self.embedding = EmbeddingEngine(model_dir=model_dir)
         self._ensure_schema()
@@ -301,17 +306,46 @@ class SQLiteMemory(MemoryBackend):
         return scored[:limit]
 
     async def forget(self, memory_id: int | str) -> None:
-        """Delete a memory by ID (string UUID or int rowid)."""
-        old = self.db.execute("SELECT content FROM memories WHERE id = ?", (str(memory_id),)).fetchone()
-        if not old:
-            # Try by rowid for backwards compat
-            old = self.db.execute("SELECT content FROM memories WHERE rowid = ?", (memory_id,)).fetchone()
-            self.db.execute("DELETE FROM memories WHERE rowid = ?", (memory_id,))
+        """Delete a memory by ID (string UUID or int rowid). Content does not survive.
+
+        Forgetting used to leave the text in the database twice over. `store`
+        writes the full content into changelog.new_value, and `forget` wrote it
+        again into changelog.old_value, so a memory deleted on request read
+        clean by SELECT and was still there in full. Both records are purged
+        here, along with the row and its FTS entry.
+
+        What remains is a content-free tombstone: which id was deleted, when,
+        and by whom. That keeps the audit trail answering "was this removed?"
+        without being a copy of the thing removed.
+        """
+        row = self.db.execute("SELECT id FROM memories WHERE id = ?",
+                              (str(memory_id),)).fetchone()
+        if row:
+            record_id = str(memory_id)
+            self.db.execute("DELETE FROM memories WHERE id = ?", (record_id,))
         else:
-            self.db.execute("DELETE FROM memories WHERE id = ?", (str(memory_id),))
-        self._log_change(None, "memories", "delete", str(memory_id),
-                         old["content"] if old else None, None)
+            # Legacy callers may pass a rowid; resolve it to the real id so the
+            # changelog purge below targets the right records.
+            row = self.db.execute("SELECT id FROM memories WHERE rowid = ?",
+                                  (memory_id,)).fetchone()
+            record_id = str(row["id"]) if row else str(memory_id)
+            self.db.execute("DELETE FROM memories WHERE rowid = ?", (memory_id,))
+
+        # Every prior trace of this record, including the insert that carried
+        # the content and any update diffs.
+        self.db.execute("DELETE FROM changelog WHERE table_name = 'memories' AND record_id = ?",
+                        (record_id,))
+        self._log_change(None, "memories", "delete", record_id, None, None)
         self.db.commit()
+
+        # secure_delete zeroes the page as written, but the pre-delete image is
+        # still sitting in the write-ahead log until it is folded back in. A
+        # checkpoint is what actually removes it from disk.
+        try:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as e:
+            logger.warning(f"forget({record_id}): WAL checkpoint failed, deleted content "
+                           f"may persist in the -wal file until the next one: {e}")
 
     # === Extended operations (used by tools and agent_manager) ===
 
