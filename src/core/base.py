@@ -36,6 +36,64 @@ def resolve_kbots_tmp() -> Path:
 KBOTS_TMP = resolve_kbots_tmp()
 
 
+def resolve_overlay() -> Path | None:
+    """The deployment overlay root, or None on an engine-local install."""
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) if overlay else None
+
+
+def agent_session_dirs(extra_dirs=None, configured=None) -> list[str]:
+    """Directories an agent session may reach beyond its own agent directory.
+
+    A CLI agent enforces a working-DIRECTORY boundary on top of the permission
+    allow-list, and the two are separate gates. `Read($KBOTS_TMP/**)` in
+    settings.json is therefore not enough on its own: the path has to be inside
+    the session's directory set as well. Without the shared temp dir there, an
+    agent produces a screenshot, a chart or a PDF through an MCP tool and is
+    then refused permission to open the file it just made. The tool reports
+    success and a path, the read is denied, and nothing in the refusal names
+    the real cause. Every visual task degrades into guesswork.
+
+    The codex is here for the same reason. Each agent's startup context lists
+    the shared documents and tells it to open the file when the work touches
+    it, which is not an instruction an agent can follow if the directory is out
+    of bounds.
+
+    Nothing else is granted by default. The overlay root holds config/
+    (including the encrypted vault), data/ (every agent's memory, turns and
+    audit log) and agents/<other-agent>/, so widening to it is a change to the
+    isolation model rather than a path fix. `defaults.sandbox.additional_dirs`
+    exists for a deployment that wants it, deliberately.
+
+    Only directories that exist are returned: --add-dir on a missing path is
+    refused, which would take the whole session down rather than just that one
+    directory.
+    """
+    candidates: list[str] = [str(resolve_kbots_tmp())]
+    overlay = resolve_overlay()
+    if overlay:
+        candidates.append(str(overlay / "codex"))
+    candidates += [str(d) for d in (configured or [])]
+    candidates += [str(d) for d in (extra_dirs or [])]
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in candidates:
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.is_dir():
+            out.append(key)
+        else:
+            logger.warning(
+                f"Agent workspace directory does not exist, not granting it: {key}")
+    return out
+
+
 def resolve_data_dir(config: dict) -> Path:
     """The deployment's data directory, absolute.
 

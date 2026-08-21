@@ -69,6 +69,17 @@ defaults:
   session:
     max_history: 50
     summarize_after: 30
+  # Agent sandbox: which directories a CLI agent session may reach outside its
+  # own agent folder. The shared temp dir ($KBOTS_TMP, where every media tool
+  # writes) and the codex are granted to every agent automatically — an agent
+  # that cannot open the screenshot it just produced is broken by construction.
+  #
+  # Add more here only deliberately. The overlay ROOT is not granted by default
+  # because it holds config/ (the encrypted vault), data/ (every agent's memory,
+  # turns and audit log) and agents/<other-agent>/, so adding it widens what an
+  # assistant-tier agent can read to the whole deployment.
+  sandbox:
+    additional_dirs: []        # e.g. ["/opt/kbots-overlay/skills"]
   memory:
     backend: sqlite
     semantic_search: false
