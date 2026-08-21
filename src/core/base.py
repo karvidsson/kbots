@@ -36,6 +36,69 @@ def resolve_kbots_tmp() -> Path:
 KBOTS_TMP = resolve_kbots_tmp()
 
 
+def resolve_data_dir(config: dict) -> Path:
+    """The deployment's data directory, absolute.
+
+    `kbots.data_dir` is the one place a deployment says where its state lives.
+    """
+    d = Path(config.get("kbots", {}).get("data_dir", "./data"))
+    return d if d.is_absolute() else (PROJECT_ROOT / d)
+
+
+def memory_config(config: dict) -> dict:
+    """`defaults.memory` with its store paths anchored to the data dir.
+
+    Both memory stores took a relative default and resolved it against
+    PROJECT_ROOT, so `data_dir` never governed either one. Pointing data_dir at
+    an overlay moved the training corpus, the audit log and version.json and
+    silently left memory behind, producing two divergent stores with the config
+    naming the one nothing was writing to. A scrub or an audit run against the
+    configured path read a stale database and reported success.
+
+    An explicit `path` in config still wins; this only supplies the default.
+    """
+    cfg = dict(config.get("defaults", {}).get("memory", {}) or {})
+    data_dir = resolve_data_dir(config)
+    cfg.setdefault("path", str(data_dir / "memory.db"))
+    graph = dict(cfg.get("graph") or {})
+    if graph:
+        graph.setdefault("path", str(data_dir / "graph" / "memory.lbdb"))
+        cfg["graph"] = graph
+
+    # A relative store path is the trap that caused this. It reads as
+    # configured, and then resolves against PROJECT_ROOT rather than the data
+    # dir, landing the store somewhere the config never mentions. Rewriting it
+    # silently would be its own surprise, so say it instead.
+    for label, p in (("defaults.memory.path", cfg.get("path")),
+                     ("defaults.memory.graph.path", graph.get("path"))):
+        if p and not Path(p).is_absolute():
+            logger.warning(
+                f"{label} = {p!r} is relative, so it resolves against {PROJECT_ROOT} "
+                f"and NOT against data_dir ({data_dir}). Make it absolute, or drop "
+                f"the key to take the data_dir default."
+            )
+    return cfg
+
+
+def warn_on_split_store(config: dict) -> list[str]:
+    """Names of stores that also exist, non-empty, at the pre-data_dir location.
+
+    A leftover is not an error — it is the old store after a cutover. But it is
+    the exact shape of the bug above, so it must never again be silent.
+    """
+    stale: list[str] = []
+    if resolve_data_dir(config).resolve() == (PROJECT_ROOT / "data").resolve():
+        return stale
+    for rel in ("memory.db", "graph/memory.lbdb"):
+        legacy = PROJECT_ROOT / "data" / rel
+        try:
+            if legacy.is_file() and legacy.stat().st_size > 0:
+                stale.append(str(legacy))
+        except OSError:
+            continue
+    return stale
+
+
 def resolve_vault_key_file() -> Path:
     """Resolve the vault key file path.
 
