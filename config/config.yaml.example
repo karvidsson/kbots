@@ -124,6 +124,26 @@ schedules:
 identity:
   reconcile_on_boot: false
 
+# Platform updates: on the first boot after a deploy, kbots posts what changed
+# and the commits that landed. Leave updates_channel empty and the notice goes
+# to security.alert_channel, which is where it has always gone. Set it (or let
+# server auto-setup create #platform-updates) to separate "the platform
+# changed" from "something attacked your agent" — different audiences.
+platform:
+  updates_channel: ""        # e.g. "YOUR_PLATFORM_UPDATES_CHANNEL_ID"
+
+# Server auto-setup: when the main agent's bot is invited to a Discord server
+# for the first time, kbots creates the channels it needs and wires their IDs
+# live — approvals, schedules, alerts, platform-updates and a goals category.
+# Existing channels with those names are adopted rather than duplicated, and a
+# role already set in this file is never repointed, so it is safe on a server
+# that is already running. Re-runnable by an admin with setup_discord_server.
+#
+# The bot invite must include the Manage Channels permission or creation fails
+# with a 403; the agent reports which roles it could not set up.
+server_setup:
+  on_guild_join: true
+
 # Goal workstreams (optional): long-running multi-agent collaborations. A goal
 # gets its own auto-created Discord channel; participants (each with its own
 # bot account) are routed there dynamically from data/goals.db — no agents.yaml

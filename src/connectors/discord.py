@@ -69,6 +69,23 @@ class DiscordConnector(Connector):
         self._recent_sends: dict[str, tuple[str, float]] = {}
         # Outgoing mention resolution: (guild_id, name_lower) -> (markup|None, timestamp)
         self._mention_cache: dict[tuple[int, str], tuple[str | None, float]] = {}
+        # Server auto-setup context, set by main (the connector sees only its own
+        # config block, and provisioning has to read hitl/schedules/goals keys).
+        self._full_config: dict = {}
+        self._data_dir: str = ""
+        self._on_guild_setup = None
+
+    def set_setup_context(self, config: dict, data_dir: str, on_guild_setup=None) -> None:
+        """Give the connector what it needs to provision a newly joined server.
+
+        on_guild_setup(agent_id, guild_id, guild_name, outcomes) is awaited after
+        provisioning so the engine can hand that agent a turn. Optional: the
+        channels are created either way, because they are deterministic and must
+        not depend on an LLM turn succeeding.
+        """
+        self._full_config = config or {}
+        self._data_dir = str(data_dir or "")
+        self._on_guild_setup = on_guild_setup
 
     def set_agent_configs(self, agent_configs: dict[str, dict]) -> None:
         """Set agent configs so the connector knows which agents route to which bots."""
@@ -556,9 +573,14 @@ class DiscordBot:
         self.client.event(self.on_resumed)
         self.client.event(self.on_message)
         self.client.event(self.on_raw_reaction_add)
+        self.client.event(self.on_guild_join)
+
+        # Kept for server provisioning, which needs REST calls of its own.
+        self._token = ""
 
     async def start(self, token: str) -> None:
         """Start the bot (non-blocking — runs in background task)."""
+        self._token = token
         self._register_commands()
 
         import asyncio
@@ -601,6 +623,68 @@ class DiscordBot:
             logger.debug(f"[{self.account_name}] could not clear presence "
                          f"on shutdown: {e}")
         await self.client.close()
+
+    async def on_guild_join(self, guild) -> None:
+        """A server invited this bot: provision the channels a fleet needs.
+
+        The whole point is that the owner does nothing. Four channel roles and a
+        category are wired by ID, and copying five IDs out of Discord into YAML
+        is most of what installing kbots costs. It is also entirely mechanical,
+        so it is code here and not a prompt: existing channels are adopted,
+        anything already configured is left alone, and re-running changes
+        nothing. Only the parts that need taste, the nickname, the avatar and
+        the introduction, are handed to the agent afterwards.
+
+        One bot does this. Eight bots racing to create the same five channels
+        would produce duplicates of each, and Discord would allow all of them.
+        """
+        from src.core import server_setup
+
+        guild_id, guild_name = str(guild.id), getattr(guild, "name", "")
+        full_config = getattr(self.connector, "_full_config", {}) or {}
+        if not (full_config.get("server_setup", {}) or {}).get("on_guild_join", True):
+            logger.info(f"[{self.account_name}] joined '{guild_name}' — auto-setup "
+                        f"is disabled (server_setup.on_guild_join)")
+            return
+
+        configs = getattr(self.connector, "_agent_configs", {}) or {}
+        if not server_setup.is_setup_account(configs, self.account_name):
+            logger.info(f"[{self.account_name}] joined '{guild_name}' — another "
+                        f"bot owns server setup, doing nothing")
+            return
+
+        data_dir = getattr(self.connector, "_data_dir", "") or "data"
+        if server_setup.guild_is_set_up(data_dir, guild_id):
+            logger.info(f"[{self.account_name}] re-joined '{guild_name}' "
+                        f"({guild_id}) — already provisioned, doing nothing")
+            return
+
+        logger.info(f"[{self.account_name}] joined '{guild_name}' ({guild_id}) "
+                    f"— provisioning kbots channels")
+        try:
+            outcomes = await server_setup.provision_guild(
+                guild_id, self._token, full_config)
+            server_setup.wire(outcomes)
+        except Exception as e:
+            logger.error(f"Server setup failed for guild {guild_id}: {e}", exc_info=True)
+            return
+
+        for out in outcomes:
+            logger.info(f"  setup {out.key}: {out.action} {out.channel_id or out.detail}")
+        server_setup.record_guild_setup(data_dir, guild_id, {
+            "name": guild_name,
+            "channels": {o.key: o.channel_id for o in outcomes if o.channel_id},
+            "failed": [o.key for o in outcomes if o.action == "failed"],
+        })
+
+        from src.core.identity_boot import agent_for_account
+        agent_id = agent_for_account(configs, "discord", self.account_name)
+        handler = getattr(self.connector, "_on_guild_setup", None)
+        if handler and agent_id:
+            try:
+                await handler(agent_id, guild_id, guild_name, outcomes)
+            except Exception as e:
+                logger.error(f"Guild-setup turn for {agent_id} failed: {e}")
 
     async def on_ready(self) -> None:
         """Called when bot connects to Discord."""

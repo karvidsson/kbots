@@ -382,6 +382,12 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     data_dir = config.get("kbots", {}).get("data_dir", "./data")
     tool_log_db = _init_tool_log(data_dir)
 
+    # This is a separate PROCESS from the engine, so it has to pin the version
+    # location for itself. platform_version and system_audit are served from
+    # here, and they are exactly the tools asked "did the deploy take?".
+    from src.core import version as _version
+    _version.set_data_dir(data_dir)
+
     # Security alerts — send to configured Discord channel
     alerter = AlertSender(config, vault)
     if alerter.enabled:
