@@ -8,6 +8,19 @@ from src.core import browser_janitor, runtime_state, tool_reservation
 from src.core.browser_janitor import _FLAG, _RESOURCE, BrowserJanitor
 
 
+@pytest.fixture(autouse=True)
+def _unsupervised(monkeypatch):
+    """Pin the janitor's stand-down check off for the idle-logic tests.
+
+    `_supervised()` reads the real ~/Library/LaunchAgents. Left unstubbed these
+    tests pass on a machine without the chrome-debug LaunchAgent and fail on one
+    that has it, which is a test suite that reports on the developer's laptop
+    rather than on the code. Supervision has its own tests in
+    test_browser_janitor_supervision.py.
+    """
+    monkeypatch.setattr(browser_janitor, "_supervised", lambda: False)
+
+
 @pytest.fixture
 def overlay(tmp_path, monkeypatch):
     monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
