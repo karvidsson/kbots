@@ -1,0 +1,283 @@
+"""Three defects a fresh Linux VPS install hit, and the shell-profile trap.
+
+None of these reproduce on the developer's own box, which is why they survived:
+a hardened systemd unit, a non-interactive shell and an all-tools agent are all
+things a production install has and a dev checkout does not.
+"""
+
+import json
+import types
+
+import pytest
+
+from src.core import schedules as sched
+from src.core.agent_manager import AgentManager
+from src.core.tools import tool
+
+
+@pytest.fixture
+def overlay(tmp_path, monkeypatch):
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    (tmp_path / "config").mkdir()
+    return tmp_path
+
+
+# --- 1. `tools: "all"` refused every tool on the dispatch path ---------------
+
+@tool(name="vps_ping", description="test tool", category="test")
+async def vps_ping(ctx, target: str = "") -> str:
+    return f"pinged {target}"
+
+
+def _bare_manager(tools):
+    """A manager with only what _dispatch_tools touches, so the real method runs."""
+    mgr = AgentManager.__new__(AgentManager)
+    mgr.agent_configs = {"bot": {"tools": tools}}
+    mgr.rate_limiter = None
+    mgr.access_control = None
+    mgr.hitl = None
+    mgr.audit = None
+    mgr.storage = None
+    mgr.behavior_monitor = None
+    mgr.alerter = None
+    mgr.vault = None
+    mgr._get_agent_memory = lambda agent_id: None
+    return mgr
+
+
+def _message():
+    return types.SimpleNamespace(channel_id="c1", user_id="u1", raw=None)
+
+
+@pytest.mark.asyncio
+async def test_all_sentinel_is_not_a_substring_test():
+    """`tool_name not in "all"` is three characters, not an allowlist.
+
+    Every tool name failed that test, so an agent configured `tools: all`
+    could never run a scheduled action or a trigger even though the CLI and
+    MCP paths allowed it the same tool.
+    """
+    mgr = _bare_manager("all")
+    results = await mgr._dispatch_tools(
+        "bot", "s1", [{"name": "vps_ping", "arguments": '{"target": "x"}'}], None, _message())
+    assert results[0]["content"] == "pinged x"
+    assert "not available" not in results[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_allowlist_still_refuses_what_is_not_on_it():
+    mgr = _bare_manager(["something_else"])
+    results = await mgr._dispatch_tools(
+        "bot", "s1", [{"name": "vps_ping", "arguments": "{}"}], None, _message())
+    assert "not available to this agent" in results[0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_explicit_allowlist_permits_a_listed_tool():
+    mgr = _bare_manager(["vps_ping"])
+    results = await mgr._dispatch_tools(
+        "bot", "s1", [{"name": "vps_ping", "arguments": '{"target": "y"}'}], None, _message())
+    assert results[0]["content"] == "pinged y"
+
+
+# --- 2. the schedule store has to live somewhere writable -------------------
+
+def test_store_is_written_under_data_not_the_overlay_root(overlay):
+    """ProtectSystem=strict leaves the overlay ROOT read-only.
+
+    Writes there failed silently, so `last_run` was never recorded and a
+    `once` schedule re-fired on every tick, forever.
+    """
+    sched.set_enabled(True)
+    assert (overlay / "data" / "schedules.json").exists()
+    assert not (overlay / "schedules.json").exists()
+
+
+def test_a_legacy_root_store_is_still_read(overlay):
+    (overlay / "schedules.json").write_text(json.dumps(
+        {"enabled": True, "schedules": [{"id": "s1", "enabled": True}]}))
+    assert len(sched._load_doc()["schedules"]) == 1
+
+
+def test_a_legacy_store_migrates_forward_on_the_next_save(overlay):
+    (overlay / "schedules.json").write_text(json.dumps(
+        {"enabled": True, "schedules": [{"id": "s1", "enabled": True}]}))
+    sched.set_enabled(False)
+    migrated = json.loads((overlay / "data" / "schedules.json").read_text())
+    assert migrated["schedules"][0]["id"] == "s1"
+    assert migrated["enabled"] is False
+
+
+def test_the_current_store_wins_over_a_stale_legacy_one(overlay):
+    (overlay / "schedules.json").write_text(json.dumps(
+        {"enabled": True, "schedules": [{"id": "old", "enabled": True}]}))
+    (overlay / "data").mkdir()
+    (overlay / "data" / "schedules.json").write_text(json.dumps(
+        {"enabled": True, "schedules": [{"id": "new", "enabled": True}]}))
+    assert sched._load_doc()["schedules"][0]["id"] == "new"
+
+
+# --- 3. an unwritable store must fire nothing, loudly -----------------------
+
+def _once_due(overlay, now):
+    (overlay / "data").mkdir(exist_ok=True)
+    (overlay / "data" / "schedules.json").write_text(json.dumps({
+        "enabled": True,
+        "schedules": [{"id": "s1", "agent_id": "bot", "channel_id": "c1",
+                       "enabled": True, "spec_type": "once", "spec": str(now - 1),
+                       "last_run": 0, "run_count": 0}],
+    }))
+
+
+def test_a_once_schedule_that_fires_records_it(overlay):
+    _once_due(overlay, 1_000_000)
+    assert len(sched.due_schedules(1_000_000)) == 1
+    doc = json.loads((overlay / "data" / "schedules.json").read_text())
+    assert doc["schedules"][0]["enabled"] is False
+    assert sched.due_schedules(1_000_000) == []
+
+
+def test_an_unwritable_store_fires_nothing_and_logs(overlay, monkeypatch, caplog):
+    """Fail CLOSED.
+
+    The old code wrapped the save in contextlib.suppress(Exception), so a
+    read-only store produced no log line and no error while the same `once`
+    schedule fired every 30 seconds indefinitely. Firing work whose state
+    cannot be recorded is what makes that loop.
+    """
+    _once_due(overlay, 1_000_000)
+
+    def boom(doc):
+        raise PermissionError("Read-only file system")
+
+    monkeypatch.setattr(sched, "_save_doc", boom)
+    with caplog.at_level("ERROR"):
+        assert sched.due_schedules(1_000_000) == []
+    assert "Read-only file system" in caplog.text
+
+
+# --- 4. the export has to sit above the interactive guard -------------------
+
+GUARDED_BASHRC = (
+    "# ~/.bashrc\n"
+    "\n"
+    "# If not running interactively, don't do anything\n"
+    "case $- in\n"
+    "    *i*) ;;\n"
+    "      *) return;;\n"
+    "esac\n"
+    "\n"
+    "alias ll='ls -alF'\n"
+)
+
+BLOCK = "\n# kbots environment\nexport KBOTS_OVERLAY=/srv/kbots-overlay\n"
+
+
+def _lines(text):
+    return text.splitlines()
+
+
+def _index_of(text, needle):
+    return next(i for i, line in enumerate(_lines(text)) if needle in line)
+
+
+def test_a_fresh_write_lands_above_the_guard(tmp_path):
+    import setup as setup_mod
+    p = tmp_path / ".bashrc"
+    p.write_text(GUARDED_BASHRC)
+    setup_mod._write_profile_block(p, BLOCK)
+    text = p.read_text()
+    assert _index_of(text, "export KBOTS_OVERLAY") < _index_of(text, "case $- in")
+
+
+def test_a_profile_with_no_guard_is_appended_to(tmp_path):
+    import setup as setup_mod
+    p = tmp_path / ".zshrc"
+    p.write_text("alias ll='ls -alF'\n")
+    setup_mod._write_profile_block(p, BLOCK)
+    assert p.read_text().endswith(BLOCK)
+
+
+def test_the_written_block_is_verbatim_so_undo_still_matches(tmp_path):
+    import setup as setup_mod
+    p = tmp_path / ".bashrc"
+    p.write_text(GUARDED_BASHRC)
+    setup_mod._write_profile_block(p, BLOCK)
+    setup_mod._strip_profile_block(p, BLOCK)
+    assert "KBOTS_OVERLAY" not in p.read_text()
+
+
+def test_an_already_installed_host_gets_its_export_moved_up(tmp_path):
+    """Setup's idempotency check is "is KBOTS_OVERLAY in the file".
+
+    Without a migration branch, every host installed before the fix keeps its
+    export stranded below the guard forever and re-running setup leaves it
+    there while reporting success.
+    """
+    import setup as setup_mod
+    p = tmp_path / ".bashrc"
+    p.write_text(GUARDED_BASHRC + BLOCK)
+    assert setup_mod._relocate_profile_block(p) is True
+    text = p.read_text()
+    assert _index_of(text, "export KBOTS_OVERLAY") < _index_of(text, "case $- in")
+    assert text.count("export KBOTS_OVERLAY") == 1
+    assert "alias ll='ls -alF'" in text
+
+
+def test_relocation_is_a_no_op_once_the_export_is_already_above(tmp_path):
+    import setup as setup_mod
+    p = tmp_path / ".bashrc"
+    p.write_text(GUARDED_BASHRC)
+    setup_mod._write_profile_block(p, BLOCK)
+    before = p.read_text()
+    assert setup_mod._relocate_profile_block(p) is False
+    assert p.read_text() == before
+
+
+def test_the_ps1_guard_form_is_recognised_too(tmp_path):
+    import setup as setup_mod
+    p = tmp_path / ".bashrc"
+    p.write_text('[ -z "$PS1" ] && return\n\nalias ll=\'ls -alF\'\n')
+    setup_mod._write_profile_block(p, BLOCK)
+    text = p.read_text()
+    assert _index_of(text, "export KBOTS_OVERLAY") < _index_of(text, "$PS1")
+
+
+# --- 5. an unset variable is not evidence of an engine-local install --------
+
+def test_overlay_is_detected_from_the_service_unit(tmp_path, monkeypatch):
+    """Answering "y" to the old prompt wrote secrets the service never reads."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "vault_manage", str(__import__("pathlib").Path(__file__).parent.parent / "vault-manage.py"))
+    vm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vm)
+
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    home = tmp_path / "home"
+    (home / ".config/systemd/user").mkdir(parents=True)
+    (home / ".config/systemd/user/kbots.service").write_text(
+        "[Service]\nEnvironment=KBOTS_OVERLAY=/srv/kbots-overlay\n")
+    monkeypatch.setattr("pathlib.Path.home", staticmethod(lambda: home))
+
+    found = vm.detect_overlay()
+    assert found is not None
+    assert found[0] == "/srv/kbots-overlay"
+
+
+def test_overlay_is_detected_from_the_shell_profile_a_stale_shell_never_read(
+        tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "vault_manage", str(__import__("pathlib").Path(__file__).parent.parent / "vault-manage.py"))
+    vm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vm)
+
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".bashrc").write_text(GUARDED_BASHRC + BLOCK)
+    monkeypatch.setattr("pathlib.Path.home", staticmethod(lambda: home))
+
+    found = vm.detect_overlay()
+    assert found == ("/srv/kbots-overlay", "~/.bashrc")

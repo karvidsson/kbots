@@ -1322,9 +1322,12 @@ class AgentManager:
                 })
                 continue
 
-            # Check tool is in agent's allowlist
+            # Check tool is in agent's allowlist. "all" is a sentinel STRING,
+            # not a list: `tool_name not in "all"` is a substring test against
+            # three characters, so it refused every tool an all-tools agent
+            # asked for on this path while the CLI/MCP path allowed them.
             agent_tools = self.agent_configs[agent_id].get("tools", [])
-            if tool_name not in agent_tools:
+            if agent_tools != "all" and tool_name not in agent_tools:
                 logger.warning(f"Agent {agent_id} tried to use non-allowed tool: {tool_name}")
                 results.append({
                     "name": tool_name,

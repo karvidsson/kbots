@@ -259,12 +259,73 @@ def cmd_migrate_salt(v):
     print(f"  Vault re-encrypted with new key. Total secrets: {len(v.list_keys())}")
 
 
+def detect_overlay() -> tuple[str, str] | None:
+    """Find the overlay this host actually runs, and say where the answer came from.
+
+    An unset KBOTS_OVERLAY does NOT mean "engine-local install". The variable
+    is exported from a shell profile, so any shell opened before setup ran, and
+    every non-interactive shell on Debian (the profile export sits below the
+    interactive guard), sees it unset on a perfectly normal overlay install.
+    Inferring engine-local from that sends secrets to a file the service never
+    reads, and answering "y" at the old prompt did exactly that.
+
+    So look at what is installed rather than at the environment.
+    """
+    import os
+    import re
+    env = os.environ.get("KBOTS_OVERLAY")
+    if env:
+        return env, "KBOTS_OVERLAY"
+
+    # The service unit is authoritative: it is what the running engine reads.
+    for unit in (Path("/etc/systemd/system/kbots.service"),
+                 Path("/etc/systemd/system/k-agents.service"),
+                 Path.home() / ".config/systemd/user/kbots.service"):
+        try:
+            m = re.search(r"^Environment=KBOTS_OVERLAY=(.+)$", unit.read_text(), re.M)
+        except OSError:
+            continue
+        if m:
+            return m.group(1).strip(), str(unit)
+    plist = Path.home() / "Library/LaunchAgents/com.kbots.agent.plist"
+    try:
+        m = re.search(r"<key>KBOTS_OVERLAY</key>\s*<string>([^<]+)</string>",
+                      plist.read_text())
+        if m:
+            return m.group(1).strip(), str(plist)
+    except OSError:
+        pass
+
+    # No unit (a fresh install, or a user-run engine): the shell profile still
+    # records the intent even when the current shell never sourced it.
+    for profile in (Path.home() / ".bashrc", Path.home() / ".zshrc",
+                    Path.home() / ".profile"):
+        try:
+            m = re.search(r"^\s*export\s+KBOTS_OVERLAY=(.+)$", profile.read_text(), re.M)
+        except OSError:
+            continue
+        if m:
+            return m.group(1).strip().strip('"\''), f"~/{profile.name}"
+    return None
+
+
 def main():
     import os
+    detected = detect_overlay()
+    if detected and not os.environ.get("KBOTS_OVERLAY"):
+        overlay, source = detected
+        if (Path(overlay) / "config").is_dir():
+            os.environ["KBOTS_OVERLAY"] = overlay
+            print("\n  KBOTS_OVERLAY was unset in this shell — using the overlay this")
+            print(f"  host is installed with, found in {source}:")
+            print(f"      {overlay}")
+        else:
+            detected = None
+
     vault_path = resolve_config_file("secrets.enc")
     if not os.environ.get("KBOTS_OVERLAY"):
-        print("\n  ⚠️  KBOTS_OVERLAY is not set — falling back to the vault inside the")
-        print(f"      engine checkout: {vault_path}")
+        print("\n  ⚠️  No overlay install detected — falling back to the vault inside")
+        print(f"      the engine checkout: {vault_path}")
         print("      On an overlay-based install the service does NOT read this file,")
         print("      so secrets saved here will never reach the bots. Set KBOTS_OVERLAY")
         print("      to your overlay path and re-run unless this is intentional.")
