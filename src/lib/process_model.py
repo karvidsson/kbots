@@ -39,6 +39,11 @@ _LIST_KEYS_PROCESS = ("trigger", "end_states", "actors", "steps", "edges", "exce
 _LIST_KEYS_WARDLEY = ("anchors", "components", "links", "flows", "pipelines", "notes",
                       "climatic_patterns", "open_questions")
 
+# Scalar top-level keys, so an unrecognised one can be named back to the caller.
+# `updated` is stamped by process_model_save itself and is not caller input.
+_SCALAR_KEYS_PROCESS = ("kind", "title", "purpose", "scope", "direction", "updated")
+_SCALAR_KEYS_WARDLEY = ("kind", "title", "purpose", "updated")
+
 
 # ---------------------------------------------------------------------------
 # Normalise + validate
@@ -72,7 +77,13 @@ def normalize(model: dict) -> dict:
         m["steps"] = [({"label": s} if isinstance(s, str) else dict(s)) for s in m["steps"]]
         for i, s in enumerate(m["steps"]):
             s.setdefault("id", f"s{i + 1}")
-            s.setdefault("label", s["id"])
+            # Fall back to `name` before `id`, matching what actors already do
+            # a few lines up. Without this a step written as {"id","name"} —
+            # the obvious shape, and the one actors use — rendered every box as
+            # its own id, which reads as a broken renderer rather than a
+            # mislabelled field.
+            if not s.get("label"):
+                s["label"] = s.get("name") or s["id"]
             s.setdefault("type", "task")
             for k in ("systems", "inputs", "outputs"):
                 v = s.get(k)
@@ -89,6 +100,17 @@ def normalize(model: dict) -> dict:
         m["components"] = [({"name": c} if isinstance(c, str) else dict(c)) for c in m["components"]]
         m["links"] = [_coerce_link(lk) for lk in m["links"]]
         m["flows"] = [_coerce_link(lk) for lk in m["flows"]]
+        # Wardley links address components by name, while process edges address
+        # steps by id. Someone carrying the habit across writes {"from":"c1"}
+        # and gets "unknown component" for a component that plainly exists. If
+        # an entry carries an `id`, accept it and resolve to the name here, so
+        # validation, the SVG emitter and the OWM output all agree.
+        by_id = {str(c["id"]): c["name"] for c in m["components"] + m["anchors"]
+                 if c.get("id") and c.get("name")}
+        if by_id:
+            for lk in m["links"] + m["flows"]:
+                for end in ("from", "to"):
+                    lk[end] = by_id.get(str(lk.get(end)), lk.get(end))
         m["notes"] = [({"text": n} if isinstance(n, str) else dict(n)) for n in m["notes"]]
         m["open_questions"] = [({"question": q} if isinstance(q, str) else dict(q))
                                for q in m["open_questions"]]
@@ -114,6 +136,17 @@ def validate(model: dict) -> tuple[list[str], list[str]]:
         return errors, warnings
     if not (model.get("title") or "").strip():
         warnings.append("title is empty")
+
+    # An unrecognised top-level key was kept verbatim by the patch-merge and
+    # then read by nothing. Content written into one persists, validates clean
+    # and never appears in any diagram, so the renderer looks like it dropped
+    # the work. Say the key is unknown instead.
+    known = ((_LIST_KEYS_WARDLEY + _SCALAR_KEYS_WARDLEY) if kind == "wardley"
+             else (_LIST_KEYS_PROCESS + _SCALAR_KEYS_PROCESS))
+    unknown = sorted(k for k in model if k not in known)
+    if unknown:
+        warnings.append(f"unknown top-level key(s) {unknown} — stored but never rendered. "
+                        f"Known keys for kind='{kind}': {sorted(known)}")
 
     if kind == "process":
         ids = [s["id"] for s in model["steps"]]
@@ -150,6 +183,18 @@ def validate(model: dict) -> tuple[list[str], list[str]]:
                 elif any(not (e.get("label") or e.get("condition")) for e in outs):
                     warnings.append(f"decision '{s['label']}' has unlabeled outgoing edges")
     else:
+        # A component or anchor with no name used to escape here as a bare
+        # KeyError ("Error executing tool process_model_save: 'name'"), naming
+        # neither the list nor the entry. Report it and stop: every check below
+        # is keyed on name, so continuing would only produce noise.
+        for key in ("components", "anchors"):
+            for i, item in enumerate(model[key]):
+                if not str(item.get("name") or "").strip():
+                    errors.append(f"{key}[{i}] has no 'name' — a Wardley "
+                                  f"component/anchor is identified by its name: {item}")
+        if errors:
+            return errors, warnings
+
         names = [c["name"] for c in model["components"]] + [a["name"] for a in model["anchors"]]
         dupes = {n for n in names if names.count(n) > 1}
         if dupes:
@@ -177,7 +222,10 @@ def validate(model: dict) -> tuple[list[str], list[str]]:
         vis = {n["name"]: float(n.get("visibility", 0.5) or 0.5) for n in model["components"] + model["anchors"]}
         for link in model["links"] + model["flows"]:
             if link.get("from") not in nameset or link.get("to") not in nameset:
-                errors.append(f"link {link.get('from')} -> {link.get('to')}: unknown component")
+                errors.append(
+                    f"link {link.get('from')} -> {link.get('to')}: unknown component. "
+                    f"Wardley links reference component/anchor NAMES (or an 'id' you "
+                    f"gave the component). Known names: {sorted(nameset)}")
             elif vis.get(link["from"], 0) + 1e-9 < vis.get(link["to"], 0):
                 warnings.append(f"link {link['from']} -> {link['to']}: dependency points upwards "
                                 "(the dependent should be more visible than what it depends on)")
