@@ -52,13 +52,22 @@ CYAN = "\033[36m"
 RESET = "\033[0m"
 
 
-def banner():
-    print(f"""
-{BOLD}{CYAN}╔══════════════════════════════════════╗
-║           kbots Setup Wizard         ║
-║    The Agent Routing System          ║
-╚══════════════════════════════════════╝{RESET}
-""")
+TAGLINE = "one process · LLM-agnostic · trains itself"
+
+
+def banner(title: str = "kbots Setup Wizard"):
+    """Boxed banner, built rather than hand-drawn.
+
+    The two hand-drawn boxes had drifted: settings.py rendered 38 characters
+    inside a 40-character border, so it printed crooked. Centring in code means
+    a retitle cannot misalign it again.
+    """
+    lines = [title, TAGLINE]
+    inner = max(len(line) for line in lines) + 8
+    top = "╔" + "═" * inner + "╗"
+    bottom = "╚" + "═" * inner + "╝"
+    body = "\n".join(f"║{line.center(inner)}║" for line in lines)
+    print(f"\n{BOLD}{CYAN}{top}\n{body}\n{bottom}{RESET}\n")
 
 
 def header(text: str):
