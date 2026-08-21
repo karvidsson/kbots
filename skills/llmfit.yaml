@@ -1,0 +1,23 @@
+name: llmfit
+description: Show which local LLM models this machine can run, ranked by hardware fit
+parameters:
+  - name: use_case
+    type: string
+    choices: [general, coding, reasoning, chat, multimodal, embedding]
+    required: false
+    description: Filter recommendations by use case (optional — omit to rank across all)
+prompt: |
+  Run the llmfit_scan tool to find out what local LLM models this machine can
+  run. Use case filter: {use_case} (if "None", no filter was requested — scan
+  everything).
+
+  Then answer briefly and readably:
+  - One line on the hardware (CPU, RAM, GPU/VRAM).
+  - The top models, each with fit level, rough speed, and disk size — flag any
+    that are already installed.
+  - One closing recommendation: which single model to try first and why.
+
+  Keep it short; the raw table is already in the tool output, so summarise —
+  don't repeat every field.
+tools:
+  - llmfit_scan
