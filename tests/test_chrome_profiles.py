@@ -24,7 +24,7 @@ def overlay(tmp_path, monkeypatch):
 def chrome(overlay, monkeypatch):
     """chrome_browser with consent pre-granted and no real Chrome in the picture."""
     monkeypatch.setattr(chrome_desktop.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(chrome_desktop, "_port_up", lambda: False)
+    monkeypatch.setattr(chrome_desktop, "_port_up", lambda port: False)
     for agent in ("atlas", "milo"):
         session_consent.grant(agent, chrome_desktop.CHROME_CAP)
     return chrome_desktop.chrome_browser
@@ -118,22 +118,22 @@ async def test_status_without_debug_dir_stays_quiet(chrome, tmp_path, monkeypatc
 
 async def test_profile_actions_never_create_windows_implicitly(chrome, monkeypatch):
     """click/fill/etc. on an unpinned profile must refuse, not open a window."""
-    monkeypatch.setattr(chrome_desktop, "_port_up", lambda: True)
+    monkeypatch.setattr(chrome_desktop, "_port_up", lambda port: True)
 
-    async def _fake_connect():
+    async def _fake_connect(inst):
         class _Browser:
             def is_connected(self):
                 return True
-        chrome_desktop._state.update(browser=_Browser())
+        chrome_desktop._st(inst).update(browser=_Browser())
         return object()   # stands in for the default page
 
     monkeypatch.setattr(chrome_desktop, "_connect", _fake_connect)
     monkeypatch.setattr(chrome_desktop, "_ensure_chrome",
-                        lambda auto_launch: _none())
+                        lambda inst, auto_launch: _none())
     out = await chrome(_ctx("atlas"), "click", selector="button",
                        profile="flow", auto_launch=False)
     assert "No open window for profile 'flow'" in out
-    chrome_desktop._state.clear()
+    chrome_desktop._instances.clear()
 
 
 async def _none():

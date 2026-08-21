@@ -48,7 +48,7 @@ async def test_grant_then_unlock_then_revoke(overlay, monkeypatch):
     monkeypatch.setattr(chrome_desktop.platform, "system", lambda: "Darwin")
     # Simulate "no debug Chrome" deterministically — otherwise a debug Chrome
     # actually running on the port (e.g. from a live session) changes the message.
-    monkeypatch.setattr(chrome_desktop, "_port_up", lambda: False)
+    monkeypatch.setattr(chrome_desktop, "_port_up", lambda port: False)
     ctx = ToolContext(agent_id="atlas", channel_id="c", user_id="u")
 
     assert "granted" in await chrome_desktop.chrome_browser(ctx, "grant")

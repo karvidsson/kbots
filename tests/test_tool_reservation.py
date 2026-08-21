@@ -173,7 +173,7 @@ def test_concurrent_acquire_has_exactly_one_winner(overlay):
 def chrome(overlay, monkeypatch):
     """chrome_browser with consent pre-granted and no real Chrome in the picture."""
     monkeypatch.setattr(chrome_desktop.platform, "system", lambda: "Darwin")
-    monkeypatch.setattr(chrome_desktop, "_port_up", lambda: False)
+    monkeypatch.setattr(chrome_desktop, "_port_up", lambda port: False)
     for agent in ("atlas", "milo"):
         session_consent.grant(agent, chrome_desktop.CHROME_CAP)
     return chrome_desktop.chrome_browser
@@ -203,7 +203,7 @@ async def test_gate_refuses_before_launching_chrome(chrome, monkeypatch):
     """A blocked agent must not start a browser as a side effect."""
     launched = []
 
-    async def _spy(auto_launch):
+    async def _spy(inst, auto_launch):
         launched.append(auto_launch)
         return "stubbed — no Chrome started"
 

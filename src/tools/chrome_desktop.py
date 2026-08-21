@@ -25,14 +25,17 @@ the agent across restarts. Revoking = deleting the profile's directory.
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
 import re
 import socket
+import subprocess
 import tempfile
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 from src.core import tool_reservation
 from src.core.base import KBOTS_TMP, PROJECT_ROOT, ToolContext
@@ -65,42 +68,130 @@ _RESERVED_ACTIONS = ("open", "login", "click", "fill", "get_text", "screenshot",
 _ALTERNATIVE = ("Use the `browser` tool instead — it is headless and per-session "
                 "isolated, so it is safe to run concurrently.")
 
-# Single attached-Chrome connection, reused across calls.
-# _state["profile_pages"] maps profile name -> pinned Page for that profile's window.
-_state: dict = {}
+class _Instance(NamedTuple):
+    """One debug-Chrome instance: the shared default, or an agent's dedicated one."""
+    port: int
+    dir: Path
+    dedicated: bool = False
+
+    @property
+    def resource(self) -> str:
+        # Dedicated instances take turns among themselves, not with the shared one.
+        return RESOURCE if self.port == DEBUG_PORT else f"{RESOURCE}:{self.port}"
+
+
+# Per-instance attach state, keyed by port. Each value holds pw/browser/context/
+# page plus "profile_pages" (profile name -> pinned Page for that window).
+_instances: dict[int, dict] = {}
+
+
+def _st(inst: "_Instance") -> dict:
+    return _instances.setdefault(inst.port, {})
 
 
 def _debug_dir() -> Path:
-    """The user-data-dir of the debug Chrome (mirror of chrome-debug.sh)."""
+    """The user-data-dir of the shared debug Chrome (mirror of chrome-debug.sh)."""
     return Path(os.environ.get("KBOTS_CHROME_DEBUG_DIR",
                                str(Path.home() / ".kbots-chrome-debug")))
 
 
+def _instance_for(ctx: ToolContext) -> _Instance:
+    """Resolve which debug Chrome this agent drives.
+
+    Default: the shared instance (DEBUG_PORT, ~/.kbots-chrome-debug). An agent
+    with a `chrome_instance: {port: N, dir: ...}` block in agents.yaml gets its
+    own Chrome — real cookie isolation, its own launchd job, its own turn-taking.
+    """
+    cfg = None
+    mgr = getattr(ctx, "agent_manager", None)
+    if mgr is not None:
+        try:
+            cfg = (mgr.agent_configs.get(ctx.agent_id) or {}).get("chrome_instance")
+        except Exception:
+            cfg = None
+    if not isinstance(cfg, dict) or "port" not in cfg:
+        return _Instance(DEBUG_PORT, _debug_dir())
+    port = int(cfg["port"])
+    d = Path(cfg.get("dir") or (Path.home() / f".kbots-chrome-{ctx.agent_id}"))
+    return _Instance(port, d, dedicated=port != DEBUG_PORT)
 
 
-def _port_up() -> bool:
+def _endpoint_file(port: int) -> Path:
+    """Discovery file chrome-debug.sh writes on a successful start."""
+    data = Path(os.environ.get("KBOTS_OVERLAY", str(Path.home() / "kbots-overlay"))) / "data"
+    name = "chrome-debug.json" if port == DEBUG_PORT else f"chrome-debug-{port}.json"
+    return data / name
+
+
+def _port_up(port: int) -> bool:
     """True if the Chrome debug endpoint is listening."""
     try:
-        with socket.create_connection(("127.0.0.1", DEBUG_PORT), timeout=1):
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
             return True
     except OSError:
         return False
 
 
-async def _ensure_chrome(auto_launch: bool) -> str | None:
-    """Make sure a debug Chrome is running. Returns an error string, or None."""
-    if _port_up():
-        return None
+def _pid_cmdline(pid: int) -> str:
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _verify_owner(inst: _Instance) -> str | None:
+    """Confirm whoever answers on inst.port is OUR debug Chrome.
+
+    A port that answers is not enough: it has been squatted by a stray spawn
+    before, and the user's own Chrome shows the debug flag in ps while binding
+    nothing (Chrome ≥136 ignores it on the default profile) — both produce
+    confusing half-broken sessions. Identity comes from the endpoint file the
+    helper writes (pid whose cmdline names our user-data-dir), with a pgrep-style
+    fallback for a debug Chrome started before this check existed.
+    """
+    ep = _endpoint_file(inst.port)
+    try:
+        meta = json.loads(ep.read_text())
+        pid = int(meta.get("pid", 0))
+        if pid and str(inst.dir) in _pid_cmdline(pid):
+            return None  # the pid we started is alive and holds our data dir
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    # No (usable) endpoint file — accept any live Chrome that carries both our
+    # port and our data dir on its command line (pre-supervision launches).
+    try:
+        out = subprocess.run(["pgrep", "-fl", f"remote-debugging-port={inst.port}"],
+                             capture_output=True, text=True, timeout=5)
+        if any(str(inst.dir) in line for line in out.stdout.splitlines()):
+            return None
+    except Exception:
+        pass
+    return (f"Port {inst.port} is answering but not from the kbots debug Chrome "
+            f"(expected user-data-dir {inst.dir}). Something else owns the port — "
+            f"likely a stray Chrome or another tool. Fix: free the port or run "
+            f"scripts/chrome-debug.sh --status to see what is going on. Refusing "
+            f"to drive an unidentified browser.")
+
+
+async def _ensure_chrome(inst: _Instance, auto_launch: bool) -> str | None:
+    """Make sure this instance's debug Chrome is running. Error string, or None."""
+    if _port_up(inst.port):
+        return _verify_owner(inst)
     if not auto_launch:
-        return (f"No debug Chrome on port {DEBUG_PORT}. "
+        return (f"No debug Chrome on port {inst.port}. "
                 f"Start it with: scripts/chrome-debug.sh")
     if not _HELPER.exists():
         return f"Helper not found: {_HELPER}"
-    logger.info("chrome_desktop: launching debug Chrome via helper")
+    logger.info(f"chrome_desktop: launching debug Chrome via helper (port {inst.port})")
+    env = {**os.environ,
+           "KBOTS_CHROME_DEBUG_PORT": str(inst.port),
+           "KBOTS_CHROME_DEBUG_DIR": str(inst.dir)}
     try:
         # Helper backgrounds Chrome and waits for the port; give it headroom.
         proc = await asyncio.create_subprocess_exec(
-            "bash", str(_HELPER),
+            "bash", str(_HELPER), env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=45)
@@ -108,38 +199,39 @@ async def _ensure_chrome(auto_launch: bool) -> str | None:
         return "Timed out launching debug Chrome (scripts/chrome-debug.sh)."
     except Exception as e:
         return f"Failed to launch debug Chrome: {e}"
-    if not _port_up():
+    if not _port_up(inst.port):
         tail = (out or b"").decode(errors="replace")[-300:]
-        return f"Debug Chrome did not come up on port {DEBUG_PORT}. Helper output:\n{tail}"
-    return None
+        return f"Debug Chrome did not come up on port {inst.port}. Helper output:\n{tail}"
+    return _verify_owner(inst)
 
 
-async def _connect():
+async def _connect(inst: _Instance):
     """Attach to the debug Chrome, reusing a live connection. Returns page or error str."""
+    st = _st(inst)
     # Reuse if the existing connection is still alive
-    if _state.get("browser") and _state["browser"].is_connected():
-        _state["last_used"] = time.time()
-        return _state["page"]
+    if st.get("browser") and st["browser"].is_connected():
+        st["last_used"] = time.time()
+        return st["page"]
 
     from playwright.async_api import async_playwright
 
     pw = await async_playwright().start()
     try:
         browser = await pw.chromium.connect_over_cdp(
-            f"http://127.0.0.1:{DEBUG_PORT}", timeout=15000)
+            f"http://127.0.0.1:{inst.port}", timeout=15000)
     except Exception as e:
         await pw.stop()
-        return f"Could not attach to Chrome on port {DEBUG_PORT}: {e}"
+        return f"Could not attach to Chrome on port {inst.port}: {e}"
 
     context = browser.contexts[0] if browser.contexts else await browser.new_context()
     pages = context.pages
     page = pages[0] if pages else await context.new_page()
-    _state.update(pw=pw, browser=browser, context=context, page=page,
-                  last_used=time.time())
+    st.update(pw=pw, browser=browser, context=context, page=page,
+              last_used=time.time())
     return page
 
 
-async def _profile_page(profile: str, create: bool = False):
+async def _profile_page(inst: _Instance, profile: str, create: bool = False):
     """Return the pinned page for a named profile, opening its window if allowed.
 
     One CDP port serves every profile in the user-data-dir, so pages from all
@@ -149,7 +241,8 @@ async def _profile_page(profile: str, create: bool = False):
     opens a window on that profile in the running instance), and pin whichever
     page appears that wasn't there before.
     """
-    pages = _state.setdefault("profile_pages", {})
+    st = _st(inst)
+    pages = st.setdefault("profile_pages", {})
     page = pages.get(profile)
     if page is not None:
         try:
@@ -162,13 +255,17 @@ async def _profile_page(profile: str, create: bool = False):
         return (f"No open window for profile '{profile}'. Run "
                 f"chrome_browser(action='open', profile='{profile}', url=...) first.")
 
-    browser = _state.get("browser")
+    browser = st.get("browser")
     if not browser or not browser.is_connected():
         return "Not attached to Chrome — retry the action."
     before = {p for ctx in browser.contexts for p in ctx.pages}
+    env = {**os.environ,
+           "KBOTS_CHROME_DEBUG_PORT": str(inst.port),
+           "KBOTS_CHROME_DEBUG_DIR": str(inst.dir)}
     try:
         proc = await asyncio.create_subprocess_exec(
             "bash", str(_HELPER), "--profile", profile, "--open", "about:blank",
+            env=env,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         await asyncio.wait_for(proc.communicate(), timeout=30)
     except Exception as e:
@@ -187,10 +284,11 @@ async def _profile_page(profile: str, create: bool = False):
             f"over CDP. Check action='status' and retry.")
 
 
-async def _teardown() -> None:
-    """Detach from Chrome (leaves the browser running)."""
-    pw = _state.get("pw")
-    browser = _state.get("browser")
+async def _teardown(inst: _Instance) -> None:
+    """Detach from this instance's Chrome (leaves the browser running)."""
+    st = _st(inst)
+    pw = st.get("pw")
+    browser = st.get("browser")
     try:
         if browser and browser.is_connected():
             await browser.close()  # closes the CDP connection, not the Chrome app
@@ -201,7 +299,7 @@ async def _teardown() -> None:
             await pw.stop()
     except Exception:
         pass
-    _state.clear()
+    st.clear()
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -274,6 +372,8 @@ async def chrome_browser(ctx: ToolContext, action: str, url: str = "", selector:
     if action not in VALID_ACTIONS:
         return f"Unknown action: {action}. Valid: {', '.join(VALID_ACTIONS)}"
 
+    inst = _instance_for(ctx)
+
     profile = profile.strip()
     if profile and not _PROFILE_RE.match(profile):
         return (f"Invalid profile name: '{profile}'. Use letters, digits, space, "
@@ -286,7 +386,7 @@ async def chrome_browser(ctx: ToolContext, action: str, url: str = "", selector:
             return "Error: 'url' required for login (the sign-in page to show the user)."
 
     if action == "status":
-        holder = tool_reservation.peek(RESOURCE)
+        holder = tool_reservation.peek(inst.resource)
         if holder and holder.agent_id != ctx.agent_id:
             who = (f"Reserved by '{holder.agent_id}' "
                    f"(idle {tool_reservation.format_duration(holder.idle_for())}, "
@@ -296,12 +396,12 @@ async def chrome_browser(ctx: ToolContext, action: str, url: str = "", selector:
         else:
             who = "Not reserved — free to use."
         profs = ""
-        d = _debug_dir()
+        d = inst.dir
         if d.is_dir():
             names = sorted(p.name for p in d.iterdir() if (p / "Preferences").exists())
             if names:
                 pinned = set()
-                for name, pg in (_state.get("profile_pages") or {}).items():
+                for name, pg in (_st(inst).get("profile_pages") or {}).items():
                     try:
                         if pg and not pg.is_closed():
                             pinned.add(name)
@@ -309,20 +409,26 @@ async def chrome_browser(ctx: ToolContext, action: str, url: str = "", selector:
                         pass
                 profs = " Profiles: " + ", ".join(
                     n + (" (window pinned)" if n in pinned else "") for n in names) + "."
-        if _port_up():
-            attached = bool(_state.get("browser") and _state["browser"].is_connected())
-            return f"Debug Chrome is up on port {DEBUG_PORT} (attached: {attached}). {who}{profs}"
-        return (f"Debug Chrome is not running on port {DEBUG_PORT}. "
+        which = "dedicated" if inst.dedicated else "shared"
+        if _port_up(inst.port):
+            owner = _verify_owner(inst)
+            if owner:
+                return owner
+            st = _st(inst)
+            attached = bool(st.get("browser") and st["browser"].is_connected())
+            return (f"Debug Chrome ({which}) is up on port {inst.port} "
+                    f"(attached: {attached}). {who}{profs}")
+        return (f"Debug Chrome ({which}) is not running on port {inst.port}. "
                 f"An 'open' will launch it. {who}{profs}")
 
     if action == "release":
-        freed = tool_reservation.release(RESOURCE, ctx.agent_id)
+        freed = tool_reservation.release(inst.resource, ctx.agent_id)
         return ("Released the chrome_browser reservation — another agent can use it now."
                 if freed else "You did not hold the chrome_browser reservation.")
 
     if action == "close":
-        await _teardown()
-        tool_reservation.release(RESOURCE, ctx.agent_id)
+        await _teardown(inst)
+        tool_reservation.release(inst.resource, ctx.agent_id)
         return "Detached from Chrome and released the reservation (the browser window is left running)."
 
     from src.core import session_consent
@@ -349,17 +455,17 @@ async def chrome_browser(ctx: ToolContext, action: str, url: str = "", selector:
     # call refreshes the heartbeat, so a long active session can't expire on us.
     if action in _RESERVED_ACTIONS:
         try:
-            ok, holder = tool_reservation.acquire(RESOURCE, ctx.agent_id)
+            ok, holder = tool_reservation.acquire(inst.resource, ctx.agent_id)
         except (TimeoutError, OSError) as e:
             return f"Could not check the chrome_browser reservation: {e}"
         if not ok:
             return tool_reservation.busy_message(holder, _ALTERNATIVE)
 
-    launch_err = await _ensure_chrome(auto_launch)
+    launch_err = await _ensure_chrome(inst, auto_launch)
     if launch_err:
         return launch_err
 
-    page = await _connect()
+    page = await _connect(inst)
     if isinstance(page, str):
         return page
 
@@ -367,7 +473,7 @@ async def chrome_browser(ctx: ToolContext, action: str, url: str = "", selector:
     # it; everything else requires it to already exist so a click can never
     # silently land in a window the agent didn't set up.
     if profile:
-        page = await _profile_page(profile, create=action in ("open", "login"))
+        page = await _profile_page(inst, profile, create=action in ("open", "login"))
         if isinstance(page, str):
             return page
 
@@ -392,7 +498,7 @@ async def chrome_browser(ctx: ToolContext, action: str, url: str = "", selector:
                     f"password (and 2FA) directly into Chrome; you never see or store "
                     f"credentials. When they confirm, continue with normal actions "
                     f"passing profile='{profile}'. The login persists across restarts; "
-                    f"the user can revoke it by deleting {_debug_dir() / profile}."
+                    f"the user can revoke it by deleting {inst.dir / profile}."
                 )
             return f"Opened: **{await page.title()}**\nURL: {page.url}"
 
