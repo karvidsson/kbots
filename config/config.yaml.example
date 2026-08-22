@@ -85,6 +85,17 @@ defaults:
     semantic_search: false
     decay_enabled: false
     max_results: 10
+    # Can one agent read what another has learned? On by default: these are one
+    # owner's agents working on one owner's business, and a lesson that cannot
+    # leave the agent that learned it gets relearned by every other agent, the
+    # expensive way. Recalled memories are labelled with who learned them.
+    # An agent that wants a note kept to itself stores it with scope 'private'.
+    # Turn this off for a deployment whose agents work for different people.
+    fleet_read: true
+    # Named groups for scope 'group:<name>'. Membership was never checked
+    # before, so a group scope was a global scope with a reassuring name.
+    # groups:
+    #   money: [ledger, rainmaker]
     # Reward-based working memory: agents save lessons (remember_lesson) and
     # feedback (record_outcome / 👍👎). The reflector periodically consolidates
     # them into each agent's LESSONS.md, injected at session start.

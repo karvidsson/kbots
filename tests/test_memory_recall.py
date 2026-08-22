@@ -84,10 +84,12 @@ def test_scope_is_still_enforced_through_the_fused_path(memory):
 
     Three engines each apply scope themselves; the risk is a future engine that
     forgets, so this asserts on the fused output rather than on any one query.
+    Uses `private:`, the one scope that is never shared, since agent scope is
+    fleet-readable by design.
     """
     async def go():
         await memory.store(content="alice private note about falcons", type="semantic",
-                           agent_id="alice", scope="agent", scope_target="alice")
+                           agent_id="alice", scope="private:alice", scope_target="alice")
         return await recall(memory, "falcons note", agent_id="bob")
     assert run(go()) == []
 

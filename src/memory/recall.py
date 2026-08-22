@@ -190,8 +190,15 @@ async def _graph_expand(memory, graph, keyword, vector, agent_id) -> list[dict]:
     return out
 
 
-def format_block(results: list[dict]) -> str:
-    """Render recalled memories as the context block agents receive."""
+def format_block(results: list[dict], agent_id: str | None = None) -> str:
+    """Render recalled memories as the context block agents receive.
+
+    Another agent's memory is labelled with who wrote it. Unattributed, a
+    lesson learned by the music agent about its own distributor reads as
+    something this agent knows, and the fleet-wide read that makes knowledge
+    compound would also make every agent confidently wrong about six other
+    domains.
+    """
     if not results:
         return ""
     lines = ["<auto-recalled-memories>"]
@@ -201,6 +208,8 @@ def format_block(results: list[dict]) -> str:
             continue
         category = mem.get("category") or "general"
         via = " via graph" if mem.get("via_graph") else ""
-        lines.append(f"[{category}{via}] {content}")
+        author = mem.get("created_by")
+        by = f" learned by {author}" if author and author != agent_id else ""
+        lines.append(f"[{category}{via}{by}] {content}")
     lines.append("</auto-recalled-memories>")
     return "\n".join(lines) if len(lines) > 2 else ""
