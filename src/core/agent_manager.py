@@ -1037,6 +1037,12 @@ class AgentManager:
             sent = await connector.send(
                 message.channel_id, out_content, reply_to=message.raw,
                 bot_account=message.bot_account,
+                # Named so reply shortening can be configured per agent: an
+                # agent whose deliverable IS the prose (a draft, a report)
+                # must never have it cut in half. Without this the connector
+                # only knows which bot account sent the message, which is not
+                # the same thing when several agents share one account.
+                agent_id=agent_id,
             )
             # If lessons informed this reply, remember them so a 👍/👎 reaction
             # can score them (see feedback_map + the connector's reaction handler).

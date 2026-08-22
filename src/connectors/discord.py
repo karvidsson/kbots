@@ -13,6 +13,7 @@ import discord
 from discord import app_commands
 
 from src.core.base import Attachment, Connector, IncomingMessage, VaultBackend
+from src.core.reply_shorten import ReplyShortener, wants_more
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +75,10 @@ class DiscordConnector(Connector):
         self._full_config: dict = {}
         self._data_dir: str = ""
         self._on_guild_setup = None
+        # Long replies are cut at a structural boundary; the rest arrives on a
+        # reaction. Built here with no data dir, rebuilt in set_setup_context
+        # once the engine says where state lives.
+        self._shortener = ReplyShortener(config.get("reply"), store_dir=".")
 
     def set_setup_context(self, config: dict, data_dir: str, on_guild_setup=None) -> None:
         """Give the connector what it needs to provision a newly joined server.
@@ -86,10 +91,25 @@ class DiscordConnector(Connector):
         self._full_config = config or {}
         self._data_dir = str(data_dir or "")
         self._on_guild_setup = on_guild_setup
+        # `defaults.reply` is engine config, not connector config, so the
+        # shortener can only be built properly once the full config arrives.
+        reply_cfg = (self._full_config.get("defaults") or {}).get("reply") or {}
+        self._shortener = ReplyShortener(
+            reply_cfg, store_dir=Path(self._data_dir or ".") / "reply-overflow",
+            agent_configs=self._agent_configs)
+        if self._shortener.enabled:
+            logger.info(f"Reply shortening: ON (default over "
+                        f"{self._shortener.threshold_for(None)} chars, "
+                        f"expand with {self._shortener.emoji})")
 
     def set_agent_configs(self, agent_configs: dict[str, dict]) -> None:
         """Set agent configs so the connector knows which agents route to which bots."""
         self._agent_configs = agent_configs
+        # The shortener resolves per-agent settings out of these, and main sets
+        # them in either order relative to set_setup_context. Rebinding here
+        # means the per-agent config cannot be silently ignored depending on
+        # startup order.
+        self._shortener.agent_configs = agent_configs
 
     def set_skills(self, skills: dict[str, Any]) -> None:
         """Set available skills for slash command registration."""
@@ -211,6 +231,17 @@ class DiscordConnector(Connector):
             return None
         self._recent_sends[channel_id] = (content_for_dedup, time.monotonic())
 
+        # Shorten before splitting, not after: the 2000-char split is a
+        # transport limit and this is an editorial cut, and running them the
+        # other way round would footer a fragment.
+        # Skipped when files are attached — an artefact and its explanation
+        # arrive together or the attachment reads as unexplained.
+        rest = None
+        if not kwargs.get("no_shorten") and not discord_files:
+            shortened = self._shortener.shorten(content, agent_id=kwargs.get("agent_id"))
+            if shortened:
+                content, rest = shortened
+
         # Split long messages (Discord 2000 char limit)
         first_msg = None
         for i, chunk in enumerate(_split_message(content)):
@@ -228,6 +259,16 @@ class DiscordConnector(Connector):
                 sent = await channel.send(chunk, files=send_files)
             if first_msg is None:
                 first_msg = sent
+
+        if rest and first_msg is not None:
+            self._shortener.store.put(str(first_msg.id), rest, channel_id=str(channel_id))
+            try:
+                # Pre-added by the bot, so expanding is a tap on a control that
+                # is already there rather than something to remember.
+                await first_msg.add_reaction(self._shortener.emoji)
+            except discord.HTTPException as e:
+                logger.warning(f"reply-shorten: could not add {self._shortener.emoji}: {e} "
+                               f"(the footer still says 'more' works)")
 
         return first_msg
 
@@ -958,6 +999,19 @@ class DiscordBot:
         now = time.monotonic()
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_mentioned = self.client.user in message.mentions if self.client.user else False
+
+        # "more" on a shortened reply is answered from the file, not by a turn.
+        # Spending an LLM call to re-emit text already written would be slower
+        # than the message it shortened, and could come back different.
+        shortener = getattr(self.connector, "_shortener", None)
+        if (shortener and shortener.enabled and not message.author.bot
+                and wants_more(message.content)):
+            rest = shortener.store.take_latest_for_channel(str(message.channel.id))
+            if rest:
+                await self.connector.send(str(message.channel.id), rest,
+                                          bot_account=self.account_name,
+                                          no_shorten=True)
+                return
         if not is_mentioned and self.client.user:
             # Check role mentions — Discord auto-creates a managed role for
             # bots, and its tags carry the owning bot's id. This works without
@@ -1079,6 +1133,17 @@ class DiscordBot:
             return
 
         emoji = str(payload.emoji)
+
+        # Expand a shortened reply. Checked first and cheap: it is a read of
+        # one file and it must never be shadowed by another handler.
+        shortener = getattr(self.connector, "_shortener", None)
+        if shortener and emoji == shortener.emoji:
+            rest = shortener.store.take(str(payload.message_id))
+            if rest:
+                await self.connector.send(str(payload.channel_id), rest,
+                                          bot_account=self.account_name,
+                                          no_shorten=True)
+            return
 
         # Lesson feedback: 👍/👎 on a reply nudges the lessons it used.
         if emoji in ("👍", "👎"):
