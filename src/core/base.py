@@ -118,6 +118,10 @@ def memory_config(config: dict) -> dict:
     cfg = dict(config.get("defaults", {}).get("memory", {}) or {})
     data_dir = resolve_data_dir(config)
     cfg.setdefault("path", str(data_dir / "memory.db"))
+    # The embedding model is state, not code, and it is downloaded at runtime.
+    # Left relative it landed under the repo, so an overlay deployment kept its
+    # memories in one place and re-fetched a 130MB model into another.
+    cfg.setdefault("model_dir", str(data_dir / "models" / "bge-small-en-v1.5"))
     graph = dict(cfg.get("graph") or {})
     if graph:
         graph.setdefault("path", str(data_dir / "graph" / "memory.lbdb"))

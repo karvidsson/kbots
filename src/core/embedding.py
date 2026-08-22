@@ -5,6 +5,7 @@ Same model, same dimensions (384), same normalization — zero behavior change.
 """
 
 import logging
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -23,12 +24,34 @@ class EmbeddingEngine:
         self.dimensions = DIMENSIONS
         self._tokenizer = None
         self._session = None
+        # Why the engine is unusable, if it is. Callers store this rather than
+        # discovering it again per memory: on the live fleet every one of 237
+        # memories was written with a NULL vector because the download path
+        # imported a package that is not a dependency, and each failure was a
+        # single debug-level line nobody read.
+        self.unavailable_reason: str | None = None
 
     def _ensure_loaded(self) -> None:
         """Lazy-load model on first use."""
         if self._session is not None:
             return
+        if self.unavailable_reason:
+            # Retrying a 130MB download once per stored memory turns a broken
+            # install into a slow one.
+            raise RuntimeError(self.unavailable_reason)
+        try:
+            self._load()
+        except Exception as e:
+            self.unavailable_reason = (
+                f"Embedding model unavailable ({type(e).__name__}: {e}). "
+                f"Semantic search and the vector half of recall are OFF until "
+                f"this is fixed; memories are still stored, without vectors. "
+                f"Expected model at {self.model_dir}.")
+            logger.error(self.unavailable_reason)
+            raise
 
+    def _load(self) -> None:
+        """Find or fetch the model, then open an ONNX Runtime session."""
         import time
 
         import onnxruntime as ort
@@ -64,17 +87,35 @@ class EmbeddingEngine:
                 return candidate
         return None
 
-    def _download_model(self) -> None:
-        """Download the model on first run if not present."""
-        logger.info(f"Model not found at {self.model_dir}, downloading {MODEL_NAME}...")
-        from optimum.onnxruntime import ORTModelForFeatureExtraction
-        from transformers import AutoTokenizer
+    # The model repo already ships an exported ONNX graph, so there is nothing
+    # to convert. Downloading these files is the whole install.
+    _HUB_FILES = ("onnx/model.onnx", "tokenizer.json", "tokenizer_config.json",
+                  "special_tokens_map.json", "config.json")
 
-        self.model_dir.parent.mkdir(parents=True, exist_ok=True)
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        tokenizer.save_pretrained(str(self.model_dir))
-        model = ORTModelForFeatureExtraction.from_pretrained(MODEL_NAME, export=True)
-        model.save_pretrained(str(self.model_dir))
+    def _download_model(self) -> None:
+        """Fetch the pre-exported ONNX model and its tokenizer from the hub.
+
+        This used to import `optimum.onnxruntime` to export the model itself.
+        optimum is not a dependency of this project and pulls in torch, so on
+        every install that did not already have a model directory the import
+        raised ModuleNotFoundError, `store()` caught it, and the memory was
+        written with no vector. Silently, per memory, forever: the live fleet
+        had 237 memories and 0 embeddings, which meant semantic_search — whose
+        query filters `WHERE embedding IS NOT NULL` — could only ever return
+        nothing.
+
+        Downloading the already-exported graph needs no exporter and no torch,
+        and huggingface_hub is already present as a transformers dependency.
+        """
+        logger.info(f"Model not found at {self.model_dir}, downloading {MODEL_NAME}...")
+        from huggingface_hub import hf_hub_download
+
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        for name in self._HUB_FILES:
+            src = hf_hub_download(MODEL_NAME, name)
+            dst = self.model_dir / name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
         logger.info(f"Model downloaded to {self.model_dir}")
 
     def embed(self, texts: list[str]) -> np.ndarray:

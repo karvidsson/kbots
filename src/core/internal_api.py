@@ -31,7 +31,8 @@ logger = logging.getLogger(__name__)
 _json_dumps = functools.partial(json.dumps, default=str)
 
 # GraphMemory methods the /graph route may dispatch — everything else is 400.
-_GRAPH_METHODS = frozenset({"link", "related", "unlink", "entities", "export", "find"})
+_GRAPH_METHODS = frozenset({"link", "related", "unlink", "entities", "export",
+                            "find", "history"})
 
 
 class InternalAPI:

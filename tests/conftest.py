@@ -64,3 +64,68 @@ def overlay(tmp_path):
 def mock_llm():
     """An offline mock LLM provider (echoes the last user message)."""
     return MockProvider(config={})
+
+
+@pytest.fixture(autouse=True)
+def _no_model_downloads(monkeypatch):
+    """No test may fetch the 130MB embedding model.
+
+    Autouse because the download is triggered from deep inside `store()`, four
+    frames below any test that happens to write a memory through a real
+    SQLiteMemory. It was invisible for as long as the download path was broken
+    (it raised ModuleNotFoundError immediately); the moment that was fixed, a
+    plain `pytest` on a fresh checkout started pulling 130MB over the network
+    before the first assertion.
+
+    Tests that want real embeddings use the model already on disk and skip when
+    it is absent — see tests/test_memory_recall_golden.py.
+    """
+    from src.core.embedding import EmbeddingEngine
+
+    def refuse(self):
+        raise RuntimeError(
+            "the embedding model is not installed and tests must not download it")
+
+    monkeypatch.setattr(EmbeddingEngine, "_download_model", refuse)
+
+
+@pytest.fixture
+def fake_embeddings(monkeypatch):
+    """Deterministic offline embeddings, so vector search is testable.
+
+    The real engine lazily downloads a 130MB ONNX model on first use, which no
+    test may do. Stubbing embed_one to return None-equivalents would be
+    simpler, but then semantic_search silently degrades to keyword search and
+    every fusion test would be measuring one engine while claiming to measure
+    two.
+
+    This is a hashed bag of words: texts sharing vocabulary score high, texts
+    sharing none score zero. Crude next to a real sentence encoder, and exactly
+    enough to assert that the vector engine ran, contributed, and ranked.
+    """
+    import zlib
+
+    import numpy as np
+
+    from src.core.embedding import DIMENSIONS, EmbeddingEngine
+
+    def embed_one(self, text: str):
+        # crc32, not hash(): str hashing is salted per process, so a failure
+        # would reproduce only under the PYTHONHASHSEED that produced it.
+        vec = np.zeros(DIMENSIONS, dtype=np.float32)
+        for token in str(text).lower().split():
+            token = token.strip(".,:;!?()[]\"'")
+            if token:
+                vec[zlib.crc32(token.encode()) % DIMENSIONS] += 1.0
+        norm = float(np.linalg.norm(vec))
+        return vec / norm if norm else vec
+
+    monkeypatch.setattr(EmbeddingEngine, "embed_one", embed_one)
+    return embed_one
+
+
+@pytest.fixture
+def memory(tmp_path, fake_embeddings):
+    """A SQLiteMemory on a throwaway database, with offline embeddings."""
+    from src.memory.sqlite import SQLiteMemory
+    return SQLiteMemory(config={"path": str(tmp_path / "memory.db")})

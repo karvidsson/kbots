@@ -8,6 +8,7 @@ import logging
 
 from src.core.base import ToolContext
 from src.core.tools import tool
+from src.memory.recall import recall
 
 logger = logging.getLogger(__name__)
 
@@ -84,25 +85,30 @@ async def memory_search(
 ) -> str:
     """Search persistent memory for relevant information.
 
+    Runs keyword search, vector search and a one-hop graph expansion together
+    and fuses the three by rank. You do not need to pick a search strategy or
+    try a second tool when this one comes back empty: an empty answer here
+    means every engine was empty, not that you chose the wrong door.
+
     Args:
-        query: What to search for
+        query: What to search for. A plain question works; it is turned into a
+            keyword expression for you.
         limit: Max results to return
         type: Filter by memory type
         category: Filter by category
     """
     memory = _get_memory(ctx)
 
-    kwargs = {}
-    if type:
-        kwargs["type"] = type
-    if category:
-        kwargs["category"] = category
+    # A graph that will not open costs the graph hop, not the search.
+    try:
+        from src.lib.graph_store import get_graph
+        graph = get_graph()
+    except Exception:
+        graph = None
 
-    memories = await memory.search(
-        query=query,
-        agent_id=ctx.agent_id,
-        limit=limit,
-        **kwargs,
+    memories = await recall(
+        memory, query, agent_id=ctx.agent_id, limit=limit, graph=graph,
+        type=type or None, category=category or None,
     )
 
     if not memories:
@@ -113,9 +119,13 @@ async def memory_search(
         content = mem.get("content", "")
         mem_type = mem.get("type", "")
         created = mem.get("created_at", "")
+        # Naming the engines is not decoration: "graph" means this memory does
+        # not resemble the query and was reached through a shared entity, which
+        # changes how much the reader should trust it as an answer.
+        via = ", ".join(mem.get("sources") or []) or "keyword"
         lines.append(f"  {i}. [{mem_type}] {content[:200]}")
-        if created:
-            lines.append(f"     (stored: {created})")
+        lines.append(f"     (id: {mem.get('id')}, found by: {via}"
+                     + (f", stored: {created}" if created else "") + ")")
     return "\n".join(lines)
 
 
@@ -129,9 +139,11 @@ async def memory_semantic_search(
     query: str,
     limit: int = 5,
 ) -> str:
-    """Search memory using embedding-based semantic similarity.
+    """Search memory using embedding-based semantic similarity only.
 
-    Better than keyword search for finding conceptually related memories.
+    memory_search already includes this engine and fuses it with the others,
+    so reach for it only when you specifically want similarity alone, with no
+    keyword or graph influence on the ranking.
     """
     memory = _get_memory(ctx)
 

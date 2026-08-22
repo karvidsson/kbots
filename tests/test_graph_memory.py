@@ -231,21 +231,37 @@ async def test_graph_query_is_scope_filtered(tmp_path):
         gm.close()
 
 
-@needs_ladybug
-async def test_graph_html_escapes_rel(tmp_path):
-    """A relationship containing markup must not inject into the exported HTML JS."""
+def test_graph_html_escapes_rel():
+    """Markup in graph data must not inject into the exported HTML JS.
+
+    Fed to the renderer directly rather than through link(). Relations are now
+    normalised to snake_case on write, which strips this payload before it
+    could ever reach the renderer, but that is a second line of defence and
+    testing through it would stop testing the escaping at all. Entity names
+    are not normalised, so this remains a reachable path.
+    """
     from src.tools.graph import _render_graph_html
+    nodes = [{"name": "</script><img src=x onerror=alert(1)>", "type": "e", "degree": 1},
+             {"name": "B", "type": "e", "degree": 1}]
+    edges = [{"src": nodes[0]["name"], "rel": "</script>evil", "dst": "B",
+              "confidence": 0.9, "scope": "global", "created_by": "alice"}]
+    html = _render_graph_html(nodes, edges, "T")
+    # The injected closing tag must be escaped in the embedded JSON payload,
+    # leaving only the document's own real </script> tags (D3 loader + app).
+    assert "<\\/script>" in html
+    assert html.count("</script>") == 2
+    assert "onerror=alert(1)>" not in html.split("<script>")[0]
+
+
+@needs_ladybug
+async def test_link_strips_markup_from_relations(tmp_path):
+    """Normalisation is also a sanitiser: a relation cannot carry markup."""
     gm = _gm(tmp_path)
     try:
         await gm.link("A", "</script><img src=x onerror=alert(1)>", "B",
                       scope="global", created_by="alice")
-        data = await gm.export(agent_id="alice")
-        html = _render_graph_html(data["nodes"], data["edges"], "T")
-        # The injected closing tag must be escaped in the embedded JSON payload,
-        # leaving only the document's own real </script> tags (D3 loader + app).
-        assert "<\\/script>" in html
-        assert html.count("</script>") == 2
-        assert "onerror=alert(1)>" not in html.split("<script>")[0]
+        edges = await gm.related("A", agent_id="alice")
+        assert "<" not in edges[0]["rel"] and ">" not in edges[0]["rel"]
     finally:
         gm.close()
 
