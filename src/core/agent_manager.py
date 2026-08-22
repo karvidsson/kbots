@@ -361,7 +361,7 @@ class AgentManager:
 
             results = await recall(memory, query, agent_id=agent_id,
                                    limit=5, graph=graph)
-            block = format_block(results)
+            block = format_block(results, agent_id=agent_id)
             if not block:
                 return []
 

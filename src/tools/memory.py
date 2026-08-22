@@ -36,10 +36,17 @@ async def memory_store(
         type: Memory type — semantic (facts/knowledge), episodic (events/experiences), procedural (how-to/processes)
         category: Category (general, project, people, business, etc.)
         tags: Comma-separated tags
-        scope: Visibility — agent (default, private to you), global (facts about
-            the world, the business, or the team that every agent should know),
-            or group:<name> (shared with a named group). Keep personal working
-            notes agent-scoped; share only established facts.
+        scope: Visibility.
+            agent (default) — filed under you, and readable by the rest of the
+                fleet. Use it for anything you learned that another agent could
+                act on: a tool's real behaviour, a gotcha, a fact about the
+                owner or the business.
+            private — yours alone, never shared. For working notes that would
+                only be noise to anyone else, or anything about an account or a
+                person that is not the fleet's business.
+            global — the same visibility as agent, stated deliberately. Use it
+                for established facts about the world, the business or the team.
+            group:<name> — members of that group only.
     """
     # Map friendly names to DB-valid types
     type_map = {"fact": "semantic", "preference": "semantic", "episode": "episodic",
@@ -52,9 +59,9 @@ async def memory_store(
     coerced = type not in ("semantic", "episodic", "procedural")
     if coerced:
         type = "semantic"
-    if scope != "agent" and scope != "global" and not scope.startswith("group:"):
-        return (f"Invalid scope {scope!r} — use 'agent' (private), 'global', "
-                "or 'group:<name>'.")
+    if scope not in ("agent", "global", "private") and not scope.startswith("group:"):
+        return (f"Invalid scope {scope!r} — use 'agent' (yours, fleet-readable), "
+                "'private' (yours alone), 'global', or 'group:<name>'.")
     memory = _get_memory(ctx)
     tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
 
@@ -65,7 +72,7 @@ async def memory_store(
         tags=tag_list,
         category=category,
         scope=scope,
-        scope_target=ctx.agent_id if scope == "agent" else None,
+        scope_target=ctx.agent_id if scope in ("agent", "private") else None,
     )
 
     note = ""
@@ -123,7 +130,9 @@ async def memory_search(
         # not resemble the query and was reached through a shared entity, which
         # changes how much the reader should trust it as an answer.
         via = ", ".join(mem.get("sources") or []) or "keyword"
-        lines.append(f"  {i}. [{mem_type}] {content[:200]}")
+        author = mem.get("created_by")
+        by = f" learned by {author}" if author and author != ctx.agent_id else ""
+        lines.append(f"  {i}. [{mem_type}{by}] {content[:200]}")
         lines.append(f"     (id: {mem.get('id')}, found by: {via}"
                      + (f", stored: {created}" if created else "") + ")")
     return "\n".join(lines)

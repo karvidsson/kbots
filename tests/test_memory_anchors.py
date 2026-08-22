@@ -76,7 +76,8 @@ def test_entity_lookup_respects_scope(memory):
     """
     async def go():
         mid = await memory.store(content="alice private note", type="semantic",
-                                 agent_id="alice", scope="agent", scope_target="alice")
+                                 agent_id="alice", scope="private:alice",
+                                 scope_target="alice")
         await memory.anchor_entities(mid, ["Falcon"])
         return (await memory.memories_for_entities(["Falcon"], agent_id="alice"),
                 await memory.memories_for_entities(["Falcon"], agent_id="bob"))

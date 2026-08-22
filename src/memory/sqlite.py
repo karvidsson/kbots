@@ -55,6 +55,11 @@ class SQLiteMemory(MemoryBackend):
 
         self.embedding = EmbeddingEngine(model_dir=model_dir)
         self._embed_failures = 0
+        # Whether one agent's memories are readable by the rest of the fleet.
+        # On by default: these are one owner's agents working on one owner's
+        # business, and knowledge that cannot leave the agent that learned it
+        # is relearned by seven others. `private:<id>` opts a memory out.
+        self.fleet_read = bool(config.get("fleet_read", True))
         self._ensure_schema()
 
         count = self.db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -200,6 +205,8 @@ class SQLiteMemory(MemoryBackend):
         # Match legacy scope format: 'agent:main' instead of just 'agent'
         if scope == "agent" and agent_id:
             scope = f"agent:{agent_id}"
+        elif scope == "private" and agent_id:
+            scope = f"private:{agent_id}"
 
         # Generate embedding. A failure here is survivable — the memory is
         # still stored and still findable by keyword — but it silently removes
@@ -239,17 +246,55 @@ class SQLiteMemory(MemoryBackend):
         return memory_id
 
     def _scope_filter(self, agent_id: str | None, prefix: str = "") -> tuple[str, list]:
-        """Build parameterised scope filter. Returns (sql_fragment, params)."""
+        """Build parameterised scope filter. Returns (sql_fragment, params).
+
+        Four scopes, and two of them are new because the old two did not work:
+
+        `global`      everyone.
+        `agent:<id>`  authored by <id>. Readable by the whole fleet when
+                      `fleet_read` is on, which is the default. Measured on the
+                      live store: 235 of 237 memories were agent-scoped and 0
+                      were global, so every agent was searching a corpus of its
+                      own handful of notes while six weeks of the fleet's
+                      lessons sat one row away and unreadable. Nothing chose
+                      that: it is the default of memory_store, which no caller
+                      ever overrode.
+        `private:<id>`only <id>, always, regardless of `fleet_read`. Sharing by
+                      default is only defensible if there is somewhere to put
+                      the things that should not be shared.
+        `group:<name>`members only, from `defaults.memory.groups`. This used to
+                      match `group:%` for everyone, so a group scope was a
+                      global scope with a misleading name.
+        """
         col = f"{prefix}scope" if prefix else "scope"
         target_col = f"{prefix}scope_target" if prefix else "scope_target"
-        clauses = [f"{col} LIKE ?", f"{col} LIKE ?"]
-        params: list = ["global%", "group:%"]
+        clauses = [f"{col} LIKE ?"]
+        params: list = ["global%"]
+
+        if self.fleet_read:
+            clauses.append(f"{col} LIKE ?")
+            params.append("agent:%")
+
         if agent_id:
             clauses.append(f"{col} LIKE ?")
             params.append(f"agent:{agent_id}%")
-            clauses.append(f"{target_col} = ?")
+            clauses.append(f"{col} = ?")
+            params.append(f"private:{agent_id}")
+            clauses.append(f"({target_col} = ? AND {col} NOT LIKE 'private:%')")
             params.append(agent_id)
+            for group in self.groups_for(agent_id):
+                clauses.append(f"{col} = ?")
+                params.append(f"group:{group}")
+
         return " OR ".join(clauses), params
+
+    def groups_for(self, agent_id: str) -> list[str]:
+        """Groups this agent belongs to, from `defaults.memory.groups`."""
+        out = []
+        for name, members in (self.config.get("groups") or {}).items():
+            if agent_id in (members or []):
+                out.append(str(name))
+        return out
 
     async def search(self, query: str, agent_id: str | None = None,
                      limit: int = 10, **kwargs) -> list[dict]:
@@ -338,7 +383,7 @@ class SQLiteMemory(MemoryBackend):
 
         rows = self.db.execute(
             f"""SELECT id, content, type, category, confidence, tags, pinned,
-                       created_at, embedding
+                       created_at, created_by, embedding
                 FROM memories
                 WHERE embedding IS NOT NULL
                   AND ({scope_sql})
