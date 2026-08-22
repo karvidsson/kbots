@@ -202,21 +202,77 @@ def wants_more(text: str) -> bool:
 
 
 class ReplyShortener:
-    """Config plus the two decisions: should this be cut, and where."""
+    """Config plus the two decisions: should this be cut, and where.
 
-    def __init__(self, config: dict | None = None, store_dir: str | Path | None = None):
-        cfg = (config or {}).get("shorten") or {}
-        self.enabled = bool(cfg.get("enabled", False))
-        self.threshold = int(cfg.get("threshold_chars", DEFAULT_THRESHOLD))
-        self.emoji = str(cfg.get("emoji", "🔍"))
+    Settings resolve per agent, in the order the rest of the engine already
+    uses for llm, memory and tools:
+
+        runtime override  (admin, applies live, survives no restart)
+        agents.yaml       reply.shorten for that agent
+        defaults          defaults.reply.shorten
+        off
+
+    Per-agent is not a refinement here, it is a correctness requirement. On a
+    fleet where one agent writes deploy reports and another writes publishable
+    copy, a global length limit is right for the first and actively wrong for
+    the second: cutting a draft in half and hiding the rest behind a reaction
+    breaks the deliverable.
+    """
+
+    def __init__(self, config: dict | None = None, store_dir: str | Path | None = None,
+                 agent_configs: dict[str, dict] | None = None):
+        self.defaults = (config or {}).get("shorten") or {}
+        self.agent_configs = agent_configs or {}
         self.store = OverflowStore(store_dir or ".", ttl_hours=float(
-            cfg.get("ttl_hours", 72.0)))
+            self.defaults.get("ttl_hours", 72.0)))
 
-    def shorten(self, content: str) -> tuple[str, str] | None:
+    # --- resolution ---
+
+    def _runtime(self, agent_id: str | None) -> dict:
+        """Admin overrides set by set_reply_shorten, per agent then fleet-wide."""
+        try:
+            from src.core import runtime_state
+        except ImportError:
+            return {}
+        out = dict(runtime_state.get_flag("reply_shorten", None) or {})
+        if agent_id:
+            out.update(runtime_state.get_flag(f"reply_shorten:{agent_id}", None) or {})
+        return out
+
+    def settings(self, agent_id: str | None = None) -> dict:
+        merged = dict(self.defaults)
+        agent_cfg = ((self.agent_configs.get(agent_id or "") or {}).get("reply")
+                     or {}).get("shorten") or {}
+        merged.update(agent_cfg)
+        merged.update(self._runtime(agent_id))
+        return merged
+
+    def enabled_for(self, agent_id: str | None = None) -> bool:
+        return bool(self.settings(agent_id).get("enabled", False))
+
+    def threshold_for(self, agent_id: str | None = None) -> int:
+        return int(self.settings(agent_id).get("threshold_chars", DEFAULT_THRESHOLD))
+
+    @property
+    def emoji(self) -> str:
+        # Fleet-wide on purpose: it is the reader's control, and one expand
+        # gesture that means the same thing everywhere is worth more than
+        # per-agent decoration.
+        return str(self.defaults.get("emoji", "🔍"))
+
+    @property
+    def enabled(self) -> bool:
+        """Whether shortening is live for anyone. Used for logging and for the
+        cheap early-out on the "more" path."""
+        if self.enabled_for(None):
+            return True
+        return any(self.enabled_for(a) for a in self.agent_configs)
+
+    def shorten(self, content: str, agent_id: str | None = None) -> tuple[str, str] | None:
         """(head_with_footer, rest), or None to send the reply unchanged."""
-        if not self.enabled:
+        if not self.enabled_for(agent_id):
             return None
-        parts = split_reply(content, self.threshold)
+        parts = split_reply(content, self.threshold_for(agent_id))
         if parts is None:
             return None
         head, rest = parts

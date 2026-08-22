@@ -92,6 +92,13 @@ defaults:
       threshold_chars: 700
       emoji: "\U0001F50D"     # the bot pre-adds this, so expanding is one tap
       ttl_hours: 72            # how long the held-back text stays available
+      # Per agent, in agents.yaml, same resolution order as llm/memory/tools:
+      #   <agent>:
+      #     reply:
+      #       shorten: {enabled: false}        # deliverable IS the prose
+      #       shorten: {threshold_chars: 2000} # long by nature, e.g. reports
+      # An admin can also flip it live with the set_reply_shorten tool, which
+      # beats both and needs no restart.
   memory:
     backend: sqlite
     semantic_search: false

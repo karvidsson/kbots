@@ -95,14 +95,21 @@ class DiscordConnector(Connector):
         # shortener can only be built properly once the full config arrives.
         reply_cfg = (self._full_config.get("defaults") or {}).get("reply") or {}
         self._shortener = ReplyShortener(
-            reply_cfg, store_dir=Path(self._data_dir or ".") / "reply-overflow")
+            reply_cfg, store_dir=Path(self._data_dir or ".") / "reply-overflow",
+            agent_configs=self._agent_configs)
         if self._shortener.enabled:
-            logger.info(f"Reply shortening: ON (over {self._shortener.threshold} chars, "
+            logger.info(f"Reply shortening: ON (default over "
+                        f"{self._shortener.threshold_for(None)} chars, "
                         f"expand with {self._shortener.emoji})")
 
     def set_agent_configs(self, agent_configs: dict[str, dict]) -> None:
         """Set agent configs so the connector knows which agents route to which bots."""
         self._agent_configs = agent_configs
+        # The shortener resolves per-agent settings out of these, and main sets
+        # them in either order relative to set_setup_context. Rebinding here
+        # means the per-agent config cannot be silently ignored depending on
+        # startup order.
+        self._shortener.agent_configs = agent_configs
 
     def set_skills(self, skills: dict[str, Any]) -> None:
         """Set available skills for slash command registration."""
@@ -231,7 +238,7 @@ class DiscordConnector(Connector):
         # arrive together or the attachment reads as unexplained.
         rest = None
         if not kwargs.get("no_shorten") and not discord_files:
-            shortened = self._shortener.shorten(content)
+            shortened = self._shortener.shorten(content, agent_id=kwargs.get("agent_id"))
             if shortened:
                 content, rest = shortened
 

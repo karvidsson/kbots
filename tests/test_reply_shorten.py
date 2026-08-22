@@ -381,3 +381,144 @@ async def test_the_expanded_text_is_not_shortened_again(connector):
     conn, channel = connector
     await conn.send("555", LONG, no_shorten=True)
     assert "shortened" not in channel.sent[0]
+
+
+# --- per agent ---
+#
+# Not a refinement. On a fleet where one agent writes deploy reports and
+# another writes publishable copy, a global length limit is right for the first
+# and actively wrong for the second: cutting a draft in half and hiding the
+# rest behind a reaction breaks the deliverable.
+
+AGENTS = {
+    "engineer": {},                                        # inherits the default
+    "writer": {"reply": {"shorten": {"enabled": False}}},   # deliverable is the prose
+    "finance": {"reply": {"shorten": {"threshold_chars": 2000}}},
+}
+
+
+def _fleet(tmp_path, **defaults):
+    return ReplyShortener({"shorten": {"enabled": True, "threshold_chars": 300,
+                                       **defaults}},
+                          store_dir=tmp_path, agent_configs=AGENTS)
+
+
+def test_an_agent_can_opt_out_entirely(tmp_path):
+    s = _fleet(tmp_path)
+    assert s.shorten(LONG, agent_id="engineer") is not None
+    assert s.shorten(LONG, agent_id="writer") is None
+
+
+def test_an_agent_can_raise_its_own_threshold(tmp_path):
+    s = _fleet(tmp_path)
+    assert s.threshold_for("finance") == 2000
+    assert s.threshold_for("engineer") == 300
+    assert s.shorten(LONG, agent_id="finance") is None
+
+
+def test_an_unknown_agent_gets_the_fleet_default(tmp_path):
+    s = _fleet(tmp_path)
+    assert s.threshold_for("someone-new") == 300
+    assert s.enabled_for("someone-new") is True
+
+
+def test_the_expand_gesture_is_the_same_everywhere(tmp_path):
+    """Per-agent thresholds, one reader-facing control. An expand emoji that
+    varied by agent would make the reader learn a different gesture per bot.
+    """
+    s = _fleet(tmp_path, emoji="📖")
+    assert s.emoji == "📖"
+
+
+# --- the runtime override ---
+
+@pytest.fixture
+def runtime(tmp_path, monkeypatch):
+    from src.core import runtime_state
+    monkeypatch.setattr(runtime_state, "_STATE_FILE", tmp_path / "runtime.json",
+                        raising=False)
+    flags = {}
+    monkeypatch.setattr(runtime_state, "get_flag",
+                        lambda k, d=None: flags.get(k, d))
+    monkeypatch.setattr(runtime_state, "set_flag",
+                        lambda k, v: flags.__setitem__(k, v))
+    return flags
+
+
+def test_a_runtime_override_beats_config(tmp_path, runtime):
+    s = _fleet(tmp_path)
+    runtime["reply_shorten"] = {"enabled": False}
+    assert s.shorten(LONG, agent_id="engineer") is None
+
+
+def test_a_per_agent_override_beats_the_fleet_override(tmp_path, runtime):
+    """Otherwise turning it off fleet-wide to try something would silently
+    override the one agent that was deliberately configured differently.
+    """
+    s = _fleet(tmp_path)
+    runtime["reply_shorten"] = {"enabled": False}
+    runtime["reply_shorten:engineer"] = {"enabled": True}
+    assert s.shorten(LONG, agent_id="engineer") is not None
+    assert s.shorten(LONG, agent_id="finance") is None
+
+
+def test_an_override_can_change_only_the_threshold(tmp_path, runtime):
+    s = _fleet(tmp_path)
+    runtime["reply_shorten"] = {"threshold_chars": 100000}
+    assert s.enabled_for("engineer") is True, "enabled must survive a threshold-only change"
+    assert s.shorten(LONG, agent_id="engineer") is None
+
+
+async def test_only_an_admin_can_change_it(monkeypatch, runtime):
+    """An agent that can switch off its own length limit will switch it off.
+    Same reasoning as set_hitl, which carries it in a comment.
+    """
+    from src.core.base import ToolContext
+    from src.tools import reply_admin
+
+    monkeypatch.setattr(reply_admin, "_is_admin", lambda uid: uid == "owner")
+
+    denied = await reply_admin.set_reply_shorten(
+        ToolContext(agent_id="engineer", user_id="someone"), enabled=False)
+    assert "only an admin" in denied
+    assert runtime == {}, "a non-admin changed the setting"
+
+    allowed = await reply_admin.set_reply_shorten(
+        ToolContext(agent_id="engineer", user_id="owner"), enabled=True)
+    assert "ON" in allowed
+    assert runtime["reply_shorten"] == {"enabled": True}
+
+
+async def test_reading_the_setting_needs_no_admin(monkeypatch, runtime):
+    """Knowing whether your reply will be cut is not a privilege."""
+    from src.core.base import ToolContext
+    from src.tools import reply_admin
+
+    monkeypatch.setattr(reply_admin, "_is_admin", lambda uid: False)
+    out = await reply_admin.set_reply_shorten(ToolContext(agent_id="e", user_id="x"))
+    assert "No runtime override" in out
+
+
+async def test_the_tool_scopes_to_one_agent(monkeypatch, runtime):
+    from src.core.base import ToolContext
+    from src.tools import reply_admin
+
+    monkeypatch.setattr(reply_admin, "_is_admin", lambda uid: True)
+    await reply_admin.set_reply_shorten(
+        ToolContext(agent_id="e", user_id="owner"), enabled=False, agent="writer")
+    assert runtime == {"reply_shorten:writer": {"enabled": False}}
+
+
+async def test_an_unusable_threshold_is_refused(monkeypatch, runtime):
+    """Below ~100 chars there is no room for a conclusion before the cut, so
+    every reply would arrive as a fragment and the feature would look broken
+    rather than misconfigured.
+    """
+    from src.core.base import ToolContext
+    from src.tools import reply_admin
+
+    monkeypatch.setattr(reply_admin, "_is_admin", lambda uid: True)
+    out = await reply_admin.set_reply_shorten(
+        ToolContext(agent_id="e", user_id="owner"), enabled=True, threshold_chars=20)
+    assert "too small" in out
+    assert runtime == {}
