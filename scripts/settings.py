@@ -515,6 +515,38 @@ def edit_memory(cfg: dict):
         save_config(cfg)
 
 
+def edit_reply(cfg: dict):
+    """Reply length: post the point, keep the rest behind a reaction."""
+    header("Reply Length")
+    reply = cfg.setdefault("defaults", {}).setdefault("reply", {})
+    shorten = reply.setdefault("shorten", {})
+
+    show("enabled", shorten.get("enabled", False))
+    show("threshold_chars", shorten.get("threshold_chars", 700))
+    show("emoji", shorten.get("emoji", "\N{LEFT-POINTING MAGNIFYING GLASS}"))
+    show("ttl_hours", shorten.get("ttl_hours", 72))
+    print()
+    info("Over the threshold, a reply is cut at a section boundary and the head")
+    info("is posted with a footer saying how much was held back. The rest arrives")
+    info("when you react with the emoji below, or say \"more\". Nothing is")
+    info("summarised and nothing is lost: the cut is where a section starts.")
+    print()
+
+    if ask_yn("Edit reply settings?"):
+        shorten["enabled"] = ask_yn("Shorten long replies?",
+                                    default=shorten.get("enabled", False))
+        if shorten["enabled"]:
+            shorten["threshold_chars"] = ask_int(
+                "Shorten replies longer than (chars)",
+                shorten.get("threshold_chars", 700))
+            shorten["emoji"] = ask(
+                "Reaction that expands a shortened reply",
+                default=shorten.get("emoji", "\N{LEFT-POINTING MAGNIFYING GLASS}"))
+            shorten["ttl_hours"] = ask_int(
+                "Keep the held-back text for (hours)", shorten.get("ttl_hours", 72))
+        save_config(cfg)
+
+
 def edit_hitl(cfg: dict):
     header("Security — Human-in-the-Loop")
     hitl = cfg.setdefault("security", {}).setdefault("hitl", {})
@@ -1713,6 +1745,7 @@ MENU_ITEMS = [
     ("5", "Security / HITL", edit_hitl, True),
     ("6", "Rate Limits", edit_rate_limits, True),
     ("7", "Compression", edit_compression, True),
+    ("17", "Reply Length", edit_reply, True),
     ("8", "Admin Users", edit_admin_users, True),
     ("9", "Identity (name, log level)", edit_kbots_identity, True),
     ("10", "Agents", view_agents, False),
