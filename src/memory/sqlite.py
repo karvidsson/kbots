@@ -713,44 +713,63 @@ class SQLiteMemory(MemoryBackend):
         self.db.commit()
         return {"duplicates_found": len(duplicates), "removed": removed, "details": duplicates[:20]}
 
-    async def decay(self, decay_rate: float = 0.0108, archive_threshold: float = 0.05) -> dict:
-        """Decay confidence of unaccessed memories. Pinned memories are exempt.
+    # Categories decay never touches. A lesson is the most expensive kind of
+    # memory the fleet holds: it exists because something went wrong once and
+    # somebody paid for finding out. Forgetting it means paying again, and a
+    # lesson that has not been recalled for sixty days is not stale, it is a
+    # mistake that has not recurred yet.
+    IMMUNE_CATEGORIES = ("lesson",)
 
-        Called daily. Memories not accessed in 24h lose confidence at a flat rate.
-        At 0.0108/day from default 0.7: ~60 days to archive, ~90 days archived to purge.
+    async def decay(self, decay_rate: float = 0.0108, archive_threshold: float = 0.05,
+                    purge: bool = False, purge_after_days: int = 90) -> dict:
+        """Decay confidence of unaccessed memories, and archive the faded ones.
 
-        Lifecycle:
+        Memories not accessed in 24h lose confidence at a flat rate. From the
+        default 0.7 at 0.0108/day that is roughly 60 days to the archive
+        threshold. Recall resets last_accessed, so anything the fleet actually
+        uses never decays.
+
             Day 0:  0.70 (new memory)
-            Day 10: 0.59
             Day 30: 0.38
-            Day 60: 0.05 → archived
-            +90 days archived → permanently deleted
-            Accessed → last_accessed resets, decay pauses
-            Pinned → immune forever
+            Day 60: 0.05 -> archived (hidden from every read, still on disk)
+            Accessed -> decay pauses
+            Pinned, or category in IMMUNE_CATEGORIES -> never decays
+
+        `purge` deletes archived memories older than `purge_after_days`. It is
+        OFF by default and the caller has to ask for it: archiving is
+        reversible by editing one column and deleting is not, so the two do not
+        belong behind the same switch. This was previously unconditional, which
+        made "decay" a synonym for "delete in 150 days" on a store where
+        nothing had ever been recalled.
         """
         yesterday = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        immune = ",".join("?" * len(self.IMMUNE_CATEGORIES))
 
         # Decay: reduce confidence for non-pinned memories not accessed in 24h
         cursor = self.db.execute(
-            """UPDATE memories
+            f"""UPDATE memories
                SET confidence = MAX(confidence - ?, 0.0),
                    updated_at = CURRENT_TIMESTAMP
                WHERE pinned = 0
                  AND scope NOT LIKE 'archived%'
+                 AND (category IS NULL OR category NOT IN ({immune}))
                  AND (last_accessed IS NULL OR last_accessed < ?)""",
-            (decay_rate, yesterday),
+            (decay_rate, *self.IMMUNE_CATEGORIES, yesterday),
         )
         decayed = cursor.rowcount
 
-        # Archive: memories below threshold
+        # Archive: memories below threshold. Not a delete — the row keeps its
+        # original scope behind an `archived:` prefix, so restoring one is a
+        # string edit rather than a restore from backup.
         cursor = self.db.execute(
-            """UPDATE memories
+            f"""UPDATE memories
                SET scope = 'archived:' || scope,
                    updated_at = CURRENT_TIMESTAMP
                WHERE pinned = 0
                  AND scope NOT LIKE 'archived%'
+                 AND (category IS NULL OR category NOT IN ({immune}))
                  AND confidence < ?""",
-            (archive_threshold,),
+            (*self.IMMUNE_CATEGORIES, archive_threshold),
         )
         archived = cursor.rowcount
 
@@ -760,24 +779,26 @@ class SQLiteMemory(MemoryBackend):
                              json.dumps({"decayed": decayed, "archived": archived}))
             self.db.commit()
 
-        # Purge: hard-delete archived memories older than 90 days
-        purge_cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
-        cursor = self.db.execute(
-            """DELETE FROM memories
-               WHERE scope LIKE 'archived%'
-                 AND updated_at < ?""",
-            (purge_cutoff,),
-        )
-        purged = cursor.rowcount
-
-        if purged:
-            self._log_change("system", "memories", "purge",
-                             "batch", None,
-                             json.dumps({"purged": purged}))
-            self.db.commit()
+        purged = 0
+        if purge:
+            purge_cutoff = (datetime.utcnow()
+                            - timedelta(days=purge_after_days)).isoformat()
+            cursor = self.db.execute(
+                """DELETE FROM memories
+                   WHERE scope LIKE 'archived%'
+                     AND updated_at < ?""",
+                (purge_cutoff,),
+            )
+            purged = cursor.rowcount
+            if purged:
+                self._log_change("system", "memories", "purge",
+                                 "batch", None,
+                                 json.dumps({"purged": purged}))
+                self.db.commit()
 
         return {"decayed": decayed, "archived": archived, "purged": purged,
-                "decay_rate": decay_rate, "archive_threshold": archive_threshold}
+                "decay_rate": decay_rate, "archive_threshold": archive_threshold,
+                "purge_enabled": purge}
 
     async def backfill_embeddings(self, batch_size: int = 50) -> dict:
         """Generate embeddings for memories that don't have them yet."""

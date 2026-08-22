@@ -638,6 +638,21 @@ async def main() -> None:
                               graph_cfg=memory_cfg.get("graph"))
         asyncio.create_task(reflector.run(), name="reflector")
 
+    # --- Memory decay: fade what nothing recalls, archive what has faded ---
+    # Reads the backend the engine already opened, so it cannot decay a
+    # different database from the one being written to. The shell script it
+    # replaces resolved its own path and would have decayed the retired
+    # pre-data_dir store.
+    decay_backend = memory_backends.get(memory_cfg.get("backend", "sqlite")) \
+        or next(iter(memory_backends.values()), None)
+    if decay_backend is not None:
+        from src.core.memory_decay import MemoryDecay
+        decay = MemoryDecay(decay_backend, memory_cfg)
+        if decay.enabled:
+            asyncio.create_task(decay.run(), name="memory-decay")
+        else:
+            logger.info("Memory decay: OFF (defaults.memory.decay_enabled)")
+
     # --- Browser janitor: quit the shared debug Chrome after hours of idleness ---
     from src.core.browser_janitor import BrowserJanitor
     janitor = BrowserJanitor(config.get("browser", {}))

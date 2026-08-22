@@ -83,7 +83,21 @@ defaults:
   memory:
     backend: sqlite
     semantic_search: false
+    # Memories nothing recalls fade and are eventually archived. Recall resets
+    # the clock, so anything the fleet uses never decays. Runs inside the
+    # engine as a daily task; the old memory-decay.sh is retired.
     decay_enabled: false
+    decay:
+      interval_hours: 24
+      rate: 0.0108             # confidence lost per day, ~60 days to archive
+      archive_threshold: 0.05  # below this, hidden from every read
+      # Archiving hides a memory and keeps the row; purging deletes it. Two
+      # different decisions, so two different switches, and this one is off.
+      purge_archived: false
+      purge_after_days: 90
+      # Lessons never decay, whatever the settings above say. A lesson exists
+      # because something went wrong once and somebody paid for finding out.
+      # See SQLiteMemory.IMMUNE_CATEGORIES.
     max_results: 10
     # Can one agent read what another has learned? On by default: these are one
     # owner's agents working on one owner's business, and a lesson that cannot
