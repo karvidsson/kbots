@@ -2,15 +2,15 @@
 
 The extraction prompt has always asked the model to "reuse the exact same
 entity spelling" and to pick "a short reusable snake_case relation". Measured
-on the live fleet graph, that produced `Dr.Zoid` beside `Dr. Zoid`,
-`neon-husky` beside `Neon Husky`, and 71 distinct relation types across 190
+on the live fleet graph, that produced `Dr.Sable` beside `Dr. Sable`,
+`blue-fox` beside `Blue Fox`, and 71 distinct relation types across 190
 edges. Asking a model to be consistent is not a resolution strategy; this
 module is, and it runs on every write regardless of who authored the edge.
 
 Entity resolution here is deliberately deterministic: same name modulo case,
-punctuation and whitespace means same entity. It will NOT merge `Kristian`
-with `Kristian Arvidsson`, because a substring rule that merges those also
-merges `Neon Husky` with `Neon Husky Shorts`, and a wrongly merged entity is
+punctuation and whitespace means same entity. It will NOT merge `Ada`
+with `Ada Lindqvist`, because a substring rule that merges those also
+merges `Blue Fox` with `Blue Fox Shorts`, and a wrongly merged entity is
 far harder to notice and undo than a duplicated one.
 """
 
@@ -22,8 +22,8 @@ _NON_ALNUM = re.compile(r"[^a-z0-9]+")
 def entity_key(name: str) -> str:
     """The identity of an entity name: lowercase, alphanumerics only.
 
-    `Dr. Zoid`, `Dr.Zoid` and `dr zoid` share a key. `Kristian` and
-    `Kristian Arvidsson` deliberately do not.
+    `Dr. Sable`, `Dr.Sable` and `dr sable` share a key. `Ada` and
+    `Ada Lindqvist` deliberately do not.
     """
     return _NON_ALNUM.sub("", (name or "").lower())
 

@@ -25,7 +25,7 @@ REAL_MESSAGES = [
     "Why don't we do a overhaul on the whole memory logic",
     "fix it so no PR is open and everything is merged with no memory drop",
     "chrome won't stay up on :9222 -- what's wrong",
-    "kristian.arvidsson@gmail.com",
+    "someone.surname@example.com",
     'he said "deploy it" and then left',
 ]
 

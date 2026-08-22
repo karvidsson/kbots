@@ -377,7 +377,7 @@ class SQLiteMemory(MemoryBackend):
 
         Idempotent: re-extracting the same memory re-asserts the same anchors
         rather than duplicating them. Keyed on the canonical entity key, so
-        "Dr. Zoid" and "Dr.Zoid" anchor the same memory once.
+        "Dr. Sable" and "Dr.Sable" anchor the same memory once.
         """
         n = 0
         for name in entities or []:

@@ -132,7 +132,7 @@ def _pick_canonical(names: list[str], degree: dict[str, int]) -> str:
 
     Most-connected first, because that is the spelling the rest of the graph
     already points at and keeping it means rewriting fewer edges. Ties break on
-    the longer name ("Dr. Zoid" over "Dr.Zoid" — spacing is more likely to be
+    the longer name ("Dr. Sable" over "Dr.Sable" — spacing is more likely to be
     the considered form than its absence), then alphabetically so the choice is
     deterministic and a dry run predicts the real run exactly.
     """

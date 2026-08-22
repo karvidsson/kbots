@@ -194,14 +194,14 @@ def test_anchors_come_from_the_vector_engine_too_not_only_from_keyword(memory):
     async def go():
         seed = await memory.store(content="restarts pytest ruff gate",
                                   type="semantic", agent_id="eng", scope="global")
-        neighbour = await memory.store(content="Kristian prefers short reports.",
+        neighbour = await memory.store(content="Ada prefers short reports.",
                                        type="semantic", agent_id="eng", scope="global")
         for i in range(20):
             await memory.store(content=f"unrelated filler memory {i} about invoices",
                                type="semantic", agent_id="eng", scope="global")
         await memory.anchor_entities(seed, ["self-deploy.sh"])
-        await memory.anchor_entities(neighbour, ["Kristian"])
-        graph = FakeGraph([{"src": "self-deploy.sh", "rel": "owned_by", "dst": "Kristian"}])
+        await memory.anchor_entities(neighbour, ["Ada"])
+        graph = FakeGraph([{"src": "self-deploy.sh", "rel": "owned_by", "dst": "Ada"}])
         results = await recall(memory, "ruff pytest gate restarts", agent_id="eng",
                                limit=5, graph=graph)
         return neighbour, graph, results

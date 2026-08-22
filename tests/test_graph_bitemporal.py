@@ -3,7 +3,7 @@
 Two faults, both measured on the live fleet graph:
 
 Resolution was `MERGE (e:Entity {name: $name})` on an exact string, so there
-was no resolution at all: `Dr.Zoid`, `Dr. Zoid` and `dr zoid` were three nodes
+was no resolution at all: `Dr.Sable`, `Dr. Sable` and `dr sable` were three nodes
 holding a third of each other's edges.
 
 Nothing ever expired. A re-link did `ON MATCH SET r.confidence` and left both
@@ -35,11 +35,11 @@ def _gm(tmp_path, name="g.lbdb") -> GraphMemory:
 async def test_a_second_spelling_becomes_an_alias_not_a_second_node(tmp_path):
     gm = _gm(tmp_path)
     try:
-        await gm.link("Dr. Zoid", "works_on", "LinkedIn", scope="global", created_by="a")
-        edge = await gm.link("Dr.Zoid", "uses", "Canva", scope="global", created_by="a")
-        assert edge["a"] == "Dr. Zoid", "the second spelling created its own node"
+        await gm.link("Dr. Sable", "works_on", "LinkedIn", scope="global", created_by="a")
+        edge = await gm.link("Dr.Sable", "uses", "Canva", scope="global", created_by="a")
+        assert edge["a"] == "Dr. Sable", "the second spelling created its own node"
         names = {e["name"] for e in await gm.entities(agent_id="a")}
-        assert "Dr.Zoid" not in names
+        assert "Dr.Sable" not in names
     finally:
         gm.close()
 
@@ -53,13 +53,13 @@ async def test_resolution_survives_a_reopen(tmp_path):
     """
     gm = _gm(tmp_path)
     try:
-        await gm.link("Neon Husky", "published_on", "TikTok", scope="global", created_by="a")
+        await gm.link("Blue Fox", "published_on", "Shortform", scope="global", created_by="a")
     finally:
         gm.close()
     gm = _gm(tmp_path)
     try:
-        edge = await gm.link("neon-husky", "uses", "Jamendo", scope="global", created_by="a")
-        assert edge["a"] == "Neon Husky"
+        edge = await gm.link("blue-fox", "uses", "Bandpost", scope="global", created_by="a")
+        assert edge["a"] == "Blue Fox"
     finally:
         gm.close()
 
@@ -68,13 +68,13 @@ async def test_resolution_survives_a_reopen(tmp_path):
 async def test_the_alternative_spelling_is_kept_so_the_merge_is_auditable(tmp_path):
     gm = _gm(tmp_path)
     try:
-        await gm.link("Contribution Run", "part_of", "kbots", scope="global", created_by="a")
-        await gm.link("contribution-run", "uses", "Phaser", scope="global", created_by="a")
+        await gm.link("Ridge Runner", "part_of", "kbots", scope="global", created_by="a")
+        await gm.link("ridge-runner", "uses", "Phaser", scope="global", created_by="a")
         conn = await gm._ensure_open()
         from src.lib.graph_store import _rows
         rows = _rows(await conn.execute(
-            "MATCH (e:Entity {name: 'Contribution Run'}) RETURN e.aliases AS aliases"))
-        assert "contribution-run" in (rows[0]["aliases"] or "")
+            "MATCH (e:Entity {name: 'Ridge Runner'}) RETURN e.aliases AS aliases"))
+        assert "ridge-runner" in (rows[0]["aliases"] or "")
     finally:
         gm.close()
 
@@ -83,8 +83,8 @@ async def test_the_alternative_spelling_is_kept_so_the_merge_is_auditable(tmp_pa
 async def test_relations_are_normalised_on_write(tmp_path):
     gm = _gm(tmp_path)
     try:
-        await gm.link("Kristian", "employed_by", "Acme", scope="global", created_by="a")
-        edges = await gm.related("Kristian", agent_id="a")
+        await gm.link("Ada", "employed_by", "Acme", scope="global", created_by="a")
+        edges = await gm.related("Ada", agent_id="a")
         assert edges[0]["rel"] == "works_at"
     finally:
         gm.close()
@@ -115,10 +115,10 @@ async def test_a_query_by_synonym_finds_the_canonical_edge(tmp_path):
 async def test_a_new_value_of_a_single_valued_fact_closes_the_old_one(tmp_path):
     gm = _gm(tmp_path)
     try:
-        await gm.link("Kristian", "works_at", "OldCo", scope="global", created_by="a")
-        result = await gm.link("Kristian", "works_at", "NewCo", scope="global", created_by="a")
+        await gm.link("Ada", "works_at", "OldCo", scope="global", created_by="a")
+        result = await gm.link("Ada", "works_at", "NewCo", scope="global", created_by="a")
         assert result.get("superseded") == 1
-        current = await gm.related("Kristian", agent_id="a")
+        current = await gm.related("Ada", agent_id="a")
         assert [e["dst"] for e in current] == ["NewCo"]
     finally:
         gm.close()
@@ -131,9 +131,9 @@ async def test_the_superseded_fact_is_still_answerable_as_history(tmp_path):
     """
     gm = _gm(tmp_path)
     try:
-        await gm.link("Kristian", "works_at", "OldCo", scope="global", created_by="a")
-        await gm.link("Kristian", "works_at", "NewCo", scope="global", created_by="a")
-        history = await gm.history("Kristian", agent_id="a")
+        await gm.link("Ada", "works_at", "OldCo", scope="global", created_by="a")
+        await gm.link("Ada", "works_at", "NewCo", scope="global", created_by="a")
+        history = await gm.history("Ada", agent_id="a")
         by_dst = {h["dst"]: h for h in history}
         assert by_dst["OldCo"]["current"] is False
         assert by_dst["OldCo"]["valid_to"] is not None
@@ -166,12 +166,12 @@ async def test_re_asserting_the_current_fact_does_not_revive_an_expired_edge(tmp
     """
     gm = _gm(tmp_path)
     try:
-        await gm.link("Kristian", "works_at", "OldCo", scope="global", created_by="a")
-        await gm.link("Kristian", "works_at", "NewCo", scope="global", created_by="a")
-        await gm.link("Kristian", "works_at", "OldCo", scope="global", created_by="a")
-        current = [e["dst"] for e in await gm.related("Kristian", agent_id="a")]
+        await gm.link("Ada", "works_at", "OldCo", scope="global", created_by="a")
+        await gm.link("Ada", "works_at", "NewCo", scope="global", created_by="a")
+        await gm.link("Ada", "works_at", "OldCo", scope="global", created_by="a")
+        current = [e["dst"] for e in await gm.related("Ada", agent_id="a")]
         assert current == ["OldCo"], "re-asserting should supersede, not duplicate"
-        assert len(await gm.history("Kristian", agent_id="a")) >= 2
+        assert len(await gm.history("Ada", agent_id="a")) >= 2
     finally:
         gm.close()
 
@@ -184,11 +184,11 @@ async def test_expired_edges_are_absent_from_every_current_read(tmp_path):
     """
     gm = _gm(tmp_path)
     try:
-        await gm.link("Kristian", "located_in", "Malmo", scope="global", created_by="a")
-        await gm.link("Kristian", "located_in", "Stockholm", scope="global", created_by="a")
+        await gm.link("Ada", "located_in", "Malmo", scope="global", created_by="a")
+        await gm.link("Ada", "located_in", "Stockholm", scope="global", created_by="a")
 
-        assert [e["dst"] for e in await gm.related("Kristian", agent_id="a")] == ["Stockholm"]
-        assert [e["dst"] for e in await gm.find(entity="Kristian", agent_id="a")] == ["Stockholm"]
+        assert [e["dst"] for e in await gm.related("Ada", agent_id="a")] == ["Stockholm"]
+        assert [e["dst"] for e in await gm.find(entity="Ada", agent_id="a")] == ["Stockholm"]
         exported = await gm.export(agent_id="a")
         assert [e["dst"] for e in exported["edges"]] == ["Stockholm"]
         assert "Malmo" not in {n["name"] for n in exported["nodes"]}
@@ -216,9 +216,9 @@ async def test_the_loopback_client_exposes_history_too(tmp_path):
 async def test_history_is_the_one_read_that_shows_everything(tmp_path):
     gm = _gm(tmp_path)
     try:
-        await gm.link("Kristian", "located_in", "Malmo", scope="global", created_by="a")
-        await gm.link("Kristian", "located_in", "Stockholm", scope="global", created_by="a")
-        assert {h["dst"] for h in await gm.history("Kristian", agent_id="a")} == \
+        await gm.link("Ada", "located_in", "Malmo", scope="global", created_by="a")
+        await gm.link("Ada", "located_in", "Stockholm", scope="global", created_by="a")
+        assert {h["dst"] for h in await gm.history("Ada", agent_id="a")} == \
             {"Malmo", "Stockholm"}
     finally:
         gm.close()
@@ -247,10 +247,10 @@ async def test_unlink_removes_expired_versions_too(tmp_path):
     """
     gm = _gm(tmp_path)
     try:
-        await gm.link("Kristian", "works_at", "Wrong", scope="global", created_by="a")
-        await gm.link("Kristian", "works_at", "AlsoWrong", scope="global", created_by="a")
-        await gm.unlink("Kristian", "works_at", "Wrong", agent_id="a")
-        assert [h["dst"] for h in await gm.history("Kristian", agent_id="a")] == ["AlsoWrong"]
+        await gm.link("Ada", "works_at", "Wrong", scope="global", created_by="a")
+        await gm.link("Ada", "works_at", "AlsoWrong", scope="global", created_by="a")
+        await gm.unlink("Ada", "works_at", "Wrong", agent_id="a")
+        assert [h["dst"] for h in await gm.history("Ada", agent_id="a")] == ["AlsoWrong"]
     finally:
         gm.close()
 
@@ -258,13 +258,13 @@ async def test_unlink_removes_expired_versions_too(tmp_path):
 @needs_ladybug
 async def test_unlink_resolves_spellings_and_synonyms(tmp_path):
     """Otherwise an agent cannot remove an edge it just created: it wrote
-    'Dr.Zoid uses Canva', the store holds 'Dr. Zoid', and unlink by the name it
+    'Dr.Sable uses Canva', the store holds 'Dr. Sable', and unlink by the name it
     used silently removes nothing.
     """
     gm = _gm(tmp_path)
     try:
-        await gm.link("Dr. Zoid", "utilizes", "Canva", scope="global", created_by="a")
-        assert await gm.unlink("Dr.Zoid", "uses", "Canva", agent_id="a") == 1
-        assert await gm.related("Dr. Zoid", agent_id="a") == []
+        await gm.link("Dr. Sable", "utilizes", "Canva", scope="global", created_by="a")
+        assert await gm.unlink("Dr.Sable", "uses", "Canva", agent_id="a") == 1
+        assert await gm.related("Dr. Sable", agent_id="a") == []
     finally:
         gm.close()

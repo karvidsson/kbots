@@ -3,8 +3,8 @@
 Measured on the live fleet graph before this landed: 167 entities holding 190
 edges, 110 of them with degree 0 or 1, and 71 distinct relation names. `uses`
 and `part_of` carried a third of the edges and the rest were mostly singletons
-invented one extraction pass at a time. `Dr.Zoid` sat beside `Dr. Zoid`,
-`neon-husky` beside `Neon Husky`.
+invented one extraction pass at a time. `Dr.Sable` sat beside `Dr. Sable`,
+`blue-fox` beside `Blue Fox`.
 
 The extraction prompt had always asked the model to "reuse the exact same
 entity spelling" and to pick "a short reusable snake_case relation". Asking a
@@ -25,12 +25,12 @@ from src.lib.canonical import (
 
 
 @pytest.mark.parametrize("a,b", [
-    ("Dr.Zoid", "Dr. Zoid"),
-    ("neon-husky", "Neon Husky"),
-    ("Contribution Run", "contribution-run"),
+    ("Dr.Sable", "Dr. Sable"),
+    ("blue-fox", "Blue Fox"),
+    ("Ridge Runner", "ridge-runner"),
     ("self-deploy.sh", "self deploy sh"),
     ("KBOTS", "kbots"),
-    ("moving-to-a-house", "Moving To A House"),
+    ("house-move-app", "House Move App"),
 ])
 def test_spellings_of_the_same_thing_share_a_key(a, b):
     """Every one of these pairs was two separate nodes on the live graph."""
@@ -38,13 +38,13 @@ def test_spellings_of_the_same_thing_share_a_key(a, b):
 
 
 @pytest.mark.parametrize("a,b", [
-    ("Kristian", "Kristian Arvidsson"),
-    ("Neon Husky", "Neon Husky Shorts"),
+    ("Ada", "Ada Lindqvist"),
+    ("Blue Fox", "Blue Fox Shorts"),
     ("kbots", "kbots-overlay"),
 ])
 def test_substrings_are_deliberately_not_merged(a, b):
-    """A rule that merges 'Kristian' into 'Kristian Arvidsson' also merges
-    'Neon Husky' into 'Neon Husky Shorts'. A wrongly merged entity is far
+    """A rule that merges 'Ada' into 'Ada Lindqvist' also merges
+    'Blue Fox' into 'Blue Fox Shorts'. A wrongly merged entity is far
     harder to notice and undo than a duplicated one, so this stays conservative
     and the duplicate survives.
     """

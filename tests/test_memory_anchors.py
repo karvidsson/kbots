@@ -22,40 +22,40 @@ def run(coro):
 @pytest.fixture
 def anchored(memory):
     async def go():
-        mid = await memory.store(content="Neon Husky publishes on TikTok.",
-                                 type="semantic", agent_id="husky", scope="global")
-        await memory.anchor_entities(mid, ["Neon Husky", "TikTok"])
+        mid = await memory.store(content="Blue Fox publishes on Shortform.",
+                                 type="semantic", agent_id="fox", scope="global")
+        await memory.anchor_entities(mid, ["Blue Fox", "Shortform"])
         return mid
     return memory, run(go())
 
 
 def test_an_anchored_memory_is_reachable_from_its_entities(anchored):
     memory, mid = anchored
-    hits = run(memory.memories_for_entities(["TikTok"], agent_id="husky"))
+    hits = run(memory.memories_for_entities(["Shortform"], agent_id="fox"))
     assert [h["id"] for h in hits] == [mid]
 
 
 def test_entities_are_reachable_from_the_memory(anchored):
     memory, mid = anchored
-    assert set(run(memory.entities_for_memories([mid]))) == {"Neon Husky", "TikTok"}
+    assert set(run(memory.entities_for_memories([mid]))) == {"Blue Fox", "Shortform"}
 
 
 def test_lookup_is_by_canonical_key_not_by_spelling(anchored):
     """Traversal returns whatever spelling the graph stored. If the join were
-    by exact string, a graph that says 'neon-husky' could not find a memory
-    anchored as 'Neon Husky' and the hop would return nothing for the entities
+    by exact string, a graph that says 'blue-fox' could not find a memory
+    anchored as 'Blue Fox' and the hop would return nothing for the entities
     most likely to be duplicated.
     """
     memory, mid = anchored
-    for spelling in ("neon-husky", "NEON HUSKY", "Neon  Husky"):
-        hits = run(memory.memories_for_entities([spelling], agent_id="husky"))
+    for spelling in ("blue-fox", "BLUE FOX", "Blue  Fox"):
+        hits = run(memory.memories_for_entities([spelling], agent_id="fox"))
         assert [h["id"] for h in hits] == [mid], f"{spelling!r} did not resolve"
 
 
 def test_anchoring_is_idempotent(anchored):
     """Re-extraction re-asserts the same anchors on every reflection pass."""
     memory, mid = anchored
-    run(memory.anchor_entities(mid, ["Neon Husky", "neon husky", "TikTok"]))
+    run(memory.anchor_entities(mid, ["Blue Fox", "blue fox", "Shortform"]))
     rows = memory.db.execute(
         "SELECT COUNT(*) FROM memory_entities WHERE memory_id = ?", (mid,)).fetchone()
     assert rows[0] == 2
@@ -93,7 +93,7 @@ def test_forgetting_a_memory_removes_its_anchors(anchored):
     memory, mid = anchored
     run(memory.forget(mid))
     assert run(memory.entities_for_memories([mid])) == []
-    assert run(memory.memories_for_entities(["TikTok"], agent_id="husky")) == []
+    assert run(memory.memories_for_entities(["Shortform"], agent_id="fox")) == []
 
 
 def test_forgetting_leaves_no_entity_name_on_disk_for_that_memory(memory, tmp_path):
@@ -125,8 +125,8 @@ def test_forgetting_leaves_no_entity_name_on_disk_for_that_memory(memory, tmp_pa
 
 def test_unknown_entities_return_nothing_rather_than_everything(anchored):
     memory, _ = anchored
-    assert run(memory.memories_for_entities(["Nobody"], agent_id="husky")) == []
-    assert run(memory.memories_for_entities([], agent_id="husky")) == []
+    assert run(memory.memories_for_entities(["Nobody"], agent_id="fox")) == []
+    assert run(memory.memories_for_entities([], agent_id="fox")) == []
 
 
 def test_entities_are_ranked_by_how_many_hits_mention_them(memory):

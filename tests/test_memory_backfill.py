@@ -80,7 +80,7 @@ async def test_synonym_relations_are_collapsed(tmp_path):
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Kristian", "employed_by", "Acme")
+        await _raw_link(conn, "Ada", "employed_by", "Acme")
         await _raw_link(conn, "kbots", "utilizes", "SQLite")
         rep = backfill.Report()
         await backfill.pass_relations(conn, True, rep)
@@ -99,9 +99,9 @@ async def test_a_dry_run_writes_nothing(tmp_path):
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Kristian", "employed_by", "Acme")
-        await _raw_link(conn, "Dr.Zoid", "uses", "Canva")
-        await _raw_link(conn, "Dr. Zoid", "uses", "LinkedIn")
+        await _raw_link(conn, "Ada", "employed_by", "Acme")
+        await _raw_link(conn, "Dr.Sable", "uses", "Canva")
+        await _raw_link(conn, "Dr. Sable", "uses", "LinkedIn")
         before = await _edges(gm)
 
         rep = backfill.Report()
@@ -123,20 +123,20 @@ async def test_duplicate_spellings_are_merged_and_their_edges_survive(tmp_path):
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Dr. Zoid", "works_on", "LinkedIn")
-        await _raw_link(conn, "Dr. Zoid", "uses", "Canva")
-        await _raw_link(conn, "Dr.Zoid", "uses", "Figma")
-        await _raw_link(conn, "Kristian", "owns", "dr zoid")
+        await _raw_link(conn, "Dr. Sable", "works_on", "LinkedIn")
+        await _raw_link(conn, "Dr. Sable", "uses", "Canva")
+        await _raw_link(conn, "Dr.Sable", "uses", "Figma")
+        await _raw_link(conn, "Ada", "owns", "dr sable")
 
         await backfill.pass_entities(conn, True, backfill.Report())
 
         names = await _names(gm)
-        assert "Dr. Zoid" in names
-        assert "Dr.Zoid" not in names and "dr zoid" not in names
+        assert "Dr. Sable" in names
+        assert "Dr.Sable" not in names and "dr sable" not in names
 
         edges = await _edges(gm)
-        assert ("Dr. Zoid", "uses", "Figma") in {(e["src"], e["rel"], e["dst"]) for e in edges}
-        assert ("Kristian", "owns", "Dr. Zoid") in {(e["src"], e["rel"], e["dst"]) for e in edges}
+        assert ("Dr. Sable", "uses", "Figma") in {(e["src"], e["rel"], e["dst"]) for e in edges}
+        assert ("Ada", "owns", "Dr. Sable") in {(e["src"], e["rel"], e["dst"]) for e in edges}
         assert len(edges) == 4, "an edge was lost or duplicated in the merge"
     finally:
         gm.close()
@@ -150,12 +150,12 @@ async def test_the_most_connected_spelling_wins(tmp_path):
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "neon-husky", "uses", "Jamendo")
-        await _raw_link(conn, "neon-husky", "uses", "TikTok")
-        await _raw_link(conn, "neon-husky", "uses", "YouTube")
-        await _raw_link(conn, "Neon Husky", "part_of", "kbots")
+        await _raw_link(conn, "blue-fox", "uses", "Bandpost")
+        await _raw_link(conn, "blue-fox", "uses", "Shortform")
+        await _raw_link(conn, "blue-fox", "uses", "YouTube")
+        await _raw_link(conn, "Blue Fox", "part_of", "kbots")
         await backfill.pass_entities(conn, True, backfill.Report())
-        assert "neon-husky" in await _names(gm)
+        assert "blue-fox" in await _names(gm)
     finally:
         gm.close()
 
@@ -165,12 +165,12 @@ async def test_the_merge_is_auditable_afterwards(tmp_path):
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Dr. Zoid", "uses", "Canva")
-        await _raw_link(conn, "Dr.Zoid", "uses", "Figma")
+        await _raw_link(conn, "Dr. Sable", "uses", "Canva")
+        await _raw_link(conn, "Dr.Sable", "uses", "Figma")
         await backfill.pass_entities(conn, True, backfill.Report())
         rows = _rows(await conn.execute(
-            "MATCH (e:Entity {name: 'Dr. Zoid'}) RETURN e.aliases AS aliases"))
-        assert "Dr.Zoid" in (rows[0]["aliases"] or "")
+            "MATCH (e:Entity {name: 'Dr. Sable'}) RETURN e.aliases AS aliases"))
+        assert "Dr.Sable" in (rows[0]["aliases"] or "")
     finally:
         gm.close()
 
@@ -184,7 +184,7 @@ async def test_merging_does_not_create_a_self_edge(tmp_path):
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Dr. Zoid", "related_to", "Dr.Zoid")
+        await _raw_link(conn, "Dr. Sable", "related_to", "Dr.Sable")
         await backfill.pass_entities(conn, True, backfill.Report())
         assert [e for e in await _edges(gm) if e["src"] == e["dst"]] == []
     finally:
@@ -197,8 +197,8 @@ async def test_running_the_passes_twice_changes_nothing_the_second_time(tmp_path
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Dr. Zoid", "employed_by", "Acme")
-        await _raw_link(conn, "Dr.Zoid", "utilizes", "Canva")
+        await _raw_link(conn, "Dr. Sable", "employed_by", "Acme")
+        await _raw_link(conn, "Dr.Sable", "utilizes", "Canva")
         for _ in range(2):
             await backfill.pass_relations(conn, True, backfill.Report())
             await backfill.pass_timestamps(conn, True, backfill.Report())
@@ -238,8 +238,8 @@ async def test_an_existing_contradiction_is_closed_newest_first(tmp_path):
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Kristian", "works_at", "OldCo", created_at="2026-01-01")
-        await _raw_link(conn, "Kristian", "works_at", "NewCo", created_at="2026-08-01")
+        await _raw_link(conn, "Ada", "works_at", "OldCo", created_at="2026-01-01")
+        await _raw_link(conn, "Ada", "works_at", "NewCo", created_at="2026-08-01")
         await backfill.pass_timestamps(conn, True, backfill.Report())
         await backfill.pass_supersede(conn, True, backfill.Report())
         by_dst = {e["dst"]: e for e in await _edges(gm)}
@@ -269,11 +269,11 @@ async def test_existing_memories_are_anchored_to_the_entities_they_mention(tmp_p
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Jamendo", "uses", "Neon Husky")
-        mid = await memory.store(content="Neon Husky uploaded the new track to Jamendo.",
+        await _raw_link(conn, "Bandpost", "uses", "Blue Fox")
+        mid = await memory.store(content="Blue Fox uploaded the new track to Bandpost.",
                                  type="semantic", agent_id="t", scope="global")
         await backfill.pass_anchors(conn, memory, True, backfill.Report())
-        assert set(await memory.entities_for_memories([mid])) == {"Neon Husky", "Jamendo"}
+        assert set(await memory.entities_for_memories([mid])) == {"Blue Fox", "Bandpost"}
     finally:
         gm.close()
 
@@ -281,13 +281,13 @@ async def test_existing_memories_are_anchored_to_the_entities_they_mention(tmp_p
 @needs_ladybug
 async def test_anchoring_matches_whole_words_only(tmp_path, memory):
     """Substring matching would anchor every memory containing 'run' to the
-    game 'Contribution Run'. Anchors drive the graph hop, so a wrong one does
+    game 'Ridge Runner'. Anchors drive the graph hop, so a wrong one does
     not just add noise, it spends the traversal budget on it.
     """
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Ledger", "uses", "CSV")
+        await _raw_link(conn, "Tally", "uses", "CSV")
         mid = await memory.store(content="The ledgers were unreadable and the CSVs stale.",
                                  type="semantic", agent_id="t", scope="global")
         await backfill.pass_anchors(conn, memory, True, backfill.Report())
@@ -318,8 +318,8 @@ async def test_anchoring_twice_does_not_duplicate(tmp_path, memory):
     gm = _gm(tmp_path)
     try:
         conn = await gm._ensure_open()
-        await _raw_link(conn, "Jamendo", "uses", "Neon Husky")
-        await memory.store(content="Neon Husky is on Jamendo.", type="semantic",
+        await _raw_link(conn, "Bandpost", "uses", "Blue Fox")
+        await memory.store(content="Blue Fox is on Bandpost.", type="semantic",
                            agent_id="t", scope="global")
         rep = backfill.Report()
         await backfill.pass_anchors(conn, memory, True, rep)
