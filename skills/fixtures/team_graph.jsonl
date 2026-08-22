@@ -1,0 +1,5 @@
+{"input": "show me a map of the agent team", "expect_tool": "agent_graph"}
+{"input": "who is on the team and what can they do?", "expect_tool": "agent_graph"}
+{"input": "generate the agent map", "expect_tool": "agent_graph"}
+{"input": "nice, thanks", "expect_no_tool": true}
+{"input": "what does tier mean in this system?", "expect_no_tool": true}
