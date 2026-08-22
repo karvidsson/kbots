@@ -48,6 +48,21 @@ _BOUNDARIES = (
     re.compile(r"\n\n"),                 # any paragraph break
 )
 
+# Anything that asks the reader for something. A cut that hides one of these
+# is the worst failure this feature can have: the message looks complete, and
+# the thing the reader was supposed to act on is behind a reaction nobody has a
+# reason to press. Found the hard way, on a real message, before shipping.
+#
+# Deliberately narrow. "Any sentence with a question mark" would match the
+# rhetorical questions ordinary prose is full of and would disable shortening
+# entirely, which is a different way to get the feature wrong.
+_ASKS = (
+    # The reply contract's decision block, through its last line.
+    re.compile(r"^DECISION:.*?(?:^IF NO REPLY:[^\n]*$|\Z)", re.M | re.S),
+    # A question as the closing line: "want me to run it?", "which one?"
+    re.compile(r"(?:^|\n)[^\n]*\?\s*$"),
+)
+
 _HEADING = re.compile(r"^#{1,6} ", re.M)
 _ENDS_ON_HEADING = re.compile(r"(^|\n)#{1,6} [^\n]*$")
 _FENCE = re.compile(r"^```", re.M)
@@ -71,6 +86,15 @@ def split_reply(content: str, threshold: int = DEFAULT_THRESHOLD) -> tuple[str, 
 
     min_head = min(MIN_HEAD, max(1, threshold // 2))
     min_tail = min(MIN_TAIL, max(1, threshold // 2))
+
+    # The cut has to fall after everything that asks the reader something.
+    # Where that is impossible under the threshold, which is exactly the case
+    # of a message that closes on a question, the reply goes out whole.
+    floor = 0
+    for pattern in _ASKS:
+        for m in pattern.finditer(content):
+            floor = max(floor, m.end())
+    min_head = max(min_head, floor)
     for pattern in _BOUNDARIES:
         candidates = []
         for m in pattern.finditer(content):

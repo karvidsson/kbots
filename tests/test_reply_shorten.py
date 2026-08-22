@@ -522,3 +522,76 @@ async def test_an_unusable_threshold_is_refused(monkeypatch, runtime):
         ToolContext(agent_id="e", user_id="owner"), enabled=True, threshold_chars=20)
     assert "too small" in out
     assert runtime == {}
+
+
+# --- never hide the ask ---
+#
+# Found on a real message before shipping: the splitter made a structurally
+# clean cut that put the DECISION block in the held-back half. The message read
+# as complete and the question the owner was supposed to answer was behind a
+# reaction nobody had a reason to press. That is the worst thing this feature
+# can do, because it fails silently and looks fine.
+
+DECISION_MSG = (
+    "It is global. The connector shortens on the way out and does not know "
+    "which agent wrote the message, which is wrong for at least one agent "
+    "here whose deliverable is the prose itself.\n\n"
+    "The pattern for fixing it already exists: llm, memory and tools all "
+    "resolve as an agent override, then defaults, then unset, and there is a "
+    "persistent per-agent override store on top of that.\n\n"
+    "DECISION: make it per-agent before it ships, or ship global?\n"
+    "OPTIONS:  A resolve per agent  /  B ship global\n"
+    "I'D PICK: A, because global is a known-wrong default for two agents.\n"
+    "IF NO REPLY: it stays unmerged and global.\n\n"
+    "## Evidence\n\n"
+    + ("Every one of these numbers came from the live store rather than from "
+       "reading the code, and the sample is small enough to state exactly. " * 3)
+)
+
+
+def test_a_decision_block_is_never_cut_away():
+    result = split_reply(DECISION_MSG, threshold=700)
+    assert result is not None, "this message is long enough to shorten"
+    head, rest = result
+    assert "DECISION:" in head
+    assert "IF NO REPLY:" in head, "the block was cut through the middle"
+    assert "DECISION" not in rest
+
+
+def test_the_whole_decision_block_stays_together():
+    """Half a decision block is worse than none: the options arrive without
+    the default that applies if the owner says nothing.
+    """
+    for threshold in range(300, 1200, 50):
+        result = split_reply(DECISION_MSG, threshold=threshold)
+        if result:
+            head = result[0]
+            for line in ("DECISION:", "OPTIONS:", "I'D PICK:", "IF NO REPLY:"):
+                assert line in head, f"threshold {threshold} split the block at {line}"
+
+
+def test_a_message_that_closes_on_a_question_is_sent_whole():
+    """The classic "want me to run it?" closer. There is no boundary after it,
+    so there is no cut that keeps it, so there is no cut.
+    """
+    content = ("A long explanation of the state of things. " * 40 +
+               "\n\nSay the word and I merge, deploy, and switch it on. "
+               "Want me to?")
+    assert split_reply(content, threshold=700) is None
+
+
+def test_rhetorical_questions_in_prose_do_not_disable_shortening():
+    """The narrow rule matters as much as the rule. "Any sentence with a
+    question mark" would match ordinary prose and quietly turn the feature off
+    everywhere, which is a different way to get it wrong.
+    """
+    content = ("The deploy broke and the gate went red on a dependency that "
+               "was never declared anywhere in this project. " * 5 +
+               "\n\n## What I changed\n\n" +
+               "The download path no longer imports it. " * 5 +
+               # Late, and rhetorical: under a broad rule this alone would push
+               # the protected floor past every boundary and silently disable
+               # shortening for the whole message.
+               "So why did nobody notice? Because the failure was one warning "
+               "per memory, from a subprocess whose log nobody reads. " * 4)
+    assert split_reply(content, threshold=700) is not None
