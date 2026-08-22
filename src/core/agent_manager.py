@@ -27,6 +27,7 @@ from src.core.base import (
 )
 from src.core.skills import get_skill, render_skill_prompt
 from src.core.tools import get_tool, get_tools_for_agent
+from src.memory.recall import format_block, recall
 
 if TYPE_CHECKING:
     from src.core.access_control import AccessControl
@@ -332,9 +333,13 @@ class AgentManager:
     ) -> list[str]:
         """Auto-recall relevant memories and inject them as context.
 
-        Searches the memory backend directly for memories related to the user's
-        message. Returns the ids of any recalled *lesson* memories so a reaction
-        on the reply can score them (see feedback_map).
+        Runs the fused pipeline (keyword + vector + one graph hop) rather than
+        a single keyword search. Returns the ids of any recalled *lesson*
+        memories so a reaction on the reply can score them (see feedback_map).
+
+        This used to pass the raw message into an FTS5 MATCH, which on the live
+        store returned nothing for 96% of real user messages. See
+        src/memory/recall.py and src/memory/query.py.
         """
         if not user_message or len(user_message) < 5:
             return []
@@ -343,23 +348,26 @@ class AgentManager:
         if not memory:
             return []
 
-        query = user_message[:200]  # truncate long messages
+        query = user_message[:500]
 
         try:
-            results = await memory.search(query=query, agent_id=agent_id, limit=5)
-            if not results:
+            # A missing or unopenable graph must cost the graph hop, never the
+            # whole recall: the other two engines still have answers.
+            try:
+                from src.lib.graph_store import get_graph
+                graph = get_graph()
+            except Exception:
+                graph = None
+
+            results = await recall(memory, query, agent_id=agent_id,
+                                   limit=5, graph=graph)
+            block = format_block(results)
+            if not block:
                 return []
 
-            lines = ["<auto-recalled-memories>"]
-            for mem in results:
-                content = mem.get("content", "")
-                category = mem.get("category", "")
-                if content:
-                    lines.append(f"[{category}] {content}")
-            lines.append("</auto-recalled-memories>")
-
-            context_blocks.append("\n".join(lines))
-            logger.debug(f"Auto-recalled {len(results)} memories for {agent_id}")
+            context_blocks.append(block)
+            logger.debug(f"Auto-recalled {len(results)} memories for {agent_id} "
+                         f"(sources: {[r.get('sources') for r in results]})")
             return [m["id"] for m in results
                     if m.get("category") == "lesson" and m.get("id")]
 

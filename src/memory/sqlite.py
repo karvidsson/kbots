@@ -13,6 +13,8 @@ from pathlib import Path
 
 from src.core.base import PROJECT_ROOT, MemoryBackend
 from src.core.embedding import EmbeddingEngine
+from src.lib.canonical import entity_key
+from src.memory.query import fts_query
 
 logger = logging.getLogger(__name__)
 
@@ -52,11 +54,25 @@ class SQLiteMemory(MemoryBackend):
         self.db.execute("PRAGMA secure_delete=ON")
 
         self.embedding = EmbeddingEngine(model_dir=model_dir)
+        self._embed_failures = 0
         self._ensure_schema()
 
         count = self.db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
         db_size = Path(db_path).stat().st_size / (1024 * 1024)
         logger.info(f"SQLite memory: {count} memories, {db_size:.1f}MB ({db_path})")
+        # Said at boot, where it is read, rather than only at the moment of
+        # failure. A store whose vectors are missing looks healthy from every
+        # angle except the one query that needs them.
+        missing = self.missing_embeddings()
+        if missing:
+            logger.warning(
+                f"{missing} of {count} memories have no embedding and are invisible to "
+                f"semantic search. Backfill: scripts/memory-backfill.py --only embeddings")
+
+    def missing_embeddings(self) -> int:
+        """How many stored memories have no vector."""
+        return self.db.execute(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NULL").fetchone()[0]
 
     def _ensure_schema(self) -> None:
         """Create tables if they don't exist. Matches legacy memory-api schema exactly."""
@@ -100,6 +116,24 @@ class SQLiteMemory(MemoryBackend):
                 new_value TEXT,
                 reason TEXT
             );
+
+            -- Entity anchors: which graph entities a memory mentions.
+            -- Without these the two stores can only be joined by matching
+            -- names in prose, so a memory found by search offers no way into
+            -- the graph and an entity found by traversal offers no way back
+            -- to the facts that mention it. The reflector already resolves
+            -- each extracted edge to its source memory id and used to throw
+            -- that link away; this is where it lands now.
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (memory_id, entity_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_key
+                ON memory_entities(entity_key);
 
             CREATE TABLE IF NOT EXISTS tracking (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -167,13 +201,26 @@ class SQLiteMemory(MemoryBackend):
         if scope == "agent" and agent_id:
             scope = f"agent:{agent_id}"
 
-        # Generate embedding
+        # Generate embedding. A failure here is survivable — the memory is
+        # still stored and still findable by keyword — but it silently removes
+        # that memory from semantic search forever, because semantic_search
+        # filters on `embedding IS NOT NULL`. It was survivable 237 times in a
+        # row on the live fleet without anyone noticing, so it is counted and
+        # reported rather than logged once per memory at warning level.
         try:
             vec = self.embedding.embed_one(content)
             blob = EmbeddingEngine.to_blob(vec)
         except Exception as e:
-            logger.warning(f"Embedding generation failed: {e}")
             blob = None
+            self._embed_failures += 1
+            if self._embed_failures == 1:
+                logger.error(f"Embedding generation failed, memories are being stored "
+                             f"WITHOUT vectors and will not be reachable by semantic "
+                             f"search: {e}")
+            elif self._embed_failures % 25 == 0:
+                logger.error(f"{self._embed_failures} memories stored without vectors "
+                             f"so far. Run scripts/memory-backfill.py --only embeddings "
+                             f"once the model is available.")
 
         memory_id = str(uuid.uuid4())
         tags_json = json.dumps(tags) if tags else None
@@ -206,11 +253,24 @@ class SQLiteMemory(MemoryBackend):
 
     async def search(self, query: str, agent_id: str | None = None,
                      limit: int = 10, **kwargs) -> list[dict]:
-        """FTS5 keyword search with scope filtering."""
+        """FTS5 keyword search with scope filtering.
+
+        The query is rewritten into a safe FTS5 expression before it reaches
+        MATCH. Callers pass raw user text here (auto-recall passes the whole
+        message), and a sentence is not an FTS5 query: on the live store, 71%
+        of real user messages raised a syntax error and fell through to a
+        `LIKE '%whole message%'` that matched nothing. See memory/query.py.
+        """
         type_filter = kwargs.get("type")
         category_filter = kwargs.get("category")
 
         scope_sql, scope_params = self._scope_filter(agent_id, prefix="m.")
+
+        match_expr = fts_query(query)
+        if match_expr is None:
+            # Nothing searchable in the input. Returning everything would be
+            # worse than returning nothing, so return nothing.
+            return []
 
         sql = f"""
             SELECT m.*, rank
@@ -220,7 +280,7 @@ class SQLiteMemory(MemoryBackend):
               AND ({scope_sql})
               AND m.scope NOT LIKE 'archived%'
         """
-        params: list = [query] + scope_params
+        params: list = [match_expr] + scope_params
 
         if type_filter:
             sql += " AND m.type = ?"
@@ -235,15 +295,20 @@ class SQLiteMemory(MemoryBackend):
         try:
             rows = self.db.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
-            # FTS query syntax error — fall back to LIKE
-            fallback_sql = f"""SELECT m.*, 0 as rank FROM memories m
+            # Should be unreachable now that the expression is built rather
+            # than passed through, but a corrupt FTS index lands here too.
+            # Fall back on the longest single term, NOT the whole input: the
+            # old `LIKE '%<entire user message>%'` could only match a memory
+            # that contained the message verbatim, so it always returned zero.
+            longest = max(match_expr.replace('"', "").split(" OR "),
+                          key=len, default="")
+            rows = self.db.execute(
+                f"""SELECT m.*, 0 as rank FROM memories m
                     WHERE m.content LIKE ?
                       AND ({scope_sql})
                       AND m.scope NOT LIKE 'archived%'
-                    ORDER BY m.updated_at DESC LIMIT ?"""
-            rows = self.db.execute(
-                fallback_sql,
-                [f"%{query}%"] + scope_params + [limit],
+                    ORDER BY m.updated_at DESC LIMIT ?""",
+                [f"%{longest}%"] + scope_params + [limit],
             ).fetchall()
 
         results = [self._row_to_dict(r) for r in rows]
@@ -305,6 +370,70 @@ class SQLiteMemory(MemoryBackend):
 
         return scored[:limit]
 
+    # === Entity anchors (the join between this store and the graph) ===
+
+    async def anchor_entities(self, memory_id: str, entities) -> int:
+        """Record that `memory_id` mentions these graph entities.
+
+        Idempotent: re-extracting the same memory re-asserts the same anchors
+        rather than duplicating them. Keyed on the canonical entity key, so
+        "Dr. Sable" and "Dr.Sable" anchor the same memory once.
+        """
+        n = 0
+        for name in entities or []:
+            key = entity_key(str(name))
+            if not key:
+                continue
+            self.db.execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity, entity_key) "
+                "VALUES (?, ?, ?)", (str(memory_id), str(name), key))
+            n += 1
+        if n:
+            self.db.commit()
+        return n
+
+    async def entities_for_memories(self, memory_ids) -> list[str]:
+        """Entities anchored to any of these memories, most-mentioned first.
+
+        Ordered rather than DISTINCT-in-scan-order because the caller takes
+        only the top few as traversal anchors. An entity mentioned by several
+        of the hits is what the results are collectively about; one mentioned
+        by a single hit is a detail of that one memory. Unordered, which anchor
+        got the budget depended on SQLite's scan order.
+        """
+        ids = [str(m) for m in memory_ids or []]
+        if not ids:
+            return []
+        rows = self.db.execute(
+            f"""SELECT entity, COUNT(*) AS n FROM memory_entities
+                WHERE memory_id IN ({','.join('?' * len(ids))})
+                GROUP BY entity_key
+                ORDER BY n DESC, entity""", ids).fetchall()
+        return [r["entity"] for r in rows]
+
+    async def memories_for_entities(self, entities, agent_id: str | None = None,
+                                    limit: int = 10) -> list[dict]:
+        """Memories anchored to any of these entities, scope-filtered.
+
+        This is the step that makes a graph hop worth taking: traversal yields
+        entity names, and what the agent needs is the facts about them.
+        """
+        keys = [k for k in (entity_key(str(e)) for e in entities or []) if k]
+        if not keys:
+            return []
+        scope_sql, scope_params = self._scope_filter(agent_id, prefix="m.")
+        rows = self.db.execute(
+            f"""SELECT DISTINCT m.* FROM memories m
+                JOIN memory_entities me ON me.memory_id = m.id
+                WHERE me.entity_key IN ({','.join('?' * len(keys))})
+                  AND ({scope_sql})
+                  AND m.scope NOT LIKE 'archived%'
+                ORDER BY m.pinned DESC, m.confidence DESC, m.updated_at DESC
+                LIMIT ?""",
+            keys + scope_params + [limit],
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
     async def forget(self, memory_id: int | str) -> None:
         """Delete a memory by ID (string UUID or int rowid). Content does not survive.
 
@@ -335,6 +464,10 @@ class SQLiteMemory(MemoryBackend):
         # the content and any update diffs.
         self.db.execute("DELETE FROM changelog WHERE table_name = 'memories' AND record_id = ?",
                         (record_id,))
+        # Anchors name entities the deleted memory mentioned. Leaving them
+        # behind would keep a forgotten memory reachable by entity and leak
+        # which entities it was about.
+        self.db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (record_id,))
         self._log_change(None, "memories", "delete", record_id, None, None)
         self.db.commit()
 

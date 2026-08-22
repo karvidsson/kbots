@@ -71,6 +71,35 @@ async def memory_related(ctx: ToolContext, entity: str, depth: int = 1, limit: i
     return "\n".join(lines)
 
 
+@tool(name="memory_history", description="What the graph used to say about an entity, and when it changed", category="memory")
+async def memory_history(ctx: ToolContext, entity: str, limit: int = 50) -> str:
+    """Show every relationship touching an entity, superseded ones included.
+
+    Every other graph read shows only what is currently true. This one shows
+    what changed: when a single-valued fact is re-asserted with a new value,
+    the old edge is closed rather than deleted, and this is where it is still
+    visible. Use it when the question is "since when" or "what was it before".
+
+    Args:
+        entity: Entity name
+        limit: Max edges to return
+    """
+    try:
+        edges = await get_graph().history(entity, agent_id=ctx.agent_id, limit=limit)
+    except GraphUnavailableError as e:
+        return str(e)
+    if not edges:
+        return f"No history for '{entity}'."
+    lines = [f"History for '{entity}' ({len(edges)} edges, newest first):"]
+    for e in edges:
+        if e.get("current"):
+            when = f"since {e.get('valid_from') or 'unknown'}"
+        else:
+            when = f"{e.get('valid_from') or 'unknown'} → {e.get('valid_to')} (superseded)"
+        lines.append(f"  {e['src']} —{e['rel']}→ {e['dst']}  [{when}]")
+    return "\n".join(lines)
+
+
 @tool(name="memory_unlink", description="Remove a relationship you created from graph memory", category="memory")
 async def memory_unlink(ctx: ToolContext, a: str, rel: str, b: str) -> str:
     """Remove a relationship. Only edges you created (or scoped to you) can be removed."""

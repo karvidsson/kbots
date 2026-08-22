@@ -97,7 +97,10 @@ defaults:
     # to the sqlite backend. One shared graph for all agents; edges carry scope
     # (global / agent:<id> / group:<name>) like memories. Agents get the
     # memory_link / memory_related / memory_unlink / memory_graph_query /
-    # memory_graph tools. Requires: uv sync --extra graph
+    # memory_history / memory_graph tools. Requires: uv sync --extra graph
+    # Edges are bitemporal: re-asserting a single-valued fact (works_at,
+    # located_in, ...) closes the old edge instead of adding a second current
+    # one. Every read shows only open edges; memory_history shows the rest.
     # NOTE macOS 14: that sync fails — ladybug ships no macOS 14 wheels and its
     # source build needs the macOS 15 SDK. Workaround (a 2-line patch + local
     # wheel via the overlay): roadmap/graph-memory-ladybugdb.md → "macOS 14"
