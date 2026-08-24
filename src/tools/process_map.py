@@ -17,13 +17,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
 
-from src.core.base import KBOTS_TMP, PROJECT_ROOT, ToolContext
+from src.core.base import KBOTS_TMP, ToolContext
 from src.core.tools import tool
 from src.lib import process_model as pm
 from src.lib.wardley_svg import emit_wardley_svg
@@ -72,11 +71,19 @@ def _write_model(path: Path, model: dict) -> None:
 
 
 def _codex_root() -> Path:
-    """Overlay codex wins (mirrors src/core/startup_context.py), else core codex/."""
-    overlay = os.environ.get("KBOTS_OVERLAY")
-    if overlay and (Path(overlay) / "codex").is_dir():
-        return Path(overlay) / "codex"
-    return PROJECT_ROOT / "codex"
+    """Where a published process document is WRITTEN: the overlay's codex.
+
+    This was `overlay/codex if it is a dir else core/codex`, which reads as
+    overlay-first and is not. On an install whose overlay has no codex/ yet,
+    the first publish landed in the Core checkout, and so did every one after
+    it, because the overlay directory still did not exist. Core is replaced by
+    every deploy and is read-only under a hardened systemd unit, so the
+    document was either lost on the next pull or refused outright.
+
+    The directory is created rather than tested for.
+    """
+    from src.core.base import install_write_root
+    return install_write_root() / "codex"
 
 
 def _today() -> str:

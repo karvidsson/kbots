@@ -229,6 +229,31 @@ def resolve_config_file(name: str) -> Path:
     return PROJECT_ROOT / "config" / name
 
 
+def install_write_root() -> Path:
+    """The root that install-specific files are WRITTEN under.
+
+    The overlay when there is one, the Core checkout only when there is not
+    (a single-user dev clone, where Core is the only layer that exists).
+
+    Nothing an installation produces belongs in Core. Core is replaced by every
+    `git pull`, so a file written there survives until the next deploy and then
+    silently does not; a hardened systemd unit lists the engine root under
+    ReadOnlyPaths, so the same write fails outright on Linux while working on a
+    developer Mac that has no sandbox; and every loader reads Core first and
+    the overlay last, so a file written to Core also loses to its own overlay
+    counterpart.
+
+    The trap this exists to close is subtler than a hardcoded path. Several
+    resolvers took the form `overlay_path if overlay_path.exists() else core`,
+    which reads as overlay-first and is not: on a fresh install the overlay
+    file does not exist yet, so the FIRST write goes to Core, and because it
+    then still does not exist in the overlay, so does every write after it.
+    Read resolvers may be exists()-gated. Write resolvers may not.
+    """
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) if overlay else PROJECT_ROOT
+
+
 def overlay_state_path(name: str) -> Path | None:
     """Where a small shared state file is WRITTEN: the overlay's data/ directory.
 

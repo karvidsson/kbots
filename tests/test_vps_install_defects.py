@@ -447,3 +447,84 @@ def test_the_written_skill_is_the_one_that_reloads(tmp_path, monkeypatch):
         prompt="Overlay.", tools=[])
     from src.core.skills import get_all_skills
     assert get_all_skills()["probe_skill"].description == "overlay version"
+
+
+# --- 7. Nothing an installation produces belongs in Core (2026-08-24) -------
+#
+# The rule, after create_skill turned out to be one of several. Core is
+# replaced by every `git pull`, is read-only under a hardened systemd unit, and
+# is read FIRST by every loader while the overlay is read last. A file an
+# install writes there is therefore lost on the next deploy, refused outright
+# on Linux, or beaten by its own overlay counterpart.
+#
+# The trap is subtler than a hardcoded path. Several resolvers took the form
+#     overlay_path if overlay_path.exists() else core_path
+# which reads as overlay-first and is not: on a fresh install the overlay copy
+# does not exist, so the FIRST write goes to Core, and so does every one after
+# it, because it still does not exist in the overlay. Read resolvers may be
+# exists()-gated. Write resolvers may not.
+
+WRITE_RESOLVERS = [
+    ("a new skill", "src.core.digest", "skill_write_dir"),
+    ("the MCP server list", "src.core.digest", "mcp_yaml_write_path"),
+    ("a published process document", "src.tools.process_map", "_codex_root"),
+]
+
+
+@pytest.mark.parametrize("what,module,func", WRITE_RESOLVERS,
+                         ids=[w for w, _, _ in WRITE_RESOLVERS])
+def test_write_targets_are_in_the_overlay(what, module, func, tmp_path, monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    target = getattr(importlib.import_module(module), func)()
+    assert str(target).startswith(str(tmp_path)), (
+        f"{what} would be written to {target}, outside the overlay")
+
+
+@pytest.mark.parametrize("what,module,func", WRITE_RESOLVERS,
+                         ids=[w for w, _, _ in WRITE_RESOLVERS])
+def test_a_write_target_does_not_depend_on_the_overlay_copy_existing(
+        what, module, func, tmp_path, monkeypatch):
+    """The exists()-gate trap. The overlay here is empty, exactly as it is on
+    the first write of a fresh install, and the answer must not change.
+    """
+    import importlib
+
+    # A subdirectory, because tmp_path already holds the autouse roster
+    # isolation. This overlay must be as empty as a fresh install's.
+    fresh = tmp_path / "fresh-overlay"
+    fresh.mkdir()
+    monkeypatch.setenv("KBOTS_OVERLAY", str(fresh))
+    assert not any(fresh.iterdir()), "the fixture overlay must start empty"
+    target = getattr(importlib.import_module(module), func)()
+    assert str(target).startswith(str(fresh))
+
+
+@pytest.mark.parametrize("what,module,func", WRITE_RESOLVERS,
+                         ids=[w for w, _, _ in WRITE_RESOLVERS])
+def test_a_checkout_with_no_overlay_falls_back_to_core(what, module, func, monkeypatch):
+    """The single-user dev clone, where Core is the only layer there is. The
+    rule is 'not Core when there is somewhere better', not 'never Core'.
+    """
+    import importlib
+
+    from src.core.base import PROJECT_ROOT as ROOT
+
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    target = getattr(importlib.import_module(module), func)()
+    assert str(target).startswith(str(ROOT))
+
+
+def test_the_capability_listing_reads_the_same_mcp_file_the_loader_does(
+        tmp_path, monkeypatch):
+    """An overlay-installed MCP server was connected, running, and absent from
+    the one listing an agent consults to find out what it has.
+    """
+    import inspect
+
+    from src.tools import ingest
+
+    src = inspect.getsource(ingest.list_capabilities)
+    assert "_resolve_mcp_yaml" in src
+    assert 'PROJECT_ROOT / "config" / "mcp.yaml"' not in src

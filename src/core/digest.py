@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from src.core.base import PROJECT_ROOT
+from src.core.base import PROJECT_ROOT, install_write_root
 from src.core.skills import _skill_registry, load_skills
 from src.core.tools import _tool_registry
 
@@ -169,8 +169,7 @@ def skill_write_dir() -> Path:
     Falls back to Core when no overlay is configured, which is the single-user
     dev checkout where Core is the only layer there is.
     """
-    overlay = os.environ.get("KBOTS_OVERLAY", "")
-    return Path(overlay) / "skills" if overlay else PROJECT_ROOT / "skills"
+    return install_write_root() / "skills"
 
 
 def reload_skills() -> int:
@@ -334,13 +333,16 @@ def ingest_mcp_server(
 
     Supports both remote (SSE) and local (stdio) servers.
     """
-    mcp_path = _resolve_mcp_yaml()
-    if mcp_path.exists():
-        with open(mcp_path) as f:
+    # Read from wherever it currently lives, write to where it belongs. On a
+    # fresh install those differ, and only the write target must be the overlay.
+    read_path = _resolve_mcp_yaml()
+    mcp_path = mcp_yaml_write_path()
+    if read_path.exists():
+        with open(read_path) as f:
             config = yaml.safe_load(f) or {}
     else:
         config = {}
-        mcp_path.parent.mkdir(parents=True, exist_ok=True)
+    mcp_path.parent.mkdir(parents=True, exist_ok=True)
 
     entry: dict = {"transport": transport}
     if transport == "stdio":
@@ -378,13 +380,24 @@ def ingest_mcp_server(
 
 
 def _resolve_mcp_yaml() -> Path:
-    """Find mcp.yaml — overlay takes precedence over Core."""
+    """Find mcp.yaml for READING — overlay takes precedence over Core."""
     overlay = os.environ.get("KBOTS_OVERLAY")
     if overlay:
         p = Path(overlay) / "config" / "mcp.yaml"
         if p.exists():
             return p
     return PROJECT_ROOT / "config" / "mcp.yaml"
+
+
+def mcp_yaml_write_path() -> Path:
+    """Where install_mcp WRITES. Always the overlay when there is one.
+
+    The read resolver above is exists()-gated, which is right for reading and
+    wrong for writing: on a fresh install the overlay has no mcp.yaml, so the
+    first install_mcp would create it in Core, and every one after it too,
+    because the overlay copy still would not exist.
+    """
+    return install_write_root() / "config" / "mcp.yaml"
 
 
 def _load_mcp_servers() -> dict:
