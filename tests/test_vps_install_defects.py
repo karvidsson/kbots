@@ -528,3 +528,88 @@ def test_the_capability_listing_reads_the_same_mcp_file_the_loader_does(
     src = inspect.getsource(ingest.list_capabilities)
     assert "_resolve_mcp_yaml" in src
     assert 'PROJECT_ROOT / "config" / "mcp.yaml"' not in src
+
+
+# --- 8. Files at the root of read-only paths (2026-08-24, third bring-up) ---
+#
+# A fresh Debian install reached the Discord gateway and still could not do
+# anything: ~/.claude.json was unwritable, so Claude Code could not record the
+# workspace as trusted and every tool came back "unapproved-permission".
+#
+# ProtectHome=read-only makes $HOME read-only inside the namespace, and
+# ReadWritePaths listed only DIRECTORIES. Granting ~/.claude does not reach a
+# file sitting beside it.
+
+def test_the_claude_trust_file_is_writable(tmp_path):
+    """The file Claude Code writes to mark a workspace trusted. Without it the
+    install is up, connected, and unable to use a single tool.
+    """
+    rendered = _render(tmp_path)
+    home = [ln for ln in rendered.splitlines()
+            if ln.startswith("Environment=HOME=")][0].split("=", 2)[2]
+    rw = [ln for ln in rendered.splitlines() if ln.startswith("ReadWritePaths=")][0]
+    assert f"{home}/.claude.json" in rw, (
+        "granting the .claude directory does not cover the .claude.json file")
+
+
+def test_a_granted_file_that_may_not_exist_is_marked_optional(tmp_path):
+    """systemd fails at step NAMESPACE when a ReadWritePaths entry is missing,
+    which is the crash loop the directory creation exists to prevent. A file on
+    another account's home is one setup cannot create on its behalf, so it
+    carries the `-` prefix that makes absence tolerable.
+    """
+    rw = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadWritePaths=")][0]
+    entry = [p for p in rw.split() if p.endswith(".claude.json")][0]
+    assert entry.startswith("-"), f"{entry} would crash-loop a host where it is absent"
+
+
+def test_directories_setup_creates_are_not_marked_optional(tmp_path):
+    """The `-` prefix is for paths nobody can guarantee. Using it on the dirs
+    setup creates would hide a real failure to create them.
+    """
+    rw = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadWritePaths=")][0].split("=", 1)[1].split()
+    for d in setup_wizard.service_writable_dirs(tmp_path / "overlay"):
+        assert str(d) in rw, f"{d} is not granted"
+        assert f"-{d}" not in rw, f"{d} must not be optional — setup creates it"
+
+
+# --- the diagnosis, which sent the reader to a fix that could not work ------
+
+def _perm_warnings(monkeypatch, tmp_path, owned_by_us: bool, writable: bool):
+    import os as _os
+
+    from src.core import preflight
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    (tmp_path / ".claude.json").write_text("{}")
+    monkeypatch.setattr(preflight.os, "access", lambda p, mode: writable)
+    uid = _os.getuid() if owned_by_us else _os.getuid() + 1
+    monkeypatch.setattr(preflight, "_running_user", lambda: (uid, "kbots"))
+    # Only the Claude-config block is under test; agent workspaces are a
+    # separate check with its own warning.
+    return [w for w in preflight._check_permissions({}) if ".claude" in w]
+
+
+def test_a_wrong_owner_is_still_reported_as_a_chown(monkeypatch, tmp_path):
+    warns = _perm_warnings(monkeypatch, tmp_path, owned_by_us=False, writable=True)
+    assert warns and "sudo chown" in warns[0]
+
+
+def test_correct_owner_but_unwritable_does_not_suggest_chown(monkeypatch, tmp_path):
+    """What the VPS actually hit. The file was already kbots:kbots, the warning
+    said "not owned/writable ... run chown", and chown could not have helped:
+    it was the sandbox. A diagnosis that names the wrong cause costs more than
+    no diagnosis, because it is followed.
+    """
+    warns = _perm_warnings(monkeypatch, tmp_path, owned_by_us=True, writable=False)
+    assert warns, "an unwritable trust file must still warn"
+    # The COMMAND, not the word: the message is allowed to say "this is not a
+    # chown problem", and saying so is the point.
+    assert "sudo chown" not in warns[0], warns[0]
+    assert "ReadWritePaths" in warns[0], "does not name the actual fix"
+
+
+def test_a_healthy_file_produces_no_warning(monkeypatch, tmp_path):
+    assert _perm_warnings(monkeypatch, tmp_path, owned_by_us=True, writable=True) == []
