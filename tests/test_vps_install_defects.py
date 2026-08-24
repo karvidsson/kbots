@@ -281,3 +281,107 @@ def test_overlay_is_detected_from_the_shell_profile_a_stale_shell_never_read(
 
     found = vm.detect_overlay()
     assert found == ("/srv/kbots-overlay", "~/.bashrc")
+
+
+# --- 5. The generated systemd unit (2026-08-24, second Linux bring-up) -------
+#
+# Four defects from provisioning a fresh Debian host. Two were already fixed
+# (the state files moved under data/, the shell export moved above the guard);
+# these are the two that were not, plus one the report did not reach because
+# the service never stayed up long enough to try an agent-authored tool.
+
+import pathlib  # noqa: E402
+
+import setup as setup_wizard  # noqa: E402
+
+TEMPLATE = pathlib.Path(__file__).resolve().parents[1] / "config" / "kbots.service"
+RESCUE = pathlib.Path(__file__).resolve().parents[1] / "config" / "kbots-rescue.service"
+
+
+def _render(tmp_path, unit=None):
+    return setup_wizard.render_service_unit(
+        (unit or TEMPLATE).read_text(), tmp_path / "overlay",
+        [f"Environment=KBOTS_OVERLAY={tmp_path / 'overlay'}"])
+
+
+def test_no_percent_h_survives_into_the_installed_unit(tmp_path):
+    """`%h` in a SYSTEM unit is the service manager's home, so it expands to
+    /root and not to the User='s. The install died on
+    `failed to create directory /root/.cache/uv: Permission denied`.
+    """
+    assert "%h" not in _render(tmp_path)
+
+
+def test_home_is_the_service_accounts_not_the_installers(tmp_path):
+    """Resolved from the unit's own User=, because setup is routinely run
+    under sudo and Path.home() would then be root's.
+    """
+    rendered = _render(tmp_path)
+    assert "Environment=HOME=" in rendered
+    home = [ln for ln in rendered.splitlines() if ln.startswith("Environment=HOME=")][0]
+    assert home.split("=", 2)[2] not in ("/root", ""), home
+    assert "kbots" in home, "HOME does not belong to the User= account"
+
+
+def test_the_credential_paths_follow_the_same_home(tmp_path):
+    """The quiet half of the %h bug: Claude Code would look in
+    /root/.claude/.credentials.json, so an authenticated service account reads
+    as unauthenticated with no error anywhere.
+    """
+    rendered = _render(tmp_path)
+    home = [ln for ln in rendered.splitlines()
+            if ln.startswith("Environment=HOME=")][0].split("=", 2)[2]
+    rw = [ln for ln in rendered.splitlines() if ln.startswith("ReadWritePaths=")][0]
+    assert f"{home}/.claude" in rw and f"{home}/.cache" in rw
+
+
+def test_the_rescue_unit_is_rendered_too(tmp_path):
+    """It carries the same two lines and would strand the rescue service in
+    exactly the state it exists to recover from.
+    """
+    assert "%h" not in _render(tmp_path, RESCUE)
+
+
+def test_agent_authored_tools_and_skills_are_writable(tmp_path):
+    """create_tool writes a .py into <overlay>/tools and tool_scope keeps its
+    sidecar there; create_skill writes into <overlay>/skills. Neither was in
+    ReadWritePaths, so both fail under the sandbox and work perfectly on a Mac,
+    which has none.
+    """
+    rw = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadWritePaths=")][0]
+    assert f"{tmp_path / 'overlay' / 'tools'}" in rw
+    assert f"{tmp_path / 'overlay' / 'skills'}" in rw
+
+
+def test_every_writable_path_is_one_setup_creates(tmp_path):
+    """systemd builds the mount namespace BEFORE exec, so a ReadWritePaths
+    entry that does not exist fails at step NAMESPACE with status=226 and a
+    message naming the path rather than the permission. The service then
+    restart-loops without ever reaching the code that creates it lazily.
+    """
+    overlay = tmp_path / "overlay"
+    rw = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadWritePaths=")][0].split("=", 1)[1].split()
+    created = {str(d) for d in setup_wizard.service_writable_dirs(overlay)}
+    for path in rw:
+        if path == "/tmp" or "/.cache" in path or "/.claude" in path:
+            continue   # always present, or owned by an account setup cannot touch
+        assert path in created, f"{path} is granted but nothing creates it"
+
+
+def test_the_overlay_root_stays_read_only(tmp_path):
+    """The sandbox is right and the paths were wrong. Widening ReadOnlyPaths
+    to make writes work would undo the design rather than fix the bug.
+    """
+    ro = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadOnlyPaths=")][0]
+    assert str(tmp_path / "overlay") in ro
+
+
+def test_the_overlay_env_injection_survives_the_rewrite(tmp_path):
+    """The PATH line is where KBOTS_OVERLAY is injected. Rewriting that line
+    without re-adding the block would leave the service with no overlay, which
+    is the failure the injection exists to prevent.
+    """
+    assert f"Environment=KBOTS_OVERLAY={tmp_path / 'overlay'}" in _render(tmp_path)

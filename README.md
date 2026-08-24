@@ -172,6 +172,7 @@ Skills also surface as slash commands automatically (`/debrief`, etc.) — `/hel
 | Ignores messages unless DM'd | Agent is mention-only (default) | `@mention` the bot, or set `mentions: false` in agents.yaml routing |
 | Replies with an error / nothing, logs show Claude errors | Claude CLI auth expired | `/admin claude-auth refresh` in Discord; if that fails, `claude auth login` on the host, then `/admin reboot` |
 | Service won't start | Config or token problem | Logs: `journalctl -u kbots -f` (Linux) / `tail -f <overlay>/data/launchd.stderr.log` (macOS) |
+| `status=226/NAMESPACE`, restart loop (Linux) | A path in the unit's `ReadWritePaths` does not exist | systemd builds the sandbox before exec, so it never reaches the code that would create it. The log names the path: create it, `systemctl daemon-reload`, restart |
 | Slash commands missing | Global sync takes time | `/admin sync` in Discord, or wait up to an hour |
 | "Vault unlock failed" in logs | Key file missing/wrong | Re-run `uv run python setup.py` in the install dir — it re-prompts for the passphrase |
 

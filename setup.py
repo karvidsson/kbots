@@ -1423,6 +1423,73 @@ def step_extras(state: dict):
             _add_bot(state)
 
 
+def service_account_home(unit_text: str) -> Path:
+    """The home directory of the account the unit runs as.
+
+    `%h` in a SYSTEM unit is the service manager's home, which is root's, not
+    the `User=`'s. The template ships `Environment=HOME=%h` with a comment
+    saying it is rewritten at install time, and nothing rewrote it: a fresh
+    Debian install failed with `failed to create directory /root/.cache/uv:
+    Permission denied` and exited 2 before doing anything. Worse than the crash
+    is the near miss, since the same %h would send Claude Code to
+    /root/.claude/.credentials.json, where an authenticated service account
+    reads as unauthenticated.
+
+    Resolved from the unit's own User= rather than from whoever runs setup,
+    because setup is routinely run under sudo.
+    """
+    import pwd
+
+    for line in unit_text.splitlines():
+        if line.startswith("User="):
+            user = line.split("=", 1)[1].strip()
+            if user:
+                try:
+                    return Path(pwd.getpwnam(user).pw_dir)
+                except KeyError:
+                    # The account is created by install-systemd.sh, which may
+                    # not have run yet. Debian's adduser --system default.
+                    return Path("/home") / user
+    return Path.home()
+
+
+def service_writable_dirs(overlay: Path) -> list[Path]:
+    """Directories the unit grants ReadWritePaths and something must create.
+
+    /tmp and the home dotfile dirs are excluded: the first always exists, and
+    the second belong to an account setup may not be able to write into.
+    """
+    return [ENGINE_ROOT / "data", overlay / "agents", overlay / "config",
+            overlay / "data", overlay / "tmp", overlay / "tools",
+            overlay / "skills"]
+
+
+def render_service_unit(unit_text: str, overlay: Path, env_lines: list[str]) -> str:
+    """Fill the template's install-time placeholders.
+
+    ReadWritePaths gains tools/ and skills/: create_tool and create_skill write
+    a .py or .yaml into them and tool_scope keeps its sidecar in tools/, so
+    without them every agent-authored capability fails on Linux while working
+    perfectly on the developer's Mac, which has no sandbox.
+    """
+    home = service_account_home(unit_text)
+    out = []
+    for line in unit_text.split("\n"):
+        if line.startswith("Environment=HOME="):
+            out.append(f"Environment=HOME={home}")
+        elif line.startswith("Environment=PATH="):
+            out.append(f"Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin")
+            out.extend(env_lines)
+        elif line.startswith("ReadWritePaths="):
+            paths = " ".join(str(d) for d in service_writable_dirs(overlay))
+            out.append(f"ReadWritePaths={paths} /tmp {home}/.cache {home}/.claude")
+        elif line.startswith("ReadOnlyPaths="):
+            out.append(f"ReadOnlyPaths={ENGINE_ROOT} {overlay}")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
 def step_systemd(state: dict):
     header("Step 16: Systemd Services")
 
@@ -1495,24 +1562,18 @@ def step_systemd(state: dict):
         if state.get("kbots_modules"):
             env_lines.append(f"Environment=KBOTS_MODULES={state['kbots_modules']}")
 
-        lines = service.split("\n")
-        new_lines = []
-        kbots_home = Path.home()
-        for line in lines:
-            if line.startswith("Environment=PATH="):
-                new_lines.append(line)
-                new_lines.extend(env_lines)
-            elif line.startswith("ReadWritePaths="):
-                # Replace with overlay-aware paths regardless of template formatting
-                new_lines.append(
-                    f"ReadWritePaths={ENGINE_ROOT}/data {overlay}/agents {overlay}/config "
-                    f"{overlay}/data {overlay}/tmp /tmp {kbots_home}/.cache {kbots_home}/.claude"
-                )
-            elif line.startswith("ReadOnlyPaths="):
-                new_lines.append(f"ReadOnlyPaths={ENGINE_ROOT} {overlay}")
-            else:
-                new_lines.append(line)
-        service = "\n".join(new_lines)
+        service = render_service_unit(service, overlay, env_lines)
+
+        # Every writable path must exist before the unit starts. systemd builds
+        # the mount namespace BEFORE exec, so a ReadWritePaths entry that is
+        # missing fails at step NAMESPACE with status=226 and a message naming
+        # the path rather than the permission, and the service restart-loops
+        # without ever reaching the code that would have created it.
+        for d in service_writable_dirs(overlay):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                warn(f"Could not create {d}: {e} — the service may fail at step NAMESPACE")
 
         out_path = overlay / "systemd" / "kbots.service"
         out_path.write_text(service)
