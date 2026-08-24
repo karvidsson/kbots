@@ -1,0 +1,6 @@
+{"input": "what local models can this machine run?", "expect_tool": "llmfit_scan"}
+{"input": "check the hardware fit for local LLMs", "expect_tool": "llmfit_scan"}
+{"input": "which model should I use for coding locally?", "expect_tool": "llmfit_scan"}
+{"input": "rank local models for reasoning", "expect_tool": "llmfit_scan"}
+{"input": "thanks, that is what I needed", "expect_no_tool": true}
+{"input": "what is a GGUF file?", "expect_no_tool": true}

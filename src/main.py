@@ -667,6 +667,15 @@ async def main() -> None:
                           judge_cfg)
         asyncio.create_task(judge.run(), name="judge")
         logger.info(f"Turn judge: ON (provider={judge.provider}, model={judge.model})")
+    elif training_collector:
+        # Collection without labelling is a corpus nobody can filter. It ran
+        # that way for 1163 turns here, and the only way to notice was to go
+        # looking for a judgments file that had never been created.
+        status = training_collector.status()
+        logger.info(
+            f"Turn judge: OFF — {status['turns']} turns collected, "
+            f"{status['judgments']} judged, {status['rewards']} human reactions. "
+            f"Enable at kbots.training_collection.judge.enabled to label them.")
 
     # --- Run until interrupted ---
     stop_event = asyncio.Event()

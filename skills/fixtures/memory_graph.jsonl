@@ -1,0 +1,6 @@
+{"input": "show me my memory graph", "expect_tool": "memory_graph"}
+{"input": "draw the entities you remember and how they connect", "expect_tool": "memory_graph"}
+{"input": "show the shared memory graph", "expect_tool": "memory_graph", "expect_args": {"view": "shared"}}
+{"input": "show the whole fleet's graph", "expect_tool": "memory_graph", "expect_args": {"view": "all"}}
+{"input": "got it, cheers", "expect_no_tool": true}
+{"input": "how does graph memory differ from sqlite memory?", "expect_no_tool": true}
