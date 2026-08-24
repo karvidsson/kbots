@@ -94,11 +94,12 @@ Prefer to do it by hand? Same steps:
 ### Step 2 — clone and launch the wizard
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh     # if you don't have uv yet
 git clone https://github.com/karvidsson/kbots.git
 cd kbots
-uv sync && uv run python setup.py
+./setup
 ```
+
+`./setup` installs uv if you do not have it, syncs dependencies, and starts the wizard. (Still prefer the pieces? `uv run python setup.py` after `bash scripts/sync.sh`.)
 
 Three things worth knowing before you hit Enter:
 

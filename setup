@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# ./setup — the one command that brings a checkout up.
+#
+# Everything it does, the four-line block in the README also did. The point is
+# that it is one thing to type and one thing to get wrong: the old sequence
+# needed uv installed first, then `uv sync`, then `uv run python setup.py`, and
+# a person who skipped the middle step got a traceback about a missing module
+# rather than "run uv sync".
+#
+# Deliberately still bash and not a uv script: on a fresh machine uv is exactly
+# what may be missing, so the launcher cannot be written in the thing it
+# installs.
+set -uo pipefail
+
+cd "$(dirname "$0")" || exit 1
+
+say()  { printf '\033[0;36m%s\033[0m\n' "$*"; }
+warn() { printf '\033[0;33m%s\033[0m\n' "$*"; }
+die()  { printf '\033[0;31m%s\033[0m\n' "$*" >&2; exit 1; }
+
+# --- uv -----------------------------------------------------------------
+# Installed to ~/.local/bin, which the installing shell often does not have on
+# PATH yet. Sourcing the env file it writes is what stops "uv: command not
+# found" one line after a successful install.
+if ! command -v uv >/dev/null 2>&1; then
+    say "uv is not installed — fetching it from astral.sh"
+    curl -LsSf https://astral.sh/uv/install.sh | sh || die "uv install failed"
+    for env_file in "$HOME/.local/bin/env" "$HOME/.cargo/env"; do
+        [ -f "$env_file" ] && . "$env_file"
+    done
+    command -v uv >/dev/null 2>&1 || export PATH="$HOME/.local/bin:$PATH"
+    command -v uv >/dev/null 2>&1 || die \
+        "uv installed but is not on PATH. Open a new shell and run ./setup again."
+fi
+
+# --- python -------------------------------------------------------------
+# uv fetches its own interpreter, so a missing or old system python is not
+# fatal. Say so rather than letting the version look like a prerequisite.
+if ! uv python find ">=3.12" >/dev/null 2>&1; then
+    say "Python 3.12+ not found — uv will fetch one"
+fi
+
+# --- dependencies -------------------------------------------------------
+# scripts/sync.sh, not bare `uv sync`. A bare sync PRUNES every extra the
+# deployment has installed, which sync.sh says in its own header and which this
+# launcher got wrong on its first run: it removed the graph wheel and the test
+# tooling from a working checkout. The README's four-line block has the same
+# bug, and replacing that block is the point of this file.
+if [ -x scripts/sync.sh ]; then
+    say "Syncing dependencies..."
+    if ! bash scripts/sync.sh; then
+        die "Dependency sync failed. Fix the error above and run ./setup again."
+    fi
+else
+    say "Syncing dependencies (uv sync)..."
+    uv sync || die "uv sync failed. Fix the error above and run ./setup again."
+fi
+
+# --- the wizard ---------------------------------------------------------
+# exec, so Ctrl-C reaches the wizard directly and its exit code is ours.
+exec uv run python setup.py "$@"
