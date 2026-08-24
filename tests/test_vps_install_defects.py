@@ -385,3 +385,65 @@ def test_the_overlay_env_injection_survives_the_rewrite(tmp_path):
     is the failure the injection exists to prevent.
     """
     assert f"Environment=KBOTS_OVERLAY={tmp_path / 'overlay'}" in _render(tmp_path)
+
+
+# --- 6. create_skill wrote into the Core checkout (2026-08-24) --------------
+#
+# Found while predicting what the VPS agent would see if asked to try its own
+# tools. create_tool writes into the overlay; create_skill did not, so widening
+# the unit's ReadWritePaths to include <overlay>/skills would have bought
+# nothing and the fix would have looked applied while the failure continued.
+
+def test_a_new_skill_is_written_to_the_overlay(tmp_path, monkeypatch):
+    """Three defects at once, visible only as the third.
+
+    The engine root is under ReadOnlyPaths in a hardened unit, so the write
+    fails outright on Linux while working on a Mac, which has no sandbox. Core
+    is replaced by every `git pull`, so where it did work the skill survived
+    until the next deploy. And the loader reads Core first and the overlay
+    last, so a Core skill loses to any overlay skill of the same name.
+    """
+    from src.core import digest
+
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    assert digest.skill_write_dir() == tmp_path / "skills"
+
+
+def test_a_checkout_with_no_overlay_still_writes_somewhere(monkeypatch):
+    """The single-user dev checkout, where Core is the only layer there is."""
+    from src.core import digest
+    from src.core.base import PROJECT_ROOT
+
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    assert digest.skill_write_dir() == PROJECT_ROOT / "skills"
+
+
+def test_the_skill_lands_where_the_loader_will_find_it(tmp_path, monkeypatch):
+    """Written and read must agree. reload_skills() reads <overlay>/skills, so
+    a skill written anywhere else is created successfully and never appears.
+    """
+    from src.core import digest
+
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    path = digest.ingest_skill_from_text(
+        name="probe_skill", description="a test skill",
+        prompt="Do the thing.", tools=[])
+    assert path.parent == tmp_path / "skills"
+    assert path.is_file()
+    from src.core.skills import get_all_skills
+    assert "probe_skill" in get_all_skills()
+
+
+def test_the_written_skill_is_the_one_that_reloads(tmp_path, monkeypatch):
+    """The overlay is read last, so an overlay skill beats a Core one of the
+    same name. Writing to Core put every agent-authored skill on the losing
+    side of its own precedence rule.
+    """
+    from src.core import digest
+
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    digest.ingest_skill_from_text(
+        name="probe_skill", description="overlay version",
+        prompt="Overlay.", tools=[])
+    from src.core.skills import get_all_skills
+    assert get_all_skills()["probe_skill"].description == "overlay version"

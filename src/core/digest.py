@@ -152,6 +152,27 @@ class Digest:
             await self._on_reload(normalised)
 
 
+def skill_write_dir() -> Path:
+    """Where a NEWLY CREATED skill is written: the overlay, when there is one.
+
+    create_skill wrote into the Core checkout, which is wrong in three ways at
+    once and was only ever visible on the third.
+
+    A hardened systemd unit lists the engine root under ReadOnlyPaths, so the
+    write fails outright: an agent on a Linux install cannot create a skill at
+    all, and the same call works perfectly on a developer Mac, which has no
+    sandbox. Second, Core is replaced by every `git pull`, so on the machines
+    where it did work the skill survived until the next deploy. Third, the
+    loader reads Core first and the overlay last, so a skill written to Core is
+    also the one that loses to any overlay skill of the same name.
+
+    Falls back to Core when no overlay is configured, which is the single-user
+    dev checkout where Core is the only layer there is.
+    """
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) / "skills" if overlay else PROJECT_ROOT / "skills"
+
+
 def reload_skills() -> int:
     """Re-scan skills directories across all layers and update the registry."""
     _skill_registry.clear()
@@ -287,7 +308,7 @@ def ingest_skill_from_text(name: str, description: str, prompt: str,
     if llm:
         skill_data["llm"] = llm
 
-    skill_path = PROJECT_ROOT / "skills" / f"{name}.yaml"
+    skill_path = skill_write_dir() / f"{name}.yaml"
     skill_path.parent.mkdir(parents=True, exist_ok=True)
     with open(skill_path, "w") as f:
         yaml.dump(skill_data, f, default_flow_style=False, sort_keys=False)
