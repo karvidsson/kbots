@@ -578,7 +578,7 @@ The two are the same program (`uv run python -m src.main`) told apart only by `-
 
 On the main instance, `disallow_builtins` shuts off the built-in tools (Edit, Write, Bash), leaving agents with MCP tools alone. The ops instance opens everything up — and compensates by letting access control confine its use to the owner.
 
-Step 12 of `setup.py` optionally provisions the ops instance, producing its own `agents.rescue.yaml`, a bot account reserved for it, and the matching systemd unit.
+The ops-instance step of `setup.py` optionally provisions the ops instance, producing its own `agents.rescue.yaml` and a bot account reserved for it. The matching unit (`config/kbots-rescue.service`) is installed manually — the wizard prints the exact commands.
 
 ### Systemd
 
@@ -829,7 +829,7 @@ Patterns with wildcards also work:
 
 ## Vault
 
-Credentials sit Fernet-encrypted in `config/secrets.enc`, next to a per-instance random salt in `config/secrets.salt`. PBKDF2 (100k iterations) turns the passphrase into the key; at startup the secrets are decrypted into memory, and the passphrase itself is never written anywhere.
+Credentials sit Fernet-encrypted in `config/secrets.enc`, next to a per-instance random salt in `config/secrets.salt`. PBKDF2 (600k iterations for new vaults; older vaults are offered an in-place rekey by the wizard) turns the passphrase into the key; at startup the secrets are decrypted into memory. The passphrase itself is written to disk only if you accept the key-file prompt during setup (`~/.config/kbots-vault-key`, 0600) — the trade for unattended service start.
 
 Manage via: `uv run python vault-manage.py`
 
@@ -999,7 +999,7 @@ gh pr create
 
 **Hook enforcement:** On each commit the hook inspects the branch name; a commit attempted on `main` fails with a formatted message that walks through the branch + PR workflow. It also reminds agents that files specific to a deployment have no place in Core.
 
-Hooks go in automatically during `setup.py` Step 3; on later runs the wizard diffs the shipped hooks against what's installed and offers an update when they've drifted.
+Hooks go in automatically during the wizard's git-hooks step; on later runs the wizard diffs the shipped hooks against what's installed and offers an update when they've drifted.
 
 ### Test Mode
 ```bash

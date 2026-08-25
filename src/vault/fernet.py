@@ -309,6 +309,13 @@ class FernetVault(VaultBackend):
         """List all secret key names (not values)."""
         return list(self._secrets.keys())
 
+    def kdf_current(self) -> bool:
+        """True when the vault already uses a per-instance salt and the current
+        iteration count — i.e. rekey() would be a no-op. Existing vaults only;
+        a fresh vault records current parameters when first persisted."""
+        return (self._salt_path.exists()
+                and self._load_iterations() >= PBKDF2_ITERATIONS)
+
     def _persist(self) -> None:
         """Re-encrypt and write vault to disk."""
         if not self._fernet:
@@ -318,10 +325,16 @@ class FernetVault(VaultBackend):
         payload = json.dumps(self._secrets).encode()
         encrypted = self._fernet.encrypt(payload)
 
+        # Write-to-temp + rename, not truncate-in-place: a crash mid-write
+        # would otherwise destroy every secret the deployment has.
         self._vault_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(self._vault_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp_path = self._vault_path.with_name(self._vault_path.name + ".tmp")
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(encrypted)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, self._vault_path)
 
     def migrate_salt(self, passphrase: str) -> None:
         """Migrate from legacy hardcoded salt to per-instance random salt.

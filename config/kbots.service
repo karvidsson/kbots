@@ -14,7 +14,7 @@ WorkingDirectory=/opt/kbots
 ExecStart=/usr/local/bin/uv run --no-sync python -m src.main
 Restart=always
 RestartSec=10
-# HOME and PATH are set dynamically by setup.sh based on the service account
+# HOME and PATH are set dynamically by setup.py based on the service account
 Environment=HOME=%h
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
