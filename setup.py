@@ -1784,6 +1784,41 @@ def render_rescue_unit(template: str, overlay: Path, env_lines: list[str],
     return render_service_unit(template, overlay, env_lines)
 
 
+def build_health_config(state: dict) -> dict:
+    """Everything scripts/health-audit.sh needs to audit THIS deployment.
+
+    Built from wizard state rather than shipped as an example: the service
+    list, vault keys and paths are per-deployment facts the wizard already
+    holds, and a generic template would audit nothing real.
+    """
+    overlay: Path = state["overlay"]
+    services = ["kbots"]
+    if state.get("ops_profile") == "rescue":
+        services.append("kbots-rescue")
+    vault_keys: list[str] = []
+    if not state.get("discord_skip"):
+        vault_keys.append(state.get("bot_token_key", "discord-token"))
+    vault_keys += list((state.get("extra_bots") or {}).values())
+    return {
+        "deployment": "kbots",
+        "paths": {
+            "kbots_home": str(ENGINE_ROOT),
+            "overlay": str(overlay),
+            "vault": str(overlay / "config" / "secrets.enc"),
+            "memory_db": str(ENGINE_ROOT / "data" / "memory.db"),
+            "embeddings_model": str(ENGINE_ROOT / "data" / "models"
+                                    / "bge-small-en-v1.5"),
+        },
+        "thresholds": {"disk_percent": 80, "ram_percent": 85,
+                       "swap_percent": 70, "load_per_cpu": 1.5},
+        "services": services,
+        "config_files": [str(overlay / "config" / "config.yaml"),
+                         str(overlay / "config" / "agents.yaml"),
+                         str(overlay / "config" / "team.json")],
+        "vault_expected_keys": vault_keys,
+    }
+
+
 def step_systemd(state: dict):
     header("Step 16: Systemd Services")
 
@@ -1798,6 +1833,12 @@ def step_systemd(state: dict):
         warn("sudo not available — service files will be generated but not installed")
         info("You'll need to symlink them to /etc/systemd/system/ manually")
         print()
+
+    # The nightly health audit (and the system_audit tool) refuse to run
+    # without this file, and nothing ever shipped or generated one — so no
+    # deployment had a working audit until someone authored it by hand.
+    _write_yaml(overlay / "config" / "health-config.yaml",
+                build_health_config(state), state)
 
     # --- Generate timer unit files (required for memory decay, health, integrity) ---
     timers_dir = ENGINE_ROOT / "config" / "timers"
@@ -1961,6 +2002,12 @@ def step_launchd(state: dict):
     header("Step 16: launchd Service (macOS)")
 
     overlay: Path = state["overlay"]
+
+    # Timers are Linux-only, but the system_audit tool runs the same script
+    # on demand — it needs this file on macOS too.
+    _write_yaml(overlay / "config" / "health-config.yaml",
+                build_health_config(state), state)
+
     template_path = ENGINE_ROOT / "config" / "kbots.launchd.plist"
     if not template_path.exists():
         err(f"launchd template not found: {template_path}")
