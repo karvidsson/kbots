@@ -2160,11 +2160,11 @@ def _ask_routing(bot_account: str, default_mentions: bool = True) -> dict:
     channels = ask_ids("channel") if scope in (2, 4) else []
     categories = ask_ids("category") if scope in (3, 4) else []
 
-    guilds = []
-    if ask_yn("Restrict to specific server(s)? (most people: No — the bot only "
-              "works where it's invited anyway)", default=False):
-        guilds = ask_ids("server/guild")
-
+    # routing.discord.guilds (a per-agent server allowlist) is deliberately NOT
+    # asked here. The wizard serves single-server installs, where the answer is
+    # always "no restriction" — and defaulting it to the install's guild would
+    # be worse: the agent would silently ignore any server the bot is invited
+    # to later. The router still honors the key for hand-edited agents.yaml.
     users = []
     if ask_yn("Only respond to specific user(s)? (most people: No — team access "
               "tiers already gate who can talk to it)", default=False):
@@ -2179,8 +2179,6 @@ def _ask_routing(bot_account: str, default_mentions: bool = True) -> dict:
     }
     if categories:
         routing["discord"]["categories"] = categories
-    if guilds:
-        routing["discord"]["guilds"] = guilds
     if users:
         routing["discord"]["users"] = users
 
