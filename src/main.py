@@ -437,7 +437,13 @@ async def main() -> None:
     # and telling the owner what it just did. If this turn fails the server is
     # still correctly wired, which is the ordering that matters.
     if "discord" in active_connectors:
-        from src.core.server_setup import build_setup_message
+        from src.core.server_setup import build_join_intro_message, build_setup_message
+
+        def _agent_identity(agent_id):
+            from src.core.identity_boot import configured_name
+            cfg = (agent_manager.agent_configs or {}).get(agent_id) or {}
+            account = ((cfg.get("routing") or {}).get("discord") or {}).get("account", "")
+            return configured_name(agent_manager.agent_configs, agent_id), str(account)
 
         async def _on_guild_setup(agent_id, guild_id, guild_name, outcomes):
             channels = {o.key: o.channel_id for o in outcomes if o.channel_id}
@@ -447,19 +453,23 @@ async def main() -> None:
                     f"Server setup for '{guild_name}' wired no channel the agent "
                     f"can post in — skipping the introduction turn")
                 return
-            from src.core.identity_boot import configured_name
-            cfg = (agent_manager.agent_configs or {}).get(agent_id) or {}
-            account = ((cfg.get("routing") or {}).get("discord") or {}).get("account", "")
+            display_name, account = _agent_identity(agent_id)
             await agent_manager.handle_message(agent_id, build_setup_message(
                 agent_id, guild_id, guild_name, outcomes, "discord", home,
-                display_name=configured_name(agent_manager.agent_configs, agent_id),
-                account=str(account)))
+                display_name=display_name, account=account))
+
+        async def _on_guild_intro(agent_id, guild_id, guild_name, channel_id):
+            display_name, account = _agent_identity(agent_id)
+            await agent_manager.handle_message(agent_id, build_join_intro_message(
+                agent_id, guild_id, guild_name, "discord", channel_id,
+                display_name=display_name, account=account))
 
         active_connectors["discord"].set_setup_context(
             config,
             str(config.get("kbots", {}).get("data_dir", "./data")),
             _on_guild_setup,
             profile=profile or "",
+            on_guild_intro=_on_guild_intro,
         )
 
     # --- Start connectors ---

@@ -75,6 +75,7 @@ class DiscordConnector(Connector):
         self._full_config: dict = {}
         self._data_dir: str = ""
         self._on_guild_setup = None
+        self._on_guild_intro = None
         self._setup_profile: str = ""
         # Long replies are cut at a structural boundary; the rest arrives on a
         # reaction. Built here with no data dir, rebuilt in set_setup_context
@@ -82,13 +83,18 @@ class DiscordConnector(Connector):
         self._shortener = ReplyShortener(config.get("reply"), store_dir=".")
 
     def set_setup_context(self, config: dict, data_dir: str, on_guild_setup=None,
-                          profile: str = "") -> None:
+                          profile: str = "", on_guild_intro=None) -> None:
         """Give the connector what it needs to provision a newly joined server.
 
         on_guild_setup(agent_id, guild_id, guild_name, outcomes) is awaited after
         provisioning so the engine can hand that agent a turn. Optional: the
         channels are created either way, because they are deterministic and must
         not depend on an LLM turn succeeding.
+
+        on_guild_intro(agent_id, guild_id, guild_name, channel_id) is awaited
+        when a NON-setup bot joins a guild, so its agent introduces itself in
+        the platform-updates channel (the setup agent's provisioning turn
+        already covers its own introduction).
 
         profile: the engine profile this process runs under ("" for the main
         instance). A secondary instance (e.g. the rescue profile) sees only its
@@ -98,6 +104,7 @@ class DiscordConnector(Connector):
         self._full_config = config or {}
         self._data_dir = str(data_dir or "")
         self._on_guild_setup = on_guild_setup
+        self._on_guild_intro = on_guild_intro
         self._setup_profile = str(profile or "")
         # `defaults.reply` is engine config, not connector config, so the
         # shortener can only be built properly once the full config arrives.
@@ -718,11 +725,14 @@ class DiscordBot:
         """
         from src.core import server_setup
 
-        # Before any provisioning gate: every bot aligns its own nickname,
-        # including the ones that never provision.
-        await self._sync_nickname(guild)
-
         guild_id, guild_name = str(guild.id), getattr(guild, "name", "")
+
+        # Before any provisioning gate: every bot aligns its own nickname and
+        # schedules its introduction — including the ones that never provision.
+        await self._sync_nickname(guild)
+        asyncio.create_task(self._join_intro(guild_id, guild_name),
+                            name=f"join-intro-{self.account_name}-{guild_id}")
+
         full_config = getattr(self.connector, "_full_config", {}) or {}
         if not (full_config.get("server_setup", {}) or {}).get("on_guild_join", True):
             logger.info(f"[{self.account_name}] joined '{guild_name}' — auto-setup "
@@ -784,10 +794,63 @@ class DiscordBot:
         agent_id = agent_for_account(configs, "discord", self.account_name)
         handler = getattr(self.connector, "_on_guild_setup", None)
         if handler and agent_id:
+            # The setup turn already asks for an introduction — mark it so the
+            # join-intro task never posts a second one for this agent.
+            server_setup.record_intro(data_dir, guild_id, agent_id)
             try:
                 await handler(agent_id, guild_id, guild_name, outcomes)
             except Exception as e:
                 logger.error(f"Guild-setup turn for {agent_id} failed: {e}")
+
+    async def _join_intro(self, guild_id: str, guild_name: str) -> None:
+        """Introduce this bot's agent in the platform-updates channel, once.
+
+        The setup agent introduces itself as part of provisioning; every other
+        bot used to join silently and sit there until someone asked what it
+        was for. The channel may still be seconds away from existing when two
+        bots are invited back-to-back, so this waits for it briefly.
+        """
+        from src.core import server_setup
+        from src.core.identity_boot import agent_for_account
+
+        handler = getattr(self.connector, "_on_guild_intro", None)
+        configs = getattr(self.connector, "_agent_configs", {}) or {}
+        agent_id = agent_for_account(configs, "discord", self.account_name)
+        if handler is None or not agent_id:
+            return
+
+        data_dir = getattr(self.connector, "_data_dir", "") or "data"
+        full_config = getattr(self.connector, "_full_config", {}) or {}
+
+        # The setup bot's provisioning turn includes its introduction — when
+        # this join is about to provision, that path owns the intro.
+        if (not getattr(self.connector, "_setup_profile", "")
+                and (full_config.get("server_setup", {}) or {}).get("on_guild_join", True)
+                and server_setup.is_setup_account(configs, self.account_name)
+                and not server_setup.guild_is_set_up(data_dir, guild_id)):
+            return
+
+        if server_setup.intro_done(data_dir, guild_id, agent_id):
+            return
+
+        channel = ""
+        for _ in range(18):  # provisioning by the other bot: up to ~3 min
+            channel = server_setup.intro_channel(full_config)
+            if channel:
+                break
+            await asyncio.sleep(10)
+        if not channel:
+            logger.info(f"[{self.account_name}] no updates/alerts channel wired "
+                        f"in '{guild_name}' — skipping join introduction")
+            return
+
+        # Recorded BEFORE the turn: one introduction per (guild, agent), even
+        # if the model flubs it — a re-add must not become an intro loop.
+        server_setup.record_intro(data_dir, guild_id, agent_id)
+        try:
+            await handler(agent_id, guild_id, guild_name, channel)
+        except Exception as e:
+            logger.error(f"Join-intro turn for {agent_id} failed: {e}")
 
     async def on_ready(self) -> None:
         """Called when bot connects to Discord."""
