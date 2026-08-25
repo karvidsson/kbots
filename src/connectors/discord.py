@@ -2478,7 +2478,21 @@ class DiscordBot:
                         f"Skill {_skill_name}: non-admin {interaction.user.id} blocked "
                         "from direct-command path")
                     return
-                await interaction.response.defer()
+                # Discord voids an interaction token 3 seconds after dispatch.
+                # If the gateway lags or reconnects in that window the deferral
+                # raises NotFound 10062 and the skill body never runs, but the
+                # traceback reads "Ignoring exception in command '<skill>'",
+                # which looks like the skill crashed. Every followup on the same
+                # token would 404 too, so there is no way to tell the user:
+                # one warning line, and stop.
+                try:
+                    await interaction.response.defer()
+                except discord.NotFound:
+                    logger.warning(
+                        f"Skill {_skill_name}: interaction expired before defer "
+                        f"(Discord 10062) — the command never started. Usually a "
+                        f"gateway reconnect; ask the user to run it again.")
+                    return
                 if _command:
                     # Direct-command skills execute a host script, bypassing the
                     # LLM, access control, HITL and audit — so gate them to admins

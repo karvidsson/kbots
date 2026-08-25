@@ -184,3 +184,26 @@ def test_the_denial_is_ephemeral():
     body = SOURCE.split("async def _skill_cmd(")[1][:1400]
     denial = body[body.index("_is_admin"):body.index("response.defer()")]
     assert "ephemeral=True" in denial
+
+
+# --- a dropped interaction that reads as a crashed skill --------------------
+
+def test_the_deferral_is_guarded_against_an_expired_interaction():
+    """Discord voids an interaction token 3 seconds after dispatch. A gateway
+    lag or reconnect in that window makes defer() raise NotFound 10062, and the
+    uncaught exception surfaces as "Ignoring exception in command '<skill>'" —
+    which reads as the skill crashing when its body never ran. Every followup
+    on the same token 404s too, so there is nothing to tell the user with.
+    """
+    body = SOURCE.split("async def _skill_cmd(")[1][:2200]
+    assert "discord.NotFound" in body
+    guarded = body[body.index("try:"):body.index("if _command:", body.index("try:"))]
+    assert "response.defer()" in guarded, "the defer is outside the guard"
+
+
+def test_the_expired_interaction_is_logged_once_and_not_re_raised():
+    body = SOURCE.split("async def _skill_cmd(")[1][:2200]
+    handler = body[body.index("except discord.NotFound"):][:600]
+    assert "logger.warning" in handler
+    assert "raise" not in handler, "re-raising restores the misleading traceback"
+    assert "10062" in handler, "the log line should name the Discord error code"
