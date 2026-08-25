@@ -111,7 +111,7 @@ Three things worth knowing before you hit Enter:
 | The wizard asks for | Have ready from Step 1 |
 |---|---|
 | Overlay directory | Nothing — the default (a sibling of the install) is fine |
-| Vault passphrase | Pick one — it encrypts your tokens at rest |
+| Vault passphrase | Pick one (12+ chars) or press Enter to generate — it encrypts your tokens at rest |
 | Discord bot token | The token you copied |
 | Server (guild) ID | The server ID |
 | Your Discord user ID | Your user ID |
@@ -620,7 +620,8 @@ The exported `messages` preserve `user → assistant(tool_calls) → tool → as
 
 ## Security
 
-- **Credentials** live in a Fernet vault (AES-128-CBC at rest, PBKDF2 with 100k iterations) unlocked by passphrase at startup
+- **Credentials** live in a Fernet vault (AES-128-CBC at rest, PBKDF2 with 600k iterations) unlocked by passphrase at startup
+- **The key-file trade-off**: for unattended start (the service unlocking the vault after a reboot with nobody at a terminal), setup offers to save the passphrase to `~/.config/kbots-vault-key` (owner-only, 0600). Anyone who can read that file can unlock the vault — decline the prompt if you'd rather type the passphrase at each start
 - **Dangerous tools** pause behind per-tool HITL gates — a human approves via Discord reaction, with a timeout
 - **Access** is filtered three times per message: sender×agent tiers, per-sender tool restriction, static per-agent ceiling
 - **Runaway behavior** is capped by per-tool/per-agent sliding-window rate limits, agent-to-agent loop detection, and dedup of identical messages to a channel within 120s
