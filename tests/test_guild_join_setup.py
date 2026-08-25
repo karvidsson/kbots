@@ -26,13 +26,15 @@ def _agent(account, tier=""):
     return cfg
 
 
-def _bot(account, data_dir, configs=None, full_config=None, on_setup=None):
+def _bot(account, data_dir, configs=None, full_config=None, on_setup=None,
+         profile=""):
     connector = types.SimpleNamespace(
         config={},
         _agent_configs=configs if configs is not None else {"j": _agent("main")},
         _full_config=full_config if full_config is not None else {},
         _data_dir=str(data_dir),
         _on_guild_setup=on_setup,
+        _setup_profile=profile,
     )
     bot = DiscordBot(account_name=account, connector=connector, admin_users=[])
     bot._token = "tok"
@@ -122,3 +124,43 @@ async def test_provisioning_that_raises_marks_nothing(overlay, monkeypatch):
 
     assert not server_setup.guild_is_set_up(overlay, "42"), \
         "a guild marked done after a failed run would never be retried"
+
+
+async def test_a_secondary_instance_never_provisions(overlay, provisioned):
+    """The rescue instance loads only agents.rescue.yaml, so its single agent
+    elects itself setup account — which is how a dual-instance install created
+    every channel twice. The profile gate closes that hole."""
+    configs = {"e": _agent("engineer")}          # len==1 → would self-elect
+    await _bot("engineer", overlay, configs=configs,
+               profile="rescue").on_guild_join(_GUILD)
+
+    assert provisioned == []
+    assert not server_setup.guild_is_set_up(overlay, "42")
+
+
+async def test_a_claimed_guild_is_not_provisioned_again(overlay, provisioned):
+    """The done-marker lands after provisioning; the claim is what stops two
+    near-simultaneous joins from racing to create duplicate channels."""
+    assert server_setup.claim_guild_setup(overlay, "42", "other")
+    await _bot("main", overlay).on_guild_join(_GUILD)
+
+    assert provisioned == []
+
+
+def test_claim_has_exactly_one_winner(tmp_path):
+    assert server_setup.claim_guild_setup(tmp_path, "7", "a") is True
+    assert server_setup.claim_guild_setup(tmp_path, "7", "b") is False
+    server_setup.release_guild_claim(tmp_path, "7")
+    assert server_setup.claim_guild_setup(tmp_path, "7", "b") is True
+
+
+async def test_a_failed_run_releases_the_claim(overlay, monkeypatch):
+    """Adopt-before-create makes a retry safe, so a failure must not leave a
+    dead claim that blocks the retry forever."""
+    async def _boom(*a, **k):
+        raise RuntimeError("discord down")
+
+    monkeypatch.setattr(server_setup, "provision_guild", _boom)
+    await _bot("main", overlay).on_guild_join(_GUILD)
+
+    assert server_setup.claim_guild_setup(overlay, "42", "retry") is True

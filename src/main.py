@@ -459,6 +459,7 @@ async def main() -> None:
             config,
             str(config.get("kbots", {}).get("data_dir", "./data")),
             _on_guild_setup,
+            profile=profile or "",
         )
 
     # --- Start connectors ---

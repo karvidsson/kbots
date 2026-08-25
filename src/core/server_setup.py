@@ -26,6 +26,7 @@ Three rules make this safe to run against a live server:
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -132,6 +133,43 @@ def configured_channel(config: dict, spec: ChannelSpec) -> str:
 
 def _marker_path(data_dir: Path | str) -> Path:
     return Path(data_dir) / MARKER_FILE
+
+
+def _claim_path(data_dir: Path | str, guild_id: str) -> Path:
+    return Path(data_dir) / f"guild_setup.{guild_id}.claim"
+
+
+def claim_guild_setup(data_dir: Path | str, guild_id: str, account: str = "") -> bool:
+    """Atomically claim the right to provision a guild. True if we own it.
+
+    The done-marker alone can't prevent duplicates: it is written AFTER
+    provisioning, so two bots invited seconds apart both pass the marker
+    check and race to create the same five channels — Discord allows every
+    duplicate. O_CREAT|O_EXCL on a per-guild claim file makes exactly one
+    winner regardless of how many processes are watching the guild.
+    """
+    path = _claim_path(data_dir, guild_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps({"account": account}) + "\n")
+        return True
+    except FileExistsError:
+        return False
+    except OSError as e:
+        # Can't claim ⇒ can't dedupe, but provisioning is adopt-before-create
+        # and idempotent, so running anyway risks noise, not damage.
+        logger.warning(f"Could not claim guild setup for {guild_id}: {e} — proceeding")
+        return True
+
+
+def release_guild_claim(data_dir: Path | str, guild_id: str) -> None:
+    """Drop the claim so a later (re-)join can retry a failed provisioning."""
+    try:
+        _claim_path(data_dir, guild_id).unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def guild_is_set_up(data_dir: Path | str, guild_id: str) -> bool:
