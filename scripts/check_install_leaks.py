@@ -246,6 +246,31 @@ def overlay_roster_names(*, single_words: bool = False) -> set[str]:
     return names
 
 
+# Role phrases Core uses about itself, throughout its own documentation. A
+# deployment is free to name an agent "Main Agent", and if it does, this check
+# cannot tell that name apart from Core's own vocabulary: every "escalates to a
+# main agent" in ARCHITECTURE.md becomes a finding. self-deploy.sh gates on a
+# green suite and rolls back a red one, so that install cannot deploy at all
+# until it renames its agent or edits correct published documentation, and the
+# second of those is the wrong resolution to reach for.
+#
+# Skipped, not silently: skipped_generic_names() reports what was dropped, so
+# "this name is unscannable" never reads as "this name is clean".
+GENERIC_ROLE_NAMES = frozenset({
+    "main agent", "sub agent", "sub-agent", "primary agent", "ops agent",
+    "the agent", "coordinator", "agent",
+})
+
+
+def is_generic_role_name(name: str) -> bool:
+    return name.strip().lower() in GENERIC_ROLE_NAMES
+
+
+def skipped_generic_names(names: set[str]) -> list[str]:
+    """Roster names this check cannot scan for, because Core uses them itself."""
+    return sorted(n for n in names if is_generic_role_name(n))
+
+
 def roster_hits(text: str, source: str, names: set[str]) -> list[str]:
     """Findings for roster names appearing as names rather than as substrings.
 
@@ -264,9 +289,19 @@ def roster_hits(text: str, source: str, names: set[str]) -> list[str]:
     """
     found = []
     for name in sorted(names):
+        if is_generic_role_name(name):
+            continue
+        # Case-sensitive for a name made only of letters and spaces, because
+        # that is the shape that collides with ordinary English: "Main Agent"
+        # is a plausible agent name AND a phrase Core writes constantly. A name
+        # carrying punctuation — Data.Bot, some-bot — cannot be mistaken for
+        # prose, so it stays case-insensitive and still catches a lowercased
+        # mention in a commit message.
+        wordlike = bool(re.fullmatch(r"[A-Za-z][A-Za-z ]*", name))
+        flags = 0 if wordlike and " " in name else re.IGNORECASE
         pattern = re.compile(
             rf"(?<![A-Za-z0-9.]){re.escape(name)}(?!\.\w)(?![A-Za-z0-9])",
-            re.IGNORECASE)
+            flags)
         for i, line in enumerate(text.splitlines(), 1):
             if pattern.search(line):
                 found.append(f"{source}:{i}: names this installation's '{name}'")

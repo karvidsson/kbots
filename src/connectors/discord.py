@@ -1461,10 +1461,22 @@ class DiscordBot:
             # Access through connector's reference (set during startup)
             if hasattr(self.connector, '_agent_manager') and self.connector._agent_manager:
                 status = await self.connector._agent_manager.get_agent_status(agent_id)
+                # "Active sessions" counted retained conversation contexts and
+                # read as tasks in flight. Work first, contexts second, and
+                # labelled so the second cannot be mistaken for the first.
+                if status.get("running"):
+                    n = status.get("inflight_turns", 0)
+                    where = ", ".join(
+                        f"<#{c}>" for c in (status.get("inflight_channels") or []) if c)
+                    working = (f"Working on: {n} turn{'s' if n != 1 else ''} in flight"
+                               + (f" ({where})" if where else ""))
+                else:
+                    working = "Working on: idle — nothing running"
                 lines = [
                     f"**{status['display_name']}** (`{agent_id}`)",
                     f"LLM: `{status['llm_provider']}` / `{status['llm_model']}`",
-                    f"Active sessions: {status['active_sessions']}",
+                    working,
+                    f"Conversation contexts: {status['active_sessions']} (retained)",
                     f"Messages handled: {status['total_messages']}",
                     f"Tools: {', '.join(status['tools']) or 'none'}",
                 ]
