@@ -366,8 +366,9 @@ def test_every_writable_path_is_one_setup_creates(tmp_path):
     rw = [ln for ln in _render(tmp_path).splitlines()
           if ln.startswith("ReadWritePaths=")][0].split("=", 1)[1].split()
     created = {str(d) for d in setup_wizard.service_writable_dirs(overlay)}
+    home = str(setup_wizard.service_account_home(_render(tmp_path)))
     for path in rw:
-        if path == "/tmp" or "/.cache" in path or "/.claude" in path:
+        if path in ("/tmp", home) or "/.cache" in path or "/.claude" in path:
             continue   # always present, or owned by an account setup cannot touch
         assert path in created, f"{path} is granted but nothing creates it"
 
@@ -545,25 +546,21 @@ def test_the_capability_listing_reads_the_same_mcp_file_the_loader_does(
 def test_the_claude_trust_file_is_writable(tmp_path):
     """The file Claude Code writes to mark a workspace trusted. Without it the
     install is up, connected, and unable to use a single tool.
+
+    The CLI rewrites ~/.claude.json ATOMICALLY: mkstemp beside it, then
+    rename. A bind-mount on the file by name leaves its parent read-only, so
+    the temp file fails with EROFS — the service HOME itself must be granted.
     """
     rendered = _render(tmp_path)
     home = [ln for ln in rendered.splitlines()
             if ln.startswith("Environment=HOME=")][0].split("=", 2)[2]
-    rw = [ln for ln in rendered.splitlines() if ln.startswith("ReadWritePaths=")][0]
-    assert f"{home}/.claude.json" in rw, (
-        "granting the .claude directory does not cover the .claude.json file")
-
-
-def test_a_granted_file_that_may_not_exist_is_marked_optional(tmp_path):
-    """systemd fails at step NAMESPACE when a ReadWritePaths entry is missing,
-    which is the crash loop the directory creation exists to prevent. A file on
-    another account's home is one setup cannot create on its behalf, so it
-    carries the `-` prefix that makes absence tolerable.
-    """
-    rw = [ln for ln in _render(tmp_path).splitlines()
-          if ln.startswith("ReadWritePaths=")][0]
-    entry = [p for p in rw.split() if p.endswith(".claude.json")][0]
-    assert entry.startswith("-"), f"{entry} would crash-loop a host where it is absent"
+    rw = [ln for ln in rendered.splitlines()
+          if ln.startswith("ReadWritePaths=")][0].split("=", 1)[1].split()
+    assert home in rw, (
+        "granting .claude or .claude.json by name does not let the atomic "
+        "temp-file rewrite of ~/.claude.json succeed; grant the home dir")
+    assert not any(p.endswith(".claude.json") for p in rw), (
+        "a by-name grant of .claude.json is dead weight once HOME is granted")
 
 
 def test_directories_setup_creates_are_not_marked_optional(tmp_path):

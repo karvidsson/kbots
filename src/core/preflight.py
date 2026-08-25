@@ -184,9 +184,10 @@ def _check_permissions(config: dict) -> list[str]:
                     f"{p} is owned by '{user}' but is NOT writable — {consequence}. "
                     f"The owner is right, so this is not a chown problem: if this "
                     f"host runs the systemd unit, the path is read-only inside the "
-                    f"service's mount namespace. Add it to ReadWritePaths in "
-                    f"kbots.service (a file must be listed by name; granting its "
-                    f"parent directory does not cover it).")
+                    f"service's mount namespace. Grant the service HOME directory "
+                    f"itself in ReadWritePaths in kbots.service — Claude Code "
+                    f"rewrites ~/.claude.json atomically via a temp file beside "
+                    f"it, so listing the file by name is not enough).")
             break  # one message covers the pair
         except OSError:
             pass

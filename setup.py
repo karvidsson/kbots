@@ -1729,21 +1729,14 @@ def render_service_unit(unit_text: str, overlay: Path, env_lines: list[str]) -> 
             out.extend(env_lines)
         elif line.startswith("ReadWritePaths="):
             paths = " ".join(str(d) for d in service_writable_dirs(overlay))
-            # ~/.claude.json is a FILE at the root of a read-only home.
-            # ProtectHome=read-only makes $HOME read-only inside the namespace
-            # and granting the .claude DIRECTORY does not reach a file beside
-            # it. Claude Code writes that file to mark a workspace trusted, so
-            # without this the trust never persists and every agent gets
-            # "unapproved-permission" on every tool: the whole install is up,
-            # connected, and unable to do anything.
-            #
-            # The `-` prefix makes systemd tolerate it being absent. Without it
-            # a fresh install where Claude Code has not run yet fails at step
-            # NAMESPACE and crash-loops, which is the exact failure the
-            # directory creation above exists to prevent, reintroduced through
-            # a path setup cannot create on another account's behalf.
-            out.append(f"ReadWritePaths={paths} /tmp {home}/.cache {home}/.claude "
-                       f"-{home}/.claude.json")
+            # ~/.claude.json lives at the root of a read-only home
+            # (ProtectHome=read-only). Claude Code rewrites it ATOMICALLY to
+            # mark a workspace trusted: mkstemp(~/.claude.json.XXXX.tmp) then
+            # rename. Granting only the .claude directory, or even the file
+            # itself by name, leaves the temp file's parent read-only, so the
+            # write fails with EROFS, trust never persists, and every agent
+            # gets "unapproved-permission" on every tool. Grant the home dir.
+            out.append(f"ReadWritePaths={paths} /tmp {home}/.cache {home}/.claude {home}")
         elif line.startswith("ReadOnlyPaths="):
             out.append(f"ReadOnlyPaths={ENGINE_ROOT} {overlay}")
         else:
