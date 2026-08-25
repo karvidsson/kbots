@@ -677,6 +677,30 @@ class DiscordBot:
                          f"on shutdown: {e}")
         await self.client.close()
 
+    async def _sync_nickname(self, guild) -> None:
+        """Set this bot's guild nickname to its configured agent name.
+
+        Mechanical, not taste: the configured name IS the answer, so no agent
+        turn is spent on it. The account username may differ (a reused bot
+        application) and renaming it is rate-limited to 2/hour — a per-guild
+        nickname is always available with the Change Nickname permission and
+        makes the bot show up under the right name the moment it joins.
+        Skipped when the account name or existing nick already matches.
+        """
+        name = getattr(self, "_self_mention_name", "")
+        me = getattr(guild, "me", None)
+        if not name or me is None:
+            return
+        if getattr(me, "nick", None) == name or getattr(me, "name", "") == name:
+            return
+        try:
+            await me.edit(nick=name)
+            logger.info(f"[{self.account_name}] set nickname '{name}' in "
+                        f"'{getattr(guild, 'name', guild.id)}'")
+        except Exception as e:
+            logger.info(f"[{self.account_name}] could not set nickname in "
+                        f"'{getattr(guild, 'name', guild.id)}': {e}")
+
     async def on_guild_join(self, guild) -> None:
         """A server invited this bot: provision the channels a fleet needs.
 
@@ -685,13 +709,18 @@ class DiscordBot:
         is most of what installing kbots costs. It is also entirely mechanical,
         so it is code here and not a prompt: existing channels are adopted,
         anything already configured is left alone, and re-running changes
-        nothing. Only the parts that need taste, the nickname, the avatar and
-        the introduction, are handed to the agent afterwards.
+        nothing. Only the parts that need taste, the avatar and the
+        introduction, are handed to the agent afterwards — the nickname is
+        mechanical and set right here for EVERY bot, not just the setup one.
 
         One bot does this. Eight bots racing to create the same five channels
         would produce duplicates of each, and Discord would allow all of them.
         """
         from src.core import server_setup
+
+        # Before any provisioning gate: every bot aligns its own nickname,
+        # including the ones that never provision.
+        await self._sync_nickname(guild)
 
         guild_id, guild_name = str(guild.id), getattr(guild, "name", "")
         full_config = getattr(self.connector, "_full_config", {}) or {}
@@ -794,6 +823,11 @@ class DiscordBot:
                 record_bot_identity(name, str(self.client.user.id))
         except Exception as e:
             logger.debug(f"roster identity sync failed: {e}")
+
+        # Guilds joined while this bot was offline never fire on_guild_join,
+        # so align the nickname here too (no-op when it already matches).
+        for guild in self.client.guilds:
+            await self._sync_nickname(guild)
 
         # Clear any stale guild-specific commands, then sync global only.
         # Global commands work everywhere (servers + DMs). Guild commands
