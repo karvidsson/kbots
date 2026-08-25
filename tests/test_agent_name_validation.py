@@ -97,12 +97,15 @@ def test_the_rule_is_stated_once_and_reused():
 
 
 def test_setup_validates_at_the_prompt_not_at_generate():
-    """Both name prompts must go through the validating helper.
+    """Both agent identity prompts must go through the validating helper.
 
     A bare ask() here is the bug: it defers the failure past the point where a
-    correction is cheap.
+    correction is cheap. Since the one-name collapse, that helper is
+    ask_display_name — it derives the internal name and validates it with
+    agent_name_error before returning.
     """
     setup_src = (__import__("pathlib").Path(__file__).parent.parent / "setup.py").read_text()
     bare = re.findall(r'agent_name = ask\((?!_)', setup_src)
     assert bare == [], f"{len(bare)} agent-name prompt(s) still unvalidated"
-    assert setup_src.count("ask_agent_name(") >= 3   # definition + both prompts
+    assert setup_src.count("ask_display_name(") >= 3   # definition + both prompts
+    assert "agent_name_error(internal)" in setup_src   # derivation is validated

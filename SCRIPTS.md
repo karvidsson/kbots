@@ -15,18 +15,17 @@ uv run python setup.py
 4. **Git hooks** — installs the pre-commit hook, refreshing it on re-runs if it changed
 5. **Modules** — finds Layer 2 extension modules and asks which ones to enable
 6. **Vault** — sets up the encrypted credential vault, reusing one if it already exists
-7. **Discord** — bot token, guild choice, channel list
+7. **Main agent & Discord bot** — one name ("Atlas") drives the display name, folder, config key and bot account; then token, guild, install link, model, personality and routing — one agent, one bot, one step
 8. **Team** — configures the owner and team members
-9. **Agent** — name, model, and personality for the first agent
-10. **Machine control** — how much of the machine the main agent may touch: none (default), user shell, or root via a sudoers rule
-11. **HITL** — approval channel and approvers; which tools are gated (`send_email`, `install_mcp`, `create_agent`)
-12. **Compression** — context compression, if wanted; plus optional sub-steps 12b **Local models** (Ollama / LM Studio + tier router) and 12c **Training-data collection**
-13. **Optional features** — Python extras (data analysis, reports, web search, …) saved to `<overlay>/extras` so every future sync keeps them installed
-14. **Config generation** — produces config.yaml, agents.yaml, team.json, mcp.yaml, and the agent AGENTS.md
-15. **Ops instance** — optionally adds a privileged dev/ops agent with its own bot and service
-16. **Extras** — additional team members or bots (further *agents* are created post-setup by your main agent via its `create_agent` tool)
-17. **Service** — Linux: systemd units via `scripts/install-systemd.sh`; macOS: launchd plist. Starts the service and verifies the agent comes online
-18. **Browser** — optionally fetches Chromium for headless browsing
+9. **Machine control** — how much of the machine the main agent may touch: none (default), user shell, or root via a sudoers rule
+10. **HITL** — approval channel and approvers; which tools are gated (`send_email`, `install_mcp`, `create_agent`)
+11. **Compression** — context compression, if wanted; plus optional sub-steps for **Local models** (Ollama / LM Studio + tier router) and **Training-data collection**
+12. **Optional features** — Python extras (data analysis, reports, web search, …) saved to `<overlay>/extras` so every future sync keeps them installed
+13. **Config generation** — produces config.yaml, agents.yaml, team.json, mcp.yaml, and the agent AGENTS.md
+14. **Ops instance** — optionally adds a privileged dev/ops agent (one name here too — bot account and folder derive from it) with its own bot and service
+15. **Extras** — additional team members or bots (further *agents* are created post-setup by your main agent via its `create_agent` tool)
+16. **Service** — Linux: systemd units via `scripts/install-systemd.sh`; macOS: launchd plist. Starts the service and verifies the agent comes online
+17. **Browser** — optionally fetches Chromium for headless browsing
 
 ### `uninstall.py` — Uninstall Wizard
 Reverses `setup.py`: detects the install (overlay, engine clone, service, sudo rule, shell env, vault key), **offers to export it first**, then removes everything after confirmation. Leaves the engine source checkout in place.

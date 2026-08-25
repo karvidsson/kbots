@@ -190,29 +190,6 @@ def ask_id(prompt: str, required: bool = False) -> str:
             return ""
 
 
-def ask_agent_name(prompt: str, default: str = "") -> str:
-    """Ask for an agent's internal name, validating it here and now.
-
-    This used to be a bare ask(). The name was not checked until scaffold_agent
-    ran, many steps later, and a capitalised name then aborted the whole wizard
-    and rolled back — so a single typo cost every answer given since. Validating
-    at the point of entry is the difference between a two-second correction and
-    starting over.
-    """
-    while True:
-        raw = ask(prompt, default)
-        problem = agent_name_error(raw)
-        if not problem:
-            return raw
-        err(problem)
-        suggestion = suggest_agent_name(raw)
-        if suggestion:
-            info(f"Suggested: {suggestion}")
-            if ask_yn(f"Use '{suggestion}'?", default=True):
-                return suggestion
-        info(f"Internal name: {AGENT_NAME_RULE}.")
-
-
 def ask_ids(label: str) -> list[str]:
     """Collect zero or more Discord IDs, validated and de-duplicated."""
     info(f"Add {label} ID(s) one per line. Press Enter on a blank line when done.")
@@ -944,16 +921,57 @@ def step_vault(state: dict):
         state["vault_existed"] = False
 
 
+def ask_display_name(prompt: str, default: str) -> tuple[str, str]:
+    """One name question instead of three.
+
+    The user gives the Discord-facing name they actually want ('Atlas');
+    the internal name — folder, config key, bot account — is derived from it
+    ('atlas', 'My Bot 2' → 'my-bot-2') instead of being asked separately.
+    Only when nothing usable survives derivation does the question repeat.
+    """
+    while True:
+        display = ask(prompt, default) or default
+        internal = suggest_agent_name(display)
+        if internal and not agent_name_error(internal):
+            info(f"Internal name: {internal} (folder, config key, bot account)")
+            return display, internal
+        err(f"Couldn't derive an internal name from {display!r} "
+            f"— it must contain letters ({AGENT_NAME_RULE}).")
+
+
 def step_discord(state: dict):
-    header("Step 7: Discord Bot")
-    info("kbots connects to Discord via a bot account.")
+    header("Step 7: Main Agent & Discord Bot")
+    info("Your primary AI agent and the Discord bot account it speaks through")
+    info("— one agent, one bot, so it's one step.")
+    print()
+
+    vault: FernetVault = state["vault"]
+
+    display_name, internal = ask_display_name(
+        "Agent name (shown in Discord — you'll @mention this)", "Main")
+    description = ask("One-line description", "Primary agent")
+    model = ask_choice("LLM model", ["sonnet", "opus"], default="sonnet")
+    info("Optionally set a personality for the agent's identity file (AGENTS.md).")
+    personality = ask("Personality (e.g., 'concise and direct', "
+                      "'friendly and detailed')", "concise and direct")
+
+    state["agent"] = {
+        "name": internal,
+        "display_name": display_name,
+        "description": description,
+        "model": model,
+        "personality": personality,
+    }
+    state["bot_name"] = internal
+    state["bot_token_key"] = "discord-token"
+
+    print()
+    info("Now the bot account itself.")
     info("Create one at: https://discord.com/developers/applications")
     info("Required intents: Message Content, Server Members, Guild Messages")
     info("Tip: README → QUICKSTART Step 1 has a Claude-in-Chrome prompt that")
     info("automates the whole portal setup (except copying the token).")
     print()
-
-    vault: FernetVault = state["vault"]
 
     # A re-run against an existing vault shouldn't force a re-paste — the
     # token is already stored, and hunting it down again is the most annoying
@@ -965,12 +983,7 @@ def step_discord(state: dict):
             token = vault.get("discord-token")
     if not token:
         token = ask_discord_token("Paste your bot token")
-    while True:
-        if not token:
-            warn("Skipped — add a token later via vault-manage.py, then restart.")
-            state["discord_skip"] = True
-            return
-
+    while token:
         info("Validating token...")
         bot_info, reason = validate_discord_token(token)
         if bot_info:
@@ -988,29 +1001,34 @@ def step_discord(state: dict):
                 "Portal (Bot → Reset Token if it was regenerated).")
         token = ask_discord_token("Paste your bot token")
 
-    vault.set("discord-token", token)
-    ok("Token stored in vault")
+    if not token:
+        warn("Skipped — add a token later via vault-manage.py, then restart.")
+        state["discord_skip"] = True
+    else:
+        vault.set("discord-token", token)
+        ok("Token stored in vault")
 
-    # Guild ID + your user ID (validated snowflakes)
-    info("Tip: enable Discord Developer Mode (Settings → Advanced), then "
-         "right-click → Copy ID. Or read the server ID from the URL: "
-         "discord.com/channels/<server-id>/<channel-id>.")
-    guild_id = ask_id("Server (guild) ID")
-    state["guild_id"] = guild_id
+        # Guild ID + your user ID (validated snowflakes)
+        info("Tip: enable Discord Developer Mode (Settings → Advanced), then "
+             "right-click → Copy ID. Or read the server ID from the URL: "
+             "discord.com/channels/<server-id>/<channel-id>.")
+        guild_id = ask_id("Server (guild) ID")
+        state["guild_id"] = guild_id
 
-    user_id = ask_id("Your Discord user ID (makes you the admin)")
-    state["owner_discord_id"] = user_id
-    state["discord_skip"] = False
+        user_id = ask_id("Your Discord user ID (makes you the admin)")
+        state["owner_discord_id"] = user_id
+        state["discord_skip"] = False
 
-    # Bot account name
-    bot_name = ask("Internal name for this bot account", "main")
-    state["bot_name"] = bot_name
-    state["bot_token_key"] = "discord-token"
+        # Manage Channels: the main bot is the setup account — server
+        # auto-setup creates the fleet channels through it on guild join.
+        print()
+        show_invite_link(state, internal, token, bot_info, manage_channels=True)
 
-    # Manage Channels: the main bot is the setup account — server auto-setup
-    # creates the fleet channels through it on guild join.
+    # Routing (asked even when Discord was skipped — the agent config must
+    # exist either way, and the account wiring activates once a token lands).
     print()
-    show_invite_link(state, bot_name, token, bot_info, manage_channels=True)
+    state["agent"]["routing"] = _ask_routing(internal)
+    ok(f"Agent: {display_name} ({model})")
 
 
 def step_team(state: dict):
@@ -1040,39 +1058,6 @@ def step_team(state: dict):
     }
     state["team_members"] = [state["owner"]]
     ok(f"Owner profile: {name} ({role})")
-
-
-def step_agent(state: dict):
-    header("Step 9: First Agent")
-    info("Configure your primary AI agent.")
-    print()
-
-    agent_name = ask_agent_name(
-        "Agent internal name (used for its folder and config key)", "main")
-    display_name = ask("Display name (shown in Discord — capitals fine here)",
-                       agent_name.upper())
-    description = ask("One-line description", "Primary agent")
-    model = ask_choice("LLM model", ["sonnet", "opus"], default="sonnet")
-
-    state["agent"] = {
-        "name": agent_name,
-        "display_name": display_name,
-        "description": description,
-        "model": model,
-    }
-
-    # Agent personality
-    print()
-    info("Optionally set a personality for the agent's identity file (AGENTS.md).")
-    personality = ask("Personality (e.g., 'concise and direct', 'friendly and detailed')", "concise and direct")
-    state["agent"]["personality"] = personality
-
-    # Routing
-    print()
-    bot_name = state.get("bot_name", "main")
-    state["agent"]["routing"] = _ask_routing(bot_name)
-
-    ok(f"Agent: {display_name} ({model})")
 
 
 def step_full_control(state: dict):
@@ -1544,18 +1529,16 @@ def step_ops_instance(state: dict):
     overlay: Path = state["overlay"]
     vault: FernetVault = state["vault"]
 
-    agent_name = ask_agent_name(
-        "Ops agent internal name (used for its folder and config key)", "engineer")
-    display_name = ask("Display name (shown in Discord — capitals fine here)",
-                       agent_name.capitalize() + " Bot")
+    display_name, agent_name = ask_display_name(
+        "Ops agent name (shown in Discord — you'll @mention this)", "Engineer")
     description = ask("Description", "Privileged ops agent — unsandboxed, owner-only")
     model = ask_choice("Model", ["sonnet", "opus"], default="opus")
 
-    # Bot account
+    # Bot account — same derived name; one agent, one bot, one name.
+    bot_name = agent_name
     print()
     info("The ops agent needs its own Discord bot account.")
-    bot_name = ask("Bot account name", agent_name)
-    token = ask_discord_token(f"Discord bot token for '{bot_name}'")
+    token = ask_discord_token(f"Discord bot token for '{display_name}'")
 
     while token:
         info("Validating token...")
@@ -1570,7 +1553,7 @@ def step_ops_instance(state: dict):
         else:
             err("Discord rejected that token — re-copy it from the Developer "
                 "Portal.")
-        token = ask_discord_token(f"Discord bot token for '{bot_name}'")
+        token = ask_discord_token(f"Discord bot token for '{display_name}'")
 
     if token:
         vault_key = f"discord-{bot_name}"
@@ -2594,7 +2577,6 @@ def main():
         step_vault,
         step_discord,
         step_team,
-        step_agent,
         step_full_control,
         step_hitl,
         step_compression,
