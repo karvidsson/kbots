@@ -398,3 +398,86 @@ def summarize(outcomes: list[Outcome]) -> str:
         detail = f" ({out.detail})" if out.detail else ""
         lines.append(f"- **{out.key}**: {verb.get(out.action, out.action)} {where}{detail}")
     return "\n".join(lines)
+
+
+# --- join introductions -----------------------------------------------------
+#
+# The setup agent introduces itself as part of provisioning; every OTHER bot
+# used to join silently and sit there until someone asked who it was. One
+# introduction per (guild, agent), in the platform-updates channel.
+
+INTRO_FILE = "guild_intros.json"
+
+JOIN_INTRO_PROMPT = (
+    "👋 <join-intro>Your bot account was just added to the Discord server "
+    "'{guild_name}' ({guild_id}). This channel is where the platform talks "
+    "about itself, and your reply is posted here — so introduce yourself, in "
+    "ONE short message:\n"
+    "- who you are ({display_name}) and what you're for, one line\n"
+    "- what you can actually do: your 3-5 standout abilities, plain language\n"
+    "- the slash commands worth knowing — /help lists them all; name the two "
+    "or three most useful for configuring you further\n"
+    "- how to reach you: @mention {display_name}\n"
+    "Do not list every tool, no headings, no wall of text — a person just "
+    "added you and wants to know what you're good for.</join-intro>"
+)
+
+
+def intro_channel(config: dict) -> str:
+    """Where a joining bot introduces itself: platform-updates, else alerts."""
+    for key in ("platform_updates", "alerts"):
+        spec = next(s for s in SPECS if s.key == key)
+        channel = configured_channel(config, spec)
+        if channel:
+            return channel
+    return ""
+
+
+def _intro_path(data_dir: Path | str) -> Path:
+    return Path(data_dir) / INTRO_FILE
+
+
+def intro_done(data_dir: Path | str, guild_id: str, agent_id: str) -> bool:
+    try:
+        data = json.loads(_intro_path(data_dir).read_text())
+        return agent_id in (data.get("guilds", {}).get(str(guild_id)) or [])
+    except (json.JSONDecodeError, OSError):
+        return False
+
+
+def record_intro(data_dir: Path | str, guild_id: str, agent_id: str) -> None:
+    path = _intro_path(data_dir)
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except (json.JSONDecodeError, OSError):
+        data = {}
+    agents = data.setdefault("guilds", {}).setdefault(str(guild_id), [])
+    if agent_id not in agents:
+        agents.append(agent_id)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2) + "\n")
+    except OSError as e:
+        logger.warning(f"Could not record intro for {agent_id}@{guild_id}: {e}")
+
+
+def build_join_intro_message(agent_id: str, guild_id: str, guild_name: str,
+                             connector: str, channel_id: str,
+                             display_name: str = "", account: str = ""):
+    """The turn handed to a bot's agent when its account joins a server."""
+    from src.core.base import IncomingMessage
+
+    return IncomingMessage(
+        connector=connector,
+        channel_id=str(channel_id),
+        user_id="",
+        user_name="join-intro",
+        content=JOIN_INTRO_PROMPT.format(
+            guild_name=guild_name or guild_id,
+            guild_id=guild_id,
+            display_name=display_name or agent_id,
+        ),
+        bot_account=account,
+    )
