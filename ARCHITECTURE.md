@@ -578,7 +578,7 @@ The two are the same program (`uv run python -m src.main`) told apart only by `-
 
 On the main instance, `disallow_builtins` shuts off the built-in tools (Edit, Write, Bash), leaving agents with MCP tools alone. The ops instance opens everything up — and compensates by letting access control confine its use to the owner.
 
-The ops-instance step of `setup.py` optionally provisions the ops instance, producing its own `agents.rescue.yaml` and a bot account reserved for it. The matching unit (`config/kbots-rescue.service`) is installed manually — the wizard prints the exact commands.
+The ops-instance step of `setup.py` optionally provisions the ops instance, producing its own `agents.rescue.yaml` and a bot account reserved for it. The systemd step renders the matching unit (`config/kbots-rescue.service`) with the same machinery as the main unit — HOME resolved from `User=`, `KBOTS_OVERLAY` injected — and installs and starts it alongside `kbots.service`.
 
 ### Systemd
 
