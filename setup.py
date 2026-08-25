@@ -1150,9 +1150,17 @@ def step_hitl(state: dict):
         }
         return
 
-    # ask_id, not ask: a typo here would silently point the approval gate at a
-    # nonexistent channel (fail-closed, so every gated action would hang).
-    channel_id = ask_id("Discord channel ID for approvals (ops/alerts channel)")
+    # Blank is the recommended answer: server auto-setup creates
+    # #kbots-approvals when the main bot joins the guild and wires it live
+    # (adopting an existing channel of that name, never repointing one set
+    # here). The ID prompt exists for people who want an EXISTING channel
+    # under a different name. ask_id, not ask: a typo would silently point
+    # the fail-closed gate at a nonexistent channel and every gated action
+    # would hang.
+    info("Approvals channel: leave blank (recommended) and the main bot")
+    info("creates + wires #kbots-approvals itself when it joins your server.")
+    info("Enter an ID only to use an existing channel with a different name.")
+    channel_id = ask_id("Approvals channel ID (Enter for automatic)")
     approvers = [state.get("owner_discord_id", "")]
     approvers = [a for a in approvers if a]
 
