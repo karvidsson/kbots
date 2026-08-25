@@ -2,6 +2,7 @@
 
 import pytest
 
+from src.core.base import PROJECT_ROOT
 from src.llm.mock import MockProvider
 
 
@@ -64,6 +65,36 @@ def overlay(tmp_path):
 def mock_llm():
     """An offline mock LLM provider (echoes the last user message)."""
     return MockProvider(config={})
+
+
+@pytest.fixture(autouse=True)
+def _no_writes_into_core(request):
+    """No test may leave a file in the Core checkout.
+
+    Nothing an installation produces belongs in Core, and the test suite is an
+    installation like any other. Four stray skill YAMLs were sitting untracked
+    in skills/ when this was added, written by tests that expressed "somewhere
+    disposable" by pointing PROJECT_ROOT at a tmpdir. That works until the code
+    resolves its write path some other way, and then the tests quietly start
+    writing into the repo instead of failing.
+
+    Autouse and checked after the fact rather than prevented, because the point
+    is to catch the write path nobody thought of. Named files only: a full tree
+    scan would fight __pycache__ and .venv for no gain.
+    """
+    watched = [PROJECT_ROOT / "skills", PROJECT_ROOT / "tools",
+               PROJECT_ROOT / "codex", PROJECT_ROOT / "config"]
+    before = {d: set(d.glob("*")) for d in watched if d.is_dir()}
+    yield
+    for d, existing in before.items():
+        new = set(d.glob("*")) - existing
+        if new:
+            for f in new:                      # leave the checkout as we found it
+                f.unlink() if f.is_file() else None
+            pytest.fail(
+                f"{request.node.name} wrote into the Core checkout: "
+                f"{sorted(str(f.relative_to(PROJECT_ROOT)) for f in new)}. "
+                f"Point KBOTS_OVERLAY at tmp_path instead.")
 
 
 @pytest.fixture(autouse=True)

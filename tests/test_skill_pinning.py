@@ -226,7 +226,7 @@ async def test_create_skill_authors_local_pinned_yaml(tmp_path, monkeypatch):
     from src.core.base import ToolContext
     from src.tools.ingest import create_skill
 
-    monkeypatch.setattr(digest, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
     (tmp_path / "skills").mkdir()
     monkeypatch.setattr(digest, "reload_skills", lambda: None)
     ctx = ToolContext(agent_id="atlas", channel_id="c", user_id="u")
@@ -250,7 +250,7 @@ async def test_create_skill_warns_on_long_local_prompt(tmp_path, monkeypatch):
     from src.core.base import ToolContext
     from src.tools.ingest import create_skill
 
-    monkeypatch.setattr(digest, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
     (tmp_path / "skills").mkdir()
     monkeypatch.setattr(digest, "reload_skills", lambda: None)
     ctx = ToolContext(agent_id="atlas", channel_id="c", user_id="u")

@@ -281,3 +281,335 @@ def test_overlay_is_detected_from_the_shell_profile_a_stale_shell_never_read(
 
     found = vm.detect_overlay()
     assert found == ("/srv/kbots-overlay", "~/.bashrc")
+
+
+# --- 5. The generated systemd unit (2026-08-24, second Linux bring-up) -------
+#
+# Four defects from provisioning a fresh Debian host. Two were already fixed
+# (the state files moved under data/, the shell export moved above the guard);
+# these are the two that were not, plus one the report did not reach because
+# the service never stayed up long enough to try an agent-authored tool.
+
+import pathlib  # noqa: E402
+
+import setup as setup_wizard  # noqa: E402
+
+TEMPLATE = pathlib.Path(__file__).resolve().parents[1] / "config" / "kbots.service"
+RESCUE = pathlib.Path(__file__).resolve().parents[1] / "config" / "kbots-rescue.service"
+
+
+def _render(tmp_path, unit=None):
+    return setup_wizard.render_service_unit(
+        (unit or TEMPLATE).read_text(), tmp_path / "overlay",
+        [f"Environment=KBOTS_OVERLAY={tmp_path / 'overlay'}"])
+
+
+def test_no_percent_h_survives_into_the_installed_unit(tmp_path):
+    """`%h` in a SYSTEM unit is the service manager's home, so it expands to
+    /root and not to the User='s. The install died on
+    `failed to create directory /root/.cache/uv: Permission denied`.
+    """
+    assert "%h" not in _render(tmp_path)
+
+
+def test_home_is_the_service_accounts_not_the_installers(tmp_path):
+    """Resolved from the unit's own User=, because setup is routinely run
+    under sudo and Path.home() would then be root's.
+    """
+    rendered = _render(tmp_path)
+    assert "Environment=HOME=" in rendered
+    home = [ln for ln in rendered.splitlines() if ln.startswith("Environment=HOME=")][0]
+    assert home.split("=", 2)[2] not in ("/root", ""), home
+    assert "kbots" in home, "HOME does not belong to the User= account"
+
+
+def test_the_credential_paths_follow_the_same_home(tmp_path):
+    """The quiet half of the %h bug: Claude Code would look in
+    /root/.claude/.credentials.json, so an authenticated service account reads
+    as unauthenticated with no error anywhere.
+    """
+    rendered = _render(tmp_path)
+    home = [ln for ln in rendered.splitlines()
+            if ln.startswith("Environment=HOME=")][0].split("=", 2)[2]
+    rw = [ln for ln in rendered.splitlines() if ln.startswith("ReadWritePaths=")][0]
+    assert f"{home}/.claude" in rw and f"{home}/.cache" in rw
+
+
+def test_the_rescue_unit_is_rendered_too(tmp_path):
+    """It carries the same two lines and would strand the rescue service in
+    exactly the state it exists to recover from.
+    """
+    assert "%h" not in _render(tmp_path, RESCUE)
+
+
+def test_agent_authored_tools_and_skills_are_writable(tmp_path):
+    """create_tool writes a .py into <overlay>/tools and tool_scope keeps its
+    sidecar there; create_skill writes into <overlay>/skills. Neither was in
+    ReadWritePaths, so both fail under the sandbox and work perfectly on a Mac,
+    which has none.
+    """
+    rw = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadWritePaths=")][0]
+    assert f"{tmp_path / 'overlay' / 'tools'}" in rw
+    assert f"{tmp_path / 'overlay' / 'skills'}" in rw
+
+
+def test_every_writable_path_is_one_setup_creates(tmp_path):
+    """systemd builds the mount namespace BEFORE exec, so a ReadWritePaths
+    entry that does not exist fails at step NAMESPACE with status=226 and a
+    message naming the path rather than the permission. The service then
+    restart-loops without ever reaching the code that creates it lazily.
+    """
+    overlay = tmp_path / "overlay"
+    rw = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadWritePaths=")][0].split("=", 1)[1].split()
+    created = {str(d) for d in setup_wizard.service_writable_dirs(overlay)}
+    for path in rw:
+        if path == "/tmp" or "/.cache" in path or "/.claude" in path:
+            continue   # always present, or owned by an account setup cannot touch
+        assert path in created, f"{path} is granted but nothing creates it"
+
+
+def test_the_overlay_root_stays_read_only(tmp_path):
+    """The sandbox is right and the paths were wrong. Widening ReadOnlyPaths
+    to make writes work would undo the design rather than fix the bug.
+    """
+    ro = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadOnlyPaths=")][0]
+    assert str(tmp_path / "overlay") in ro
+
+
+def test_the_overlay_env_injection_survives_the_rewrite(tmp_path):
+    """The PATH line is where KBOTS_OVERLAY is injected. Rewriting that line
+    without re-adding the block would leave the service with no overlay, which
+    is the failure the injection exists to prevent.
+    """
+    assert f"Environment=KBOTS_OVERLAY={tmp_path / 'overlay'}" in _render(tmp_path)
+
+
+# --- 6. create_skill wrote into the Core checkout (2026-08-24) --------------
+#
+# Found while predicting what the VPS agent would see if asked to try its own
+# tools. create_tool writes into the overlay; create_skill did not, so widening
+# the unit's ReadWritePaths to include <overlay>/skills would have bought
+# nothing and the fix would have looked applied while the failure continued.
+
+def test_a_new_skill_is_written_to_the_overlay(tmp_path, monkeypatch):
+    """Three defects at once, visible only as the third.
+
+    The engine root is under ReadOnlyPaths in a hardened unit, so the write
+    fails outright on Linux while working on a Mac, which has no sandbox. Core
+    is replaced by every `git pull`, so where it did work the skill survived
+    until the next deploy. And the loader reads Core first and the overlay
+    last, so a Core skill loses to any overlay skill of the same name.
+    """
+    from src.core import digest
+
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    assert digest.skill_write_dir() == tmp_path / "skills"
+
+
+def test_a_checkout_with_no_overlay_still_writes_somewhere(monkeypatch):
+    """The single-user dev checkout, where Core is the only layer there is."""
+    from src.core import digest
+    from src.core.base import PROJECT_ROOT
+
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    assert digest.skill_write_dir() == PROJECT_ROOT / "skills"
+
+
+def test_the_skill_lands_where_the_loader_will_find_it(tmp_path, monkeypatch):
+    """Written and read must agree. reload_skills() reads <overlay>/skills, so
+    a skill written anywhere else is created successfully and never appears.
+    """
+    from src.core import digest
+
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    path = digest.ingest_skill_from_text(
+        name="probe_skill", description="a test skill",
+        prompt="Do the thing.", tools=[])
+    assert path.parent == tmp_path / "skills"
+    assert path.is_file()
+    from src.core.skills import get_all_skills
+    assert "probe_skill" in get_all_skills()
+
+
+def test_the_written_skill_is_the_one_that_reloads(tmp_path, monkeypatch):
+    """The overlay is read last, so an overlay skill beats a Core one of the
+    same name. Writing to Core put every agent-authored skill on the losing
+    side of its own precedence rule.
+    """
+    from src.core import digest
+
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    digest.ingest_skill_from_text(
+        name="probe_skill", description="overlay version",
+        prompt="Overlay.", tools=[])
+    from src.core.skills import get_all_skills
+    assert get_all_skills()["probe_skill"].description == "overlay version"
+
+
+# --- 7. Nothing an installation produces belongs in Core (2026-08-24) -------
+#
+# The rule, after create_skill turned out to be one of several. Core is
+# replaced by every `git pull`, is read-only under a hardened systemd unit, and
+# is read FIRST by every loader while the overlay is read last. A file an
+# install writes there is therefore lost on the next deploy, refused outright
+# on Linux, or beaten by its own overlay counterpart.
+#
+# The trap is subtler than a hardcoded path. Several resolvers took the form
+#     overlay_path if overlay_path.exists() else core_path
+# which reads as overlay-first and is not: on a fresh install the overlay copy
+# does not exist, so the FIRST write goes to Core, and so does every one after
+# it, because it still does not exist in the overlay. Read resolvers may be
+# exists()-gated. Write resolvers may not.
+
+WRITE_RESOLVERS = [
+    ("a new skill", "src.core.digest", "skill_write_dir"),
+    ("the MCP server list", "src.core.digest", "mcp_yaml_write_path"),
+    ("a published process document", "src.tools.process_map", "_codex_root"),
+]
+
+
+@pytest.mark.parametrize("what,module,func", WRITE_RESOLVERS,
+                         ids=[w for w, _, _ in WRITE_RESOLVERS])
+def test_write_targets_are_in_the_overlay(what, module, func, tmp_path, monkeypatch):
+    import importlib
+
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    target = getattr(importlib.import_module(module), func)()
+    assert str(target).startswith(str(tmp_path)), (
+        f"{what} would be written to {target}, outside the overlay")
+
+
+@pytest.mark.parametrize("what,module,func", WRITE_RESOLVERS,
+                         ids=[w for w, _, _ in WRITE_RESOLVERS])
+def test_a_write_target_does_not_depend_on_the_overlay_copy_existing(
+        what, module, func, tmp_path, monkeypatch):
+    """The exists()-gate trap. The overlay here is empty, exactly as it is on
+    the first write of a fresh install, and the answer must not change.
+    """
+    import importlib
+
+    # A subdirectory, because tmp_path already holds the autouse roster
+    # isolation. This overlay must be as empty as a fresh install's.
+    fresh = tmp_path / "fresh-overlay"
+    fresh.mkdir()
+    monkeypatch.setenv("KBOTS_OVERLAY", str(fresh))
+    assert not any(fresh.iterdir()), "the fixture overlay must start empty"
+    target = getattr(importlib.import_module(module), func)()
+    assert str(target).startswith(str(fresh))
+
+
+@pytest.mark.parametrize("what,module,func", WRITE_RESOLVERS,
+                         ids=[w for w, _, _ in WRITE_RESOLVERS])
+def test_a_checkout_with_no_overlay_falls_back_to_core(what, module, func, monkeypatch):
+    """The single-user dev clone, where Core is the only layer there is. The
+    rule is 'not Core when there is somewhere better', not 'never Core'.
+    """
+    import importlib
+
+    from src.core.base import PROJECT_ROOT as ROOT
+
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    target = getattr(importlib.import_module(module), func)()
+    assert str(target).startswith(str(ROOT))
+
+
+def test_the_capability_listing_reads_the_same_mcp_file_the_loader_does(
+        tmp_path, monkeypatch):
+    """An overlay-installed MCP server was connected, running, and absent from
+    the one listing an agent consults to find out what it has.
+    """
+    import inspect
+
+    from src.tools import ingest
+
+    src = inspect.getsource(ingest.list_capabilities)
+    assert "_resolve_mcp_yaml" in src
+    assert 'PROJECT_ROOT / "config" / "mcp.yaml"' not in src
+
+
+# --- 8. Files at the root of read-only paths (2026-08-24, third bring-up) ---
+#
+# A fresh Debian install reached the Discord gateway and still could not do
+# anything: ~/.claude.json was unwritable, so Claude Code could not record the
+# workspace as trusted and every tool came back "unapproved-permission".
+#
+# ProtectHome=read-only makes $HOME read-only inside the namespace, and
+# ReadWritePaths listed only DIRECTORIES. Granting ~/.claude does not reach a
+# file sitting beside it.
+
+def test_the_claude_trust_file_is_writable(tmp_path):
+    """The file Claude Code writes to mark a workspace trusted. Without it the
+    install is up, connected, and unable to use a single tool.
+    """
+    rendered = _render(tmp_path)
+    home = [ln for ln in rendered.splitlines()
+            if ln.startswith("Environment=HOME=")][0].split("=", 2)[2]
+    rw = [ln for ln in rendered.splitlines() if ln.startswith("ReadWritePaths=")][0]
+    assert f"{home}/.claude.json" in rw, (
+        "granting the .claude directory does not cover the .claude.json file")
+
+
+def test_a_granted_file_that_may_not_exist_is_marked_optional(tmp_path):
+    """systemd fails at step NAMESPACE when a ReadWritePaths entry is missing,
+    which is the crash loop the directory creation exists to prevent. A file on
+    another account's home is one setup cannot create on its behalf, so it
+    carries the `-` prefix that makes absence tolerable.
+    """
+    rw = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadWritePaths=")][0]
+    entry = [p for p in rw.split() if p.endswith(".claude.json")][0]
+    assert entry.startswith("-"), f"{entry} would crash-loop a host where it is absent"
+
+
+def test_directories_setup_creates_are_not_marked_optional(tmp_path):
+    """The `-` prefix is for paths nobody can guarantee. Using it on the dirs
+    setup creates would hide a real failure to create them.
+    """
+    rw = [ln for ln in _render(tmp_path).splitlines()
+          if ln.startswith("ReadWritePaths=")][0].split("=", 1)[1].split()
+    for d in setup_wizard.service_writable_dirs(tmp_path / "overlay"):
+        assert str(d) in rw, f"{d} is not granted"
+        assert f"-{d}" not in rw, f"{d} must not be optional — setup creates it"
+
+
+# --- the diagnosis, which sent the reader to a fix that could not work ------
+
+def _perm_warnings(monkeypatch, tmp_path, owned_by_us: bool, writable: bool):
+    import os as _os
+
+    from src.core import preflight
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    (tmp_path / ".claude.json").write_text("{}")
+    monkeypatch.setattr(preflight.os, "access", lambda p, mode: writable)
+    uid = _os.getuid() if owned_by_us else _os.getuid() + 1
+    monkeypatch.setattr(preflight, "_running_user", lambda: (uid, "kbots"))
+    # Only the Claude-config block is under test; agent workspaces are a
+    # separate check with its own warning.
+    return [w for w in preflight._check_permissions({}) if ".claude" in w]
+
+
+def test_a_wrong_owner_is_still_reported_as_a_chown(monkeypatch, tmp_path):
+    warns = _perm_warnings(monkeypatch, tmp_path, owned_by_us=False, writable=True)
+    assert warns and "sudo chown" in warns[0]
+
+
+def test_correct_owner_but_unwritable_does_not_suggest_chown(monkeypatch, tmp_path):
+    """What the VPS actually hit. The file was already kbots:kbots, the warning
+    said "not owned/writable ... run chown", and chown could not have helped:
+    it was the sandbox. A diagnosis that names the wrong cause costs more than
+    no diagnosis, because it is followed.
+    """
+    warns = _perm_warnings(monkeypatch, tmp_path, owned_by_us=True, writable=False)
+    assert warns, "an unwritable trust file must still warn"
+    # The COMMAND, not the word: the message is allowed to say "this is not a
+    # chown problem", and saying so is the point.
+    assert "sudo chown" not in warns[0], warns[0]
+    assert "ReadWritePaths" in warns[0], "does not name the actual fix"
+
+
+def test_a_healthy_file_produces_no_warning(monkeypatch, tmp_path):
+    assert _perm_warnings(monkeypatch, tmp_path, owned_by_us=True, writable=True) == []

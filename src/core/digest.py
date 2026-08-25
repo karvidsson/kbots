@@ -13,7 +13,7 @@ from pathlib import Path
 
 import yaml
 
-from src.core.base import PROJECT_ROOT
+from src.core.base import PROJECT_ROOT, install_write_root
 from src.core.skills import _skill_registry, load_skills
 from src.core.tools import _tool_registry
 
@@ -152,6 +152,26 @@ class Digest:
             await self._on_reload(normalised)
 
 
+def skill_write_dir() -> Path:
+    """Where a NEWLY CREATED skill is written: the overlay, when there is one.
+
+    create_skill wrote into the Core checkout, which is wrong in three ways at
+    once and was only ever visible on the third.
+
+    A hardened systemd unit lists the engine root under ReadOnlyPaths, so the
+    write fails outright: an agent on a Linux install cannot create a skill at
+    all, and the same call works perfectly on a developer Mac, which has no
+    sandbox. Second, Core is replaced by every `git pull`, so on the machines
+    where it did work the skill survived until the next deploy. Third, the
+    loader reads Core first and the overlay last, so a skill written to Core is
+    also the one that loses to any overlay skill of the same name.
+
+    Falls back to Core when no overlay is configured, which is the single-user
+    dev checkout where Core is the only layer there is.
+    """
+    return install_write_root() / "skills"
+
+
 def reload_skills() -> int:
     """Re-scan skills directories across all layers and update the registry."""
     _skill_registry.clear()
@@ -287,7 +307,7 @@ def ingest_skill_from_text(name: str, description: str, prompt: str,
     if llm:
         skill_data["llm"] = llm
 
-    skill_path = PROJECT_ROOT / "skills" / f"{name}.yaml"
+    skill_path = skill_write_dir() / f"{name}.yaml"
     skill_path.parent.mkdir(parents=True, exist_ok=True)
     with open(skill_path, "w") as f:
         yaml.dump(skill_data, f, default_flow_style=False, sort_keys=False)
@@ -313,13 +333,16 @@ def ingest_mcp_server(
 
     Supports both remote (SSE) and local (stdio) servers.
     """
-    mcp_path = _resolve_mcp_yaml()
-    if mcp_path.exists():
-        with open(mcp_path) as f:
+    # Read from wherever it currently lives, write to where it belongs. On a
+    # fresh install those differ, and only the write target must be the overlay.
+    read_path = _resolve_mcp_yaml()
+    mcp_path = mcp_yaml_write_path()
+    if read_path.exists():
+        with open(read_path) as f:
             config = yaml.safe_load(f) or {}
     else:
         config = {}
-        mcp_path.parent.mkdir(parents=True, exist_ok=True)
+    mcp_path.parent.mkdir(parents=True, exist_ok=True)
 
     entry: dict = {"transport": transport}
     if transport == "stdio":
@@ -357,13 +380,24 @@ def ingest_mcp_server(
 
 
 def _resolve_mcp_yaml() -> Path:
-    """Find mcp.yaml — overlay takes precedence over Core."""
+    """Find mcp.yaml for READING — overlay takes precedence over Core."""
     overlay = os.environ.get("KBOTS_OVERLAY")
     if overlay:
         p = Path(overlay) / "config" / "mcp.yaml"
         if p.exists():
             return p
     return PROJECT_ROOT / "config" / "mcp.yaml"
+
+
+def mcp_yaml_write_path() -> Path:
+    """Where install_mcp WRITES. Always the overlay when there is one.
+
+    The read resolver above is exists()-gated, which is right for reading and
+    wrong for writing: on a fresh install the overlay has no mcp.yaml, so the
+    first install_mcp would create it in Core, and every one after it too,
+    because the overlay copy still would not exist.
+    """
+    return install_write_root() / "config" / "mcp.yaml"
 
 
 def _load_mcp_servers() -> dict:

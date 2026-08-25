@@ -818,7 +818,11 @@ async def list_capabilities(ctx: ToolContext) -> str:
             lines.append(f"  `/{name.replace('_', '-')}` ({params}) — {skill.description}")
 
     # MCP
-    mcp_path = PROJECT_ROOT / "config" / "mcp.yaml"
+    # Resolved the same way the loader resolves it. Reading Core's copy
+    # directly meant an overlay-installed server was connected and running and
+    # absent from the one listing an agent consults to find out what it has.
+    from src.core.digest import _resolve_mcp_yaml
+    mcp_path = _resolve_mcp_yaml()
     if mcp_path.exists():
         import yaml
         with open(mcp_path) as f:
