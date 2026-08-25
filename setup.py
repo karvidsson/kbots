@@ -1448,6 +1448,12 @@ def step_generate(state: dict):
             "compression": state.get("compression", {"enabled": False, "level": "standard"}),
         },
         "admin_users": {"discord": [owner_discord]},
+        # ON for fresh installs: each agent aligns its Discord account name
+        # and avatar with its config on first boot, so a reused bot app named
+        # something else doesn't ship a stranger's identity. The example
+        # config defaults this OFF because renaming is outward-facing and
+        # rate-limited — a caveat for established fleets, not a new install.
+        "identity": {"reconcile_on_boot": True},
     }
 
     # Local models + tier routing (from step_local_models). Router config in

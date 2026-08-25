@@ -138,6 +138,29 @@ async def test_a_secondary_instance_never_provisions(overlay, provisioned):
     assert not server_setup.guild_is_set_up(overlay, "42")
 
 
+async def test_every_bot_syncs_its_nickname_on_join_even_non_setup(overlay, provisioned):
+    """Nickname alignment is mechanical and per-bot — it must run BEFORE the
+    provisioning gates that make every non-setup bot return early."""
+    class _Me:
+        name, nick = "APP-2", None
+
+        def __init__(self):
+            self.edits = []
+
+        async def edit(self, nick=None):
+            self.edits.append(nick)
+
+    me = _Me()
+    guild = types.SimpleNamespace(id=42, name="ME", me=me)
+    bot = _bot("engineer", overlay, configs={"e": _agent("engineer")},
+               profile="rescue")
+    bot._self_mention_name = "Engineer"
+    await bot.on_guild_join(guild)
+
+    assert me.edits == ["Engineer"]   # nickname set
+    assert provisioned == []          # provisioning still gated off
+
+
 async def test_a_claimed_guild_is_not_provisioned_again(overlay, provisioned):
     """The done-marker lands after provisioning; the claim is what stops two
     near-simultaneous joins from racing to create duplicate channels."""
