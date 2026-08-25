@@ -1,5 +1,8 @@
-# Rescue Bot — standalone systemd service (unsandboxed)
-# Install: sudo cp config/kbots-rescue.service /etc/systemd/system/ && sudo systemctl daemon-reload
+# Rescue Bot — standalone systemd service (unsandboxed) — TEMPLATE
+# The setup wizard renders and installs this: HOME resolved from User=
+# (the specifier below resolves to ROOT's home in a system unit) and
+# KBOTS_OVERLAY injected — a raw `cp` of this file boots with the wrong
+# home and no overlay, and crash-loops.
 
 [Unit]
 Description=kbots Rescue Bot
@@ -14,7 +17,7 @@ WorkingDirectory=/opt/kbots
 ExecStart=/usr/local/bin/uv run --no-sync python -m src.main --profile rescue
 Restart=always
 RestartSec=10
-# HOME and PATH are set dynamically by setup.sh based on the service account
+# HOME and PATH are set dynamically by setup.py based on the service account
 Environment=HOME=%h
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 

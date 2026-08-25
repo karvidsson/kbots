@@ -13,12 +13,12 @@ Store format: {"enabled": bool, "schedules": [...]}. `enabled` is the global
 killswitch for all scheduled inference.
 """
 
-import contextlib
 import json
 import logging
-import os
 from datetime import datetime
 from pathlib import Path
+
+from src.core.base import overlay_state_path, overlay_state_read_path
 
 logger = logging.getLogger(__name__)
 
@@ -26,13 +26,18 @@ _FILENAME = "schedules.json"
 
 
 def _path() -> Path | None:
-    overlay = os.environ.get("KBOTS_OVERLAY", "")
-    return Path(overlay) / _FILENAME if overlay else None
+    """Written under the overlay's data/ dir, not the read-only overlay root."""
+    return overlay_state_path(_FILENAME)
+
+
+def _read_path() -> Path | None:
+    """Read the current file, falling back to the pre-migration root-level one."""
+    return overlay_state_read_path(_FILENAME)
 
 
 def _load_doc() -> dict:
-    path = _path()
-    if not path or not path.exists():
+    path = _read_path()
+    if not path:
         return {"enabled": True, "schedules": []}
     try:
         data = json.loads(path.read_text())
@@ -273,6 +278,18 @@ def due_schedules(now: float) -> list[dict]:
             fired.append(dict(sch))
             changed = True
     if changed:
-        with contextlib.suppress(Exception):
+        try:
             _save_doc(doc)
+        except Exception as e:
+            # Fail CLOSED. Swallowing this was what made a read-only store
+            # invisible: nothing fired state was ever recorded, so `once`
+            # schedules never retired and re-fired on every tick. Firing work
+            # whose state cannot be written is what turns one failed write
+            # into an endless loop, so fire nothing and say why.
+            logger.error(
+                f"Could not persist schedule state ({_path()}): {e} — "
+                f"suppressing {len(fired)} due schedule(s) this tick rather "
+                f"than firing work that would repeat forever."
+            )
+            return []
     return fired

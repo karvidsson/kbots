@@ -11,6 +11,7 @@ from pathlib import Path
 
 import yaml
 
+from src.core import runtime_state
 from src.core.agent_manager import AgentManager
 from src.core.base import read_vault_key_file, resolve_vault_key_file
 from src.core.preflight import run_preflight
@@ -77,6 +78,14 @@ def load_config(profile: str | None = None) -> dict:
         with open(main_file) as f:
             main_config = yaml.safe_load(f) or {}
         logger.info(f"Config loaded from {main_file}")
+    else:
+        # Falling through to {} used to be silent, so a fresh clone failed
+        # later with schema errors that never named the actual problem.
+        logger.warning(
+            "No config.yaml found in any config dir ("
+            + ", ".join(str(d) for d in config_dirs)
+            + ") — starting with an empty config."
+        )
 
     agents_file = _find_config_file(f"agents{suffix}.yaml", config_dirs)
     if not agents_file:
@@ -231,8 +240,10 @@ async def main() -> None:
 
     # --- Memory backends ---
     memory_backends = {}
+    from src.core.base import memory_config as _memory_config
+    from src.core.base import warn_on_split_store as _warn_on_split_store
+    mem_config = _memory_config(config)
     for backend_name, backend_cls in registry.memory_backends.items():
-        mem_config = defaults.get("memory", {})
         try:
             memory_backends[backend_name] = backend_cls(config=mem_config)
             logger.info(f"Memory backend: {backend_name}")
@@ -243,9 +254,16 @@ async def main() -> None:
 
     # --- Graph memory (optional, additive to sqlite; opens lazily on first use) ---
     from src.lib.graph_store import close_graph, init_graph
-    graph = init_graph(defaults.get("memory", {}))
+    graph = init_graph(mem_config)
     if graph:
         logger.info(f"Graph memory: LadybugDB ({graph.path})")
+
+    for legacy in _warn_on_split_store(config):
+        logger.warning(
+            f"Legacy memory store still present at {legacy}, outside the configured "
+            f"data_dir. Nothing reads it — confirm it is migrated, then delete it. "
+            f"Two stores is how a scrub or an audit silently reads stale data."
+        )
 
     # --- Security: HITL, rate limiting, audit, content safety ---
     from src.core.audit import AuditLog
@@ -413,6 +431,47 @@ async def main() -> None:
     for connector in active_connectors.values():
         connector.on_message = router.route
 
+    # --- Server auto-setup: a new Discord server provisions itself ---
+    # The channels are created by the connector deterministically. What comes
+    # back here is only the part that needs an agent: its nickname, its avatar,
+    # and telling the owner what it just did. If this turn fails the server is
+    # still correctly wired, which is the ordering that matters.
+    if "discord" in active_connectors:
+        from src.core.server_setup import build_join_intro_message, build_setup_message
+
+        def _agent_identity(agent_id):
+            from src.core.identity_boot import configured_name
+            cfg = (agent_manager.agent_configs or {}).get(agent_id) or {}
+            account = ((cfg.get("routing") or {}).get("discord") or {}).get("account", "")
+            return configured_name(agent_manager.agent_configs, agent_id), str(account)
+
+        async def _on_guild_setup(agent_id, guild_id, guild_name, outcomes):
+            channels = {o.key: o.channel_id for o in outcomes if o.channel_id}
+            home = channels.get("platform_updates") or channels.get("alerts")
+            if not home:
+                logger.warning(
+                    f"Server setup for '{guild_name}' wired no channel the agent "
+                    f"can post in — skipping the introduction turn")
+                return
+            display_name, account = _agent_identity(agent_id)
+            await agent_manager.handle_message(agent_id, build_setup_message(
+                agent_id, guild_id, guild_name, outcomes, "discord", home,
+                display_name=display_name, account=account))
+
+        async def _on_guild_intro(agent_id, guild_id, guild_name, channel_id):
+            display_name, account = _agent_identity(agent_id)
+            await agent_manager.handle_message(agent_id, build_join_intro_message(
+                agent_id, guild_id, guild_name, "discord", channel_id,
+                display_name=display_name, account=account))
+
+        active_connectors["discord"].set_setup_context(
+            config,
+            str(config.get("kbots", {}).get("data_dir", "./data")),
+            _on_guild_setup,
+            profile=profile or "",
+            on_guild_intro=_on_guild_intro,
+        )
+
     # --- Start connectors ---
     for conn_name, connector in active_connectors.items():
         try:
@@ -435,6 +494,7 @@ async def main() -> None:
     # --- Platform version: freeze the running commit; announce real updates ---
     from src.core import version as _version
     data_dir = Path(config.get("kbots", {}).get("data_dir", "./data"))
+    _version.set_data_dir(data_dir)  # so in-process readers agree with the writer
     _prev = _version.read_running_version(data_dir)
     _running = _version.write_running_version(data_dir)
     _run_v = _running.get("version") or _running["short"]
@@ -445,7 +505,14 @@ async def main() -> None:
         _changes = _version.commits_between(_prev["commit"], _running["commit"])
         _detail = f"\n```\n{_changes}\n```" if _changes else ""
         if alerter:
-            alerter.send_bg(
+            # Its own channel when one is wired, else the alert channel, which is
+            # where this has always gone. "The platform changed" and "something
+            # attacked your agent" are different audiences, but an install that
+            # has not run server setup must not lose the notice entirely.
+            _updates = (runtime_state.get_flag("platform_updates_channel", None)
+                        or (config.get("platform", {}) or {}).get("updates_channel", ""))
+            alerter.post_bg(
+                _updates,
                 f"🔄 **Platform updated** — now running **{_run_v}** (was {_prev_v}). "
                 f"`{_running['short']}`{_detail}"
             )
@@ -514,6 +581,48 @@ async def main() -> None:
                     logger.error(f"Restart recovery for {agent_id} failed: {e}")
         asyncio.create_task(_deliver_recovery(), name="restart-recovery")
 
+    # --- Identity reconcile: an agent whose Discord ACCOUNT name disagrees with
+    # its config gets one turn to rename itself. Off by default: a rename is
+    # outward-facing and rate-limited at two per hour, so an established fleet
+    # should opt in rather than discover it after a restart.
+    if (config.get("identity", {}) or {}).get("reconcile_on_boot", False):
+        from src.core.identity_boot import build_identity_message, pending_renames
+
+        async def _deliver_identity():
+            await asyncio.sleep(25)  # after restart-recovery, connectors online
+            discord_conn = active_connectors.get("discord")
+            if not discord_conn:
+                return
+            live_names = {
+                acct: bot.client.user.name
+                for acct, bot in getattr(discord_conn, "bots", {}).items()
+                if getattr(bot, "client", None) and bot.client.user
+            }
+            from src.core.identity_boot import owner_discord_id, record_attempt
+            from src.tools.team import _load_team
+            owner_id = owner_discord_id(_load_team())
+            for pending in pending_renames(
+                    live_names, agent_manager.agent_configs, data_dir):
+                agent_id = pending["agent_id"]
+                home = await agent_manager._resolve_home_channel(agent_id)
+                if not home:
+                    logger.warning(
+                        f"Identity reconcile: {agent_id} has no home channel — skipped")
+                    continue
+                connector_name, channel_id, _ = home
+                logger.info(
+                    f"Identity reconcile -> {agent_id}: account is "
+                    f"{pending['live_name']!r}, configured as "
+                    f"{pending['configured_name']!r}")
+                record_attempt(data_dir, agent_id, pending["configured_name"])
+                try:
+                    await agent_manager.handle_message(
+                        agent_id, build_identity_message(
+                            pending, owner_id, connector_name, channel_id))
+                except Exception as e:
+                    logger.error(f"Identity reconcile for {agent_id} failed: {e}")
+        asyncio.create_task(_deliver_identity(), name="identity-reconcile")
+
     # --- Android emulator reaper: shut the emulator down once nobody uses it ---
     # Must live here, in the long-running service: the failure mode is "no agent
     # calls android_device again", so a check inside the tool would never run for
@@ -548,6 +657,21 @@ async def main() -> None:
                               graph_cfg=memory_cfg.get("graph"))
         asyncio.create_task(reflector.run(), name="reflector")
 
+    # --- Memory decay: fade what nothing recalls, archive what has faded ---
+    # Reads the backend the engine already opened, so it cannot decay a
+    # different database from the one being written to. The shell script it
+    # replaces resolved its own path and would have decayed the retired
+    # pre-data_dir store.
+    decay_backend = memory_backends.get(memory_cfg.get("backend", "sqlite")) \
+        or next(iter(memory_backends.values()), None)
+    if decay_backend is not None:
+        from src.core.memory_decay import MemoryDecay
+        decay = MemoryDecay(decay_backend, memory_cfg)
+        if decay.enabled:
+            asyncio.create_task(decay.run(), name="memory-decay")
+        else:
+            logger.info("Memory decay: OFF (defaults.memory.decay_enabled)")
+
     # --- Browser janitor: quit the shared debug Chrome after hours of idleness ---
     from src.core.browser_janitor import BrowserJanitor
     janitor = BrowserJanitor(config.get("browser", {}))
@@ -562,6 +686,15 @@ async def main() -> None:
                           judge_cfg)
         asyncio.create_task(judge.run(), name="judge")
         logger.info(f"Turn judge: ON (provider={judge.provider}, model={judge.model})")
+    elif training_collector:
+        # Collection without labelling is a corpus nobody can filter. It ran
+        # that way for 1163 turns here, and the only way to notice was to go
+        # looking for a judgments file that had never been created.
+        status = training_collector.status()
+        logger.info(
+            f"Turn judge: OFF — {status['turns']} turns collected, "
+            f"{status['judgments']} judged, {status['rewards']} human reactions. "
+            f"Enable at kbots.training_collection.judge.enabled to label them.")
 
     # --- Run until interrupted ---
     stop_event = asyncio.Event()

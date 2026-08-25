@@ -9,6 +9,8 @@ import logging
 
 import aiohttp
 
+from src.core import runtime_state
+
 logger = logging.getLogger(__name__)
 
 DISCORD_API = "https://discord.com/api/v10"
@@ -52,11 +54,11 @@ async def send_alert(message: str, channel_id: str, bot_token: str) -> bool:
 
 
 class AlertSender:
-    """Cached alert sender — resolves config once, reuses for all alerts."""
+    """Alert sender — token resolved once, channel resolved per send."""
 
     def __init__(self, config: dict, vault=None):
         security = config.get("security", {})
-        self.channel_id = security.get("alert_channel", "")
+        self._config_channel = security.get("alert_channel", "")
         alert_bot = security.get("alert_bot", "")
         self.bot_token = ""
         if alert_bot and vault:
@@ -66,7 +68,18 @@ class AlertSender:
             accounts = config.get("connectors", {}).get("discord", {}).get("accounts", {})
             token_key = accounts.get(alert_bot, {}).get("token_key", f"discord-{alert_bot}")
             self.bot_token = vault.get(token_key) or ""
-        self.enabled = bool(self.channel_id and self.bot_token)
+
+    @property
+    def channel_id(self) -> str:
+        """Alert channel — a runtime override wins over config, so server setup
+        can wire this live rather than needing a config edit and a restart.
+        Resolved per send, not cached at boot: caching is what made this the one
+        channel role of four that could not be provisioned without downtime."""
+        return runtime_state.get_flag("alert_channel", None) or self._config_channel
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.channel_id and self.bot_token)
 
     async def send(self, message: str) -> bool:
         """Send an alert. Fire-and-forget safe."""
@@ -84,3 +97,14 @@ class AlertSender:
             send_alert(message, self.channel_id, self.bot_token),
             name="security-alert",
         )
+
+    def post_bg(self, channel_id: str, message: str) -> None:
+        """Post to a specific channel with the alert bot's token, falling back
+        to the alert channel. Used by the platform-update notice, which has its
+        own channel but no bot of its own."""
+        target = str(channel_id or "") or self.channel_id
+        if not (target and self.bot_token):
+            logger.warning(f"Platform notice (no channel): {message}")
+            return
+        asyncio.create_task(
+            send_alert(message, target, self.bot_token), name="platform-notice")

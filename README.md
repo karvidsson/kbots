@@ -91,14 +91,17 @@ Prefer to do it by hand? Same steps:
    - Right-click **yourself** → Copy User ID (makes you the owner/admin)
    - Right-click the channel you want approval prompts in → Copy Channel ID
 
+Full reference — every permission and why, install links, fixing a bot invited with Administrator, server auto-setup: **[docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md)**.
+
 ### Step 2 — clone and launch the wizard
 
 ```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh     # if you don't have uv yet
 git clone https://github.com/karvidsson/kbots.git
 cd kbots
-uv sync && uv run python setup.py
+./setup
 ```
+
+`./setup` installs uv if you do not have it, syncs dependencies, and starts the wizard. (Still prefer the pieces? `uv run python setup.py` after `bash scripts/sync.sh`.)
 
 Three things worth knowing before you hit Enter:
 
@@ -111,7 +114,7 @@ Three things worth knowing before you hit Enter:
 | The wizard asks for | Have ready from Step 1 |
 |---|---|
 | Overlay directory | Nothing — the default (a sibling of the install) is fine |
-| Vault passphrase | Pick one — it encrypts your tokens at rest |
+| Vault passphrase | Pick one (12+ chars) or press Enter to generate — it encrypts your tokens at rest |
 | Discord bot token | The token you copied |
 | Server (guild) ID | The server ID |
 | Your Discord user ID | Your user ID |
@@ -172,6 +175,7 @@ Skills also surface as slash commands automatically (`/debrief`, etc.) — `/hel
 | Ignores messages unless DM'd | Agent is mention-only (default) | `@mention` the bot, or set `mentions: false` in agents.yaml routing |
 | Replies with an error / nothing, logs show Claude errors | Claude CLI auth expired | `/admin claude-auth refresh` in Discord; if that fails, `claude auth login` on the host, then `/admin reboot` |
 | Service won't start | Config or token problem | Logs: `journalctl -u kbots -f` (Linux) / `tail -f <overlay>/data/launchd.stderr.log` (macOS) |
+| `status=226/NAMESPACE`, restart loop (Linux) | A path in the unit's `ReadWritePaths` does not exist | systemd builds the sandbox before exec, so it never reaches the code that would create it. The log names the path: create it, `systemctl daemon-reload`, restart |
 | Slash commands missing | Global sync takes time | `/admin sync` in Discord, or wait up to an hour |
 | "Vault unlock failed" in logs | Key file missing/wrong | Re-run `uv run python setup.py` in the install dir — it re-prompts for the passphrase |
 
@@ -620,7 +624,8 @@ The exported `messages` preserve `user → assistant(tool_calls) → tool → as
 
 ## Security
 
-- **Credentials** live in a Fernet vault (AES-128-CBC at rest, PBKDF2 with 100k iterations) unlocked by passphrase at startup
+- **Credentials** live in a Fernet vault (AES-128-CBC at rest, PBKDF2 with 600k iterations) unlocked by passphrase at startup
+- **The key-file trade-off**: for unattended start (the service unlocking the vault after a reboot with nobody at a terminal), setup offers to save the passphrase to `~/.config/kbots-vault-key` (owner-only, 0600). Anyone who can read that file can unlock the vault — decline the prompt if you'd rather type the passphrase at each start
 - **Dangerous tools** pause behind per-tool HITL gates — a human approves via Discord reaction, with a timeout
 - **Access** is filtered three times per message: sender×agent tiers, per-sender tool restriction, static per-agent ceiling
 - **Runaway behavior** is capped by per-tool/per-agent sliding-window rate limits, agent-to-agent loop detection, and dedup of identical messages to a channel within 120s
@@ -704,6 +709,7 @@ No sandbox for in-process tool execution (validation is a filter, not a boundary
 |----------|-------------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design and operations, end to end |
 | [docs/PERMISSIONS.md](docs/PERMISSIONS.md) | Permissions & rights — per-platform setup (Linux/macOS/WSL2), failure catalog, runtime permission watch |
+| [docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md) | Discord bot setup — creating applications, the minimal permission set, install links, the Administrator trap |
 | [SCRIPTS.md](SCRIPTS.md) | Every script and what it's for |
 | [docs/TRAINING.md](docs/TRAINING.md) | Collect agent turns and fine-tune a local model (nanoGPT / MLX-LM / hosted / DPO-KTO) |
 | [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md) | Run agents on local models (Ollama / LM Studio) + the quality-first tier router |

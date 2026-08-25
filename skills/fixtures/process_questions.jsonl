@@ -1,0 +1,4 @@
+{"input": "what is missing from the onboarding process model?", "expect_tool": "process_model_load"}
+{"input": "load the invoicing process and tell me the gaps", "expect_tool": "process_model_load"}
+{"input": "ok that answers it", "expect_no_tool": true}
+{"input": "what is a RACI matrix?", "expect_no_tool": true}

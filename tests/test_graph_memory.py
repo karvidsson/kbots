@@ -123,6 +123,42 @@ async def test_export_for_visualization(tmp_path):
 
 
 @needs_ladybug
+async def test_export_all_scopes(tmp_path):
+    gm = _gm(tmp_path)
+    try:
+        await gm.link("A", "knows", "B", scope="agent", created_by="alice")
+        await gm.link("C", "runs", "D", scope="agent", created_by="bob")
+        await gm.link("A", "uses", "D", scope="global", created_by="alice")
+        # the fleet view sees every edge, private ones included
+        data = await gm.export(all_scopes=True)
+        assert len(data["edges"]) == 3
+        assert {n["name"] for n in data["nodes"]} == {"A", "B", "C", "D"}
+        # scope filtering still applies without the flag
+        assert len((await gm.export(agent_id="carol"))["edges"]) == 1
+    finally:
+        gm.close()
+
+
+@needs_ladybug
+async def test_memory_graph_all_view_is_gated(tmp_path, monkeypatch):
+    """view='all' reveals private edges — unprivileged agents must be refused."""
+    from src.tools import graph as graph_tools
+    gm = _gm(tmp_path)
+    monkeypatch.setattr(graph_store, "_graph", gm)
+    try:
+        await gm.link("Alice", "prefers", "Tea", scope="agent", created_by="alice")
+        monkeypatch.setattr(graph_tools, "_may_view_all", lambda agent_id: False)
+        out = await memory_graph(_ctx("bob"), view="all")
+        assert "privileged" in out and "Tea" not in out
+        monkeypatch.setattr(graph_tools, "_may_view_all", lambda agent_id: True)
+        ctx = ToolContext(agent_id="bob", project_dir=str(tmp_path))
+        out = await memory_graph(ctx, title="Fleet", view="all")
+        assert "memory-graph-" in out and "1 relationships" in out
+    finally:
+        gm.close()
+
+
+@needs_ladybug
 async def test_export_own_only(tmp_path):
     gm = _gm(tmp_path)
     try:
@@ -195,21 +231,37 @@ async def test_graph_query_is_scope_filtered(tmp_path):
         gm.close()
 
 
-@needs_ladybug
-async def test_graph_html_escapes_rel(tmp_path):
-    """A relationship containing markup must not inject into the exported HTML JS."""
+def test_graph_html_escapes_rel():
+    """Markup in graph data must not inject into the exported HTML JS.
+
+    Fed to the renderer directly rather than through link(). Relations are now
+    normalised to snake_case on write, which strips this payload before it
+    could ever reach the renderer, but that is a second line of defence and
+    testing through it would stop testing the escaping at all. Entity names
+    are not normalised, so this remains a reachable path.
+    """
     from src.tools.graph import _render_graph_html
+    nodes = [{"name": "</script><img src=x onerror=alert(1)>", "type": "e", "degree": 1},
+             {"name": "B", "type": "e", "degree": 1}]
+    edges = [{"src": nodes[0]["name"], "rel": "</script>evil", "dst": "B",
+              "confidence": 0.9, "scope": "global", "created_by": "alice"}]
+    html = _render_graph_html(nodes, edges, "T")
+    # The injected closing tag must be escaped in the embedded JSON payload,
+    # leaving only the document's own real </script> tags (D3 loader + app).
+    assert "<\\/script>" in html
+    assert html.count("</script>") == 2
+    assert "onerror=alert(1)>" not in html.split("<script>")[0]
+
+
+@needs_ladybug
+async def test_link_strips_markup_from_relations(tmp_path):
+    """Normalisation is also a sanitiser: a relation cannot carry markup."""
     gm = _gm(tmp_path)
     try:
         await gm.link("A", "</script><img src=x onerror=alert(1)>", "B",
                       scope="global", created_by="alice")
-        data = await gm.export(agent_id="alice")
-        html = _render_graph_html(data["nodes"], data["edges"], "T")
-        # The injected closing tag must be escaped in the embedded JSON payload,
-        # leaving only the document's own real </script> tags (D3 loader + app).
-        assert "<\\/script>" in html
-        assert html.count("</script>") == 2
-        assert "onerror=alert(1)>" not in html.split("<script>")[0]
+        edges = await gm.related("A", agent_id="alice")
+        assert "<" not in edges[0]["rel"] and ">" not in edges[0]["rel"]
     finally:
         gm.close()
 

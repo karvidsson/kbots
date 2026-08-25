@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from src.connectors.discord import DiscordBot, DiscordConnector
 
 
-def _bot():
+def _bot(self_id=None, self_name=""):
     b = DiscordBot.__new__(DiscordBot)
     b.account_name = "test"
+    b._self_user_id = self_id
+    b._self_mention_name = self_name
     return b
 
 
@@ -38,6 +40,25 @@ def test_nickname_form_resolves():
     u = _user(7, "Robin")
     msg = _msg("<@!7> ping", mentions=[u])
     assert _bot()._render_mentions(msg) == "@Robin ping"
+
+
+def test_self_mention_renders_configured_name():
+    """The account's Discord username can differ from the agent's configured
+    name (a fresh install reusing an existing bot application). Rendered with
+    the account name, the agent reads mail addressed to someone else and
+    stays silent — the exact first-boot failure this pins."""
+    account = _user(2, "App-Two")             # Discord-side username
+    msg = _msg("<@2> hello!", mentions=[account])
+    bot = _bot(self_id=2, self_name="Atlas")  # the agent's configured name
+    assert bot._render_mentions(msg) == "@Atlas hello!"
+
+
+def test_self_name_never_touches_other_mentions():
+    me = _user(2, "App-Two")
+    other = _user(3, "Data.Bot")
+    msg = _msg("<@2> ask <@3>", mentions=[me, other])
+    bot = _bot(self_id=2, self_name="Atlas")
+    assert bot._render_mentions(msg) == "@Atlas ask @Data.Bot"
 
 
 def test_role_and_channel_mentions_resolve():

@@ -12,11 +12,50 @@ from pathlib import Path
 
 import yaml
 
-from src.core.base import PROJECT_ROOT, resolve_kbots_tmp
+from src.core.base import PROJECT_ROOT, agent_session_dirs, resolve_kbots_tmp
 
 TIERS = ("privileged", "coordinator", "assistant")
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+
+AGENT_NAME_RULE = ("lowercase letters, digits, '-' or '_', starting with a "
+                   "letter, max 32 characters")
+
+
+def agent_name_error(name: str) -> str | None:
+    """Why `name` cannot be used as an agent id, or None if it can.
+
+    The agent name becomes a directory, a YAML key and an env-var component, so
+    the rule is narrow on purpose. Callers that take it from a human should ask
+    THIS before doing any other work, and re-prompt — the name arriving here for
+    the first time inside scaffold_agent means the failure surfaces after
+    everything else is already done.
+    """
+    if not name:
+        return "Name is empty"
+    if _NAME_RE.match(name):
+        return None
+    if name != name.lower():
+        return (f"{name!r} has capital letters. Agent names are {AGENT_NAME_RULE}. "
+                f"The display name shown in Discord is a separate question and "
+                f"can be capitalised however you like.")
+    if name[0].isdigit() or name[0] in "-_":
+        return f"{name!r} must start with a lowercase letter ({AGENT_NAME_RULE})"
+    if len(name) > 32:
+        return f"{name!r} is {len(name)} characters ({AGENT_NAME_RULE})"
+    return f"{name!r} contains characters that are not allowed ({AGENT_NAME_RULE})"
+
+
+def suggest_agent_name(raw: str) -> str:
+    """A usable agent name derived from whatever the human typed.
+
+    'Botson' -> 'botson', 'My Bot 2' -> 'my-bot-2'. Returns '' when nothing
+    usable survives, so a caller can tell the difference between a fixable typo
+    and input it should simply reject.
+    """
+    slug = re.sub(r"[^a-z0-9_-]+", "-", (raw or "").strip().lower()).strip("-_")
+    slug = re.sub(r"^[^a-z]+", "", slug)[:32].rstrip("-_")
+    return slug if _NAME_RE.match(slug) else ""
 
 # The agent's identity/instructions live in ONE canonical file, named for the
 # cross-CLI convention most agent CLIs read natively (Codex, opencode, Amp…).
@@ -276,10 +315,9 @@ def scaffold_agent(
     overlay = Path(overlay).resolve()
     engine_root = Path(engine_root).resolve() if engine_root else PROJECT_ROOT
 
-    if not _NAME_RE.match(name):
-        raise ValueError(
-            f"Invalid agent name {name!r} — lowercase letters, digits, '-'/'_', max 32 chars"
-        )
+    name_error = agent_name_error(name)
+    if name_error:
+        raise ValueError(f"Invalid agent name: {name_error}")
     if tier not in TIERS:
         raise ValueError(f"Invalid tier {tier!r} — one of {', '.join(TIERS)}")
     if not (overlay / "config").is_dir():
@@ -383,7 +421,16 @@ def scaffold_agent(
     settings_path = claude_dir / "settings.json"
     if not settings_path.exists():
         settings = {
-            "permissions": {"allow": cc_allow_for_tier(tier), "deny": []},
+            "permissions": {
+                "allow": cc_allow_for_tier(tier),
+                "deny": [],
+                # The allow-list and the working-directory boundary are separate
+                # gates: a Read rule over the temp dir grants nothing unless the
+                # directory is in scope too. The engine passes the same set via
+                # --add-dir on every session, so this is what an agent dir opened
+                # by hand sees, and it keeps the two from disagreeing.
+                "additionalDirectories": agent_session_dirs(),
+            },
             "env": {
                 # Include Homebrew paths — node/npx live there on macOS and
                 # stdio MCP servers (npx ...) silently fail to launch without it.

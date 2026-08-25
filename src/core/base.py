@@ -36,6 +36,131 @@ def resolve_kbots_tmp() -> Path:
 KBOTS_TMP = resolve_kbots_tmp()
 
 
+def resolve_overlay() -> Path | None:
+    """The deployment overlay root, or None on an engine-local install."""
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) if overlay else None
+
+
+def agent_session_dirs(extra_dirs=None, configured=None) -> list[str]:
+    """Directories an agent session may reach beyond its own agent directory.
+
+    A CLI agent enforces a working-DIRECTORY boundary on top of the permission
+    allow-list, and the two are separate gates. `Read($KBOTS_TMP/**)` in
+    settings.json is therefore not enough on its own: the path has to be inside
+    the session's directory set as well. Without the shared temp dir there, an
+    agent produces a screenshot, a chart or a PDF through an MCP tool and is
+    then refused permission to open the file it just made. The tool reports
+    success and a path, the read is denied, and nothing in the refusal names
+    the real cause. Every visual task degrades into guesswork.
+
+    The codex is here for the same reason. Each agent's startup context lists
+    the shared documents and tells it to open the file when the work touches
+    it, which is not an instruction an agent can follow if the directory is out
+    of bounds.
+
+    Nothing else is granted by default. The overlay root holds config/
+    (including the encrypted vault), data/ (every agent's memory, turns and
+    audit log) and agents/<other-agent>/, so widening to it is a change to the
+    isolation model rather than a path fix. `defaults.sandbox.additional_dirs`
+    exists for a deployment that wants it, deliberately.
+
+    Only directories that exist are returned: --add-dir on a missing path is
+    refused, which would take the whole session down rather than just that one
+    directory.
+    """
+    candidates: list[str] = [str(resolve_kbots_tmp())]
+    overlay = resolve_overlay()
+    if overlay:
+        candidates.append(str(overlay / "codex"))
+    candidates += [str(d) for d in (configured or [])]
+    candidates += [str(d) for d in (extra_dirs or [])]
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in candidates:
+        if not raw:
+            continue
+        p = Path(raw).expanduser()
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.is_dir():
+            out.append(key)
+        else:
+            logger.warning(
+                f"Agent workspace directory does not exist, not granting it: {key}")
+    return out
+
+
+def resolve_data_dir(config: dict) -> Path:
+    """The deployment's data directory, absolute.
+
+    `kbots.data_dir` is the one place a deployment says where its state lives.
+    """
+    d = Path(config.get("kbots", {}).get("data_dir", "./data"))
+    return d if d.is_absolute() else (PROJECT_ROOT / d)
+
+
+def memory_config(config: dict) -> dict:
+    """`defaults.memory` with its store paths anchored to the data dir.
+
+    Both memory stores took a relative default and resolved it against
+    PROJECT_ROOT, so `data_dir` never governed either one. Pointing data_dir at
+    an overlay moved the training corpus, the audit log and version.json and
+    silently left memory behind, producing two divergent stores with the config
+    naming the one nothing was writing to. A scrub or an audit run against the
+    configured path read a stale database and reported success.
+
+    An explicit `path` in config still wins; this only supplies the default.
+    """
+    cfg = dict(config.get("defaults", {}).get("memory", {}) or {})
+    data_dir = resolve_data_dir(config)
+    cfg.setdefault("path", str(data_dir / "memory.db"))
+    # The embedding model is state, not code, and it is downloaded at runtime.
+    # Left relative it landed under the repo, so an overlay deployment kept its
+    # memories in one place and re-fetched a 130MB model into another.
+    cfg.setdefault("model_dir", str(data_dir / "models" / "bge-small-en-v1.5"))
+    graph = dict(cfg.get("graph") or {})
+    if graph:
+        graph.setdefault("path", str(data_dir / "graph" / "memory.lbdb"))
+        cfg["graph"] = graph
+
+    # A relative store path is the trap that caused this. It reads as
+    # configured, and then resolves against PROJECT_ROOT rather than the data
+    # dir, landing the store somewhere the config never mentions. Rewriting it
+    # silently would be its own surprise, so say it instead.
+    for label, p in (("defaults.memory.path", cfg.get("path")),
+                     ("defaults.memory.graph.path", graph.get("path"))):
+        if p and not Path(p).is_absolute():
+            logger.warning(
+                f"{label} = {p!r} is relative, so it resolves against {PROJECT_ROOT} "
+                f"and NOT against data_dir ({data_dir}). Make it absolute, or drop "
+                f"the key to take the data_dir default."
+            )
+    return cfg
+
+
+def warn_on_split_store(config: dict) -> list[str]:
+    """Names of stores that also exist, non-empty, at the pre-data_dir location.
+
+    A leftover is not an error — it is the old store after a cutover. But it is
+    the exact shape of the bug above, so it must never again be silent.
+    """
+    stale: list[str] = []
+    if resolve_data_dir(config).resolve() == (PROJECT_ROOT / "data").resolve():
+        return stale
+    for rel in ("memory.db", "graph/memory.lbdb"):
+        legacy = PROJECT_ROOT / "data" / rel
+        try:
+            if legacy.is_file() and legacy.stat().st_size > 0:
+                stale.append(str(legacy))
+        except OSError:
+            continue
+    return stale
+
+
 def resolve_vault_key_file() -> Path:
     """Resolve the vault key file path.
 
@@ -60,6 +185,26 @@ def harden_path(path, file_mode: int = 0o600, dir_mode: int = 0o700) -> None:
             os.chmod(parent, dir_mode)
     except OSError as e:
         logger.debug(f"harden_path({path}) failed: {e}")
+
+
+def write_private_file(path: Path, content: str, dir_mode: int = 0o700) -> None:
+    """Write a sensitive file so it is 0600 from its first byte on disk.
+
+    write_text() + chmod() leaves a window where the file sits at the umask
+    default (0644 on most hosts) with the secret already inside; opening with
+    an explicit 0600 mode closes it. The parent directory is created 0700 only
+    when it does not exist yet — an existing ~/.config keeps its mode.
+    """
+    path = Path(path)
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, mode=dir_mode)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
+    # O_CREAT's mode only applies to new files — repair a pre-existing one.
+    os.chmod(path, 0o600)
 
 
 def read_vault_key_file(key_file: Path) -> str:
@@ -102,6 +247,66 @@ def resolve_config_file(name: str) -> Path:
         if p.exists():
             return p
     return PROJECT_ROOT / "config" / name
+
+
+def install_write_root() -> Path:
+    """The root that install-specific files are WRITTEN under.
+
+    The overlay when there is one, the Core checkout only when there is not
+    (a single-user dev clone, where Core is the only layer that exists).
+
+    Nothing an installation produces belongs in Core. Core is replaced by every
+    `git pull`, so a file written there survives until the next deploy and then
+    silently does not; a hardened systemd unit lists the engine root under
+    ReadOnlyPaths, so the same write fails outright on Linux while working on a
+    developer Mac that has no sandbox; and every loader reads Core first and
+    the overlay last, so a file written to Core also loses to its own overlay
+    counterpart.
+
+    The trap this exists to close is subtler than a hardcoded path. Several
+    resolvers took the form `overlay_path if overlay_path.exists() else core`,
+    which reads as overlay-first and is not: on a fresh install the overlay
+    file does not exist yet, so the FIRST write goes to Core, and because it
+    then still does not exist in the overlay, so does every write after it.
+    Read resolvers may be exists()-gated. Write resolvers may not.
+    """
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) if overlay else PROJECT_ROOT
+
+
+def overlay_state_path(name: str) -> Path | None:
+    """Where a small shared state file is WRITTEN: the overlay's data/ directory.
+
+    Five of these (schedules, runtime flags, triggers, session consent, the
+    feedback map) each resolved their own path against the overlay ROOT. A
+    hardened service unit grants ReadWritePaths to the subdirectories it needs,
+    which leaves that root read-only, so inside the service every write failed
+    while the same code worked perfectly from a shell. One of them suppressed
+    the error and re-fired a `once` schedule every tick, forever.
+
+    One helper rather than a sixth copy of the same two lines.
+    """
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) / "data" / name if overlay else None
+
+
+def overlay_state_legacy_path(name: str) -> Path | None:
+    """The pre-migration location at the overlay root. Read, never written."""
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return Path(overlay) / name if overlay else None
+
+
+def overlay_state_read_path(name: str) -> Path | None:
+    """The file to READ: the current location, else the legacy one, else None.
+
+    State written before the move keeps governing until the first write carries
+    it forward, so an existing install loses nothing on upgrade.
+    """
+    path = overlay_state_path(name)
+    if path and path.exists():
+        return path
+    legacy = overlay_state_legacy_path(name)
+    return legacy if legacy and legacy.exists() else None
 
 
 # === Messages ===

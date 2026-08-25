@@ -31,9 +31,12 @@ async def test_list_since_scope_and_archive_filtering(tmp_path):
     try:
         await mem.store("mine", "semantic", agent_id="a")
         await mem.store("someone else's", "semantic", agent_id="b")
+        await mem.store("someone else's secret", "semantic", agent_id="b",
+                        scope="private:b")
         await mem.store("shared", "semantic", agent_id="b", scope="global")
         rows = await mem.list_since("a", limit=10)
         contents = {m["content"] for m in rows}
-        assert contents == {"mine", "shared"}
+        # Another agent's ordinary memory is readable; its private one is not.
+        assert contents == {"mine", "someone else's", "shared"}
     finally:
         mem.close()

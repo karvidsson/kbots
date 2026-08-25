@@ -52,13 +52,22 @@ CYAN = "\033[36m"
 RESET = "\033[0m"
 
 
-def banner():
-    print(f"""
-{BOLD}{CYAN}╔══════════════════════════════════════╗
-║       kbots Settings Manager       ║
-║    The Agent Routing System          ║
-╚══════════════════════════════════════╝{RESET}
-""")
+TAGLINE = "one process · LLM-agnostic · trains itself"
+
+
+def banner(title: str = "kbots Settings Manager"):
+    """Boxed banner, built rather than hand-drawn.
+
+    The two hand-drawn boxes had drifted: settings.py rendered 38 characters
+    inside a 40-character border, so it printed crooked. Centring in code means
+    a retitle cannot misalign it again.
+    """
+    lines = [title, TAGLINE]
+    inner = max(len(line) for line in lines) + 8
+    top = "╔" + "═" * inner + "╗"
+    bottom = "╚" + "═" * inner + "╝"
+    body = "\n".join(f"║{line.center(inner)}║" for line in lines)
+    print(f"\n{BOLD}{CYAN}{top}\n{body}\n{bottom}{RESET}\n")
 
 
 def header(text: str):
@@ -503,6 +512,38 @@ def edit_memory(cfg: dict):
 
         memory["decay_enabled"] = ask_yn("Enable memory decay?", default=memory.get("decay_enabled", False))
         memory["max_results"] = ask_int("Max results per search", memory.get("max_results", 10))
+        save_config(cfg)
+
+
+def edit_reply(cfg: dict):
+    """Reply length: post the point, keep the rest behind a reaction."""
+    header("Reply Length")
+    reply = cfg.setdefault("defaults", {}).setdefault("reply", {})
+    shorten = reply.setdefault("shorten", {})
+
+    show("enabled", shorten.get("enabled", False))
+    show("threshold_chars", shorten.get("threshold_chars", 700))
+    show("emoji", shorten.get("emoji", "\N{LEFT-POINTING MAGNIFYING GLASS}"))
+    show("ttl_hours", shorten.get("ttl_hours", 72))
+    print()
+    info("Over the threshold, a reply is cut at a section boundary and the head")
+    info("is posted with a footer saying how much was held back. The rest arrives")
+    info("when you react with the emoji below, or say \"more\". Nothing is")
+    info("summarised and nothing is lost: the cut is where a section starts.")
+    print()
+
+    if ask_yn("Edit reply settings?"):
+        shorten["enabled"] = ask_yn("Shorten long replies?",
+                                    default=shorten.get("enabled", False))
+        if shorten["enabled"]:
+            shorten["threshold_chars"] = ask_int(
+                "Shorten replies longer than (chars)",
+                shorten.get("threshold_chars", 700))
+            shorten["emoji"] = ask(
+                "Reaction that expands a shortened reply",
+                default=shorten.get("emoji", "\N{LEFT-POINTING MAGNIFYING GLASS}"))
+            shorten["ttl_hours"] = ask_int(
+                "Keep the held-back text for (hours)", shorten.get("ttl_hours", 72))
         save_config(cfg)
 
 
@@ -1257,10 +1298,10 @@ def create_ops_instance():
     print()
     header("Next Steps")
     info("1. Customise the CLAUDE.md:  agents/" + agent_name + "/CLAUDE.md")
-    info("2. Install the service unit:")
-    info("     sudo cp config/kbots-rescue.service /etc/systemd/system/")
-    info("     sudo systemctl daemon-reload")
-    info("     sudo systemctl enable --now kbots-rescue.service")
+    info("2. Install the service unit — re-run `uv run python setup.py`; its")
+    info("   systemd step renders and installs kbots-rescue.service with the")
+    info("   right HOME and KBOTS_OVERLAY. (A raw cp of the template boots")
+    info("   with root's HOME and no overlay, and crash-loops.)")
     info("3. The ops agent loads profile 'rescue' — only agents in")
     info("   agents.rescue.yaml are started. Your main agents are unaffected.")
     info("")
@@ -1704,6 +1745,7 @@ MENU_ITEMS = [
     ("5", "Security / HITL", edit_hitl, True),
     ("6", "Rate Limits", edit_rate_limits, True),
     ("7", "Compression", edit_compression, True),
+    ("17", "Reply Length", edit_reply, True),
     ("8", "Admin Users", edit_admin_users, True),
     ("9", "Identity (name, log level)", edit_kbots_identity, True),
     ("10", "Agents", view_agents, False),

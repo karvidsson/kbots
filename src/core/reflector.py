@@ -18,12 +18,12 @@ CLAUDE.md / .mcp.json), with no tools, so it's a single cheap completion.
 import asyncio
 import json
 import logging
-import os
 import time
 from pathlib import Path
 
 from src.core import runtime_state
-from src.core.base import Message, MessageRole
+from src.core.base import Message, MessageRole, resolve_kbots_tmp
+from src.lib.canonical import normalize_rel, vocab_prompt_line
 
 logger = logging.getLogger(__name__)
 
@@ -52,9 +52,11 @@ _EXTRACT_SYSTEM = (
     "build a knowledge graph. Each memory has an id. Output ONLY a JSON array:\n"
     '[{"a": "<entity>", "rel": "<relation>", "b": "<entity>", '
     '"confidence": 0.0-1.0, "source": <memory id>}]\n'
-    "Rules: entities are short canonical names of durable things — people, "
-    "projects, tools, organizations, places, concepts. rel is a short reusable "
-    "snake_case relation (works_at, uses, owns, part_of, reports_to, competes_with). "
+    "Rules: entities are short canonical names of durable things: people, "
+    "projects, tools, organizations, places, concepts.\n"
+    "rel MUST come from this list: " + vocab_prompt_line() + ". "
+    "Pick the closest one rather than inventing a new relation; a graph with a "
+    "hundred one-off relation names cannot be traversed.\n"
     "Only extract relationships the memory actually states or strongly implies; "
     "skip one-off events, opinions, and procedural trivia. Reuse the exact same "
     "entity spelling across edges. confidence reflects how explicitly the memory "
@@ -113,8 +115,14 @@ class Reflector:
         return (now - float(last)) >= self.interval_h * 3600
 
     def _work_dir(self) -> str:
-        """Neutral cwd for the LLM call — no agent CLAUDE.md/.mcp.json to load."""
-        d = Path(os.environ.get("KBOTS_OVERLAY", ".")) / "tmp" / "reflector"
+        """Neutral cwd for the LLM call — no agent CLAUDE.md/.mcp.json to load.
+
+        Via resolve_kbots_tmp() rather than a hand-rolled $KBOTS_OVERLAY/tmp:
+        that bypassed the KBOTS_TMP override, which is the one escape hatch a
+        hardened host has when the overlay root is mounted read-only. The mkdir
+        raised there, and it is the first thing the reflector does.
+        """
+        d = resolve_kbots_tmp() / "reflector"
         d.mkdir(parents=True, exist_ok=True)
         return str(d)
 
@@ -123,19 +131,21 @@ class Reflector:
                     f"graph extraction {'ON' if self.extract_enabled else 'off'})")
         while True:
             try:
-                if self.enabled or self.extract_enabled:
-                    now = time.time()
-                    for agent_id in list(getattr(self.mgr, "agent_configs", {})):
-                        if not self._due(agent_id, now):
-                            continue
-                        if self.enabled:
-                            await self._reflect(agent_id)
-                        if self.extract_enabled:
-                            try:
-                                await self._extract_graph(agent_id)
-                            except Exception as e:
-                                logger.error(f"Graph extraction failed for {agent_id}: {e}")
+                now = time.time()
+                for agent_id in list(getattr(self.mgr, "agent_configs", {})):
+                    if self.enabled and self._due(agent_id, now):
+                        await self._reflect(agent_id)
                         runtime_state.set_flag(f"reflector_last_{agent_id}", time.time())
+                    # Extraction runs every tick, not on the reflection interval:
+                    # _extract_graph early-returns on an empty batch (one cheap
+                    # cursor query), so a quiet agent costs nothing, while a
+                    # busy agent's backlog drains at extract_batch/tick instead
+                    # of extract_batch/24h.
+                    if self.extract_enabled:
+                        try:
+                            await self._extract_graph(agent_id)
+                        except Exception as e:
+                            logger.error(f"Graph extraction failed for {agent_id}: {e}")
             except Exception as e:
                 logger.error(f"Reflector tick failed: {e}", exc_info=True)
             await asyncio.sleep(self.tick)
@@ -225,15 +235,39 @@ class Reflector:
         # scope of each edge = scope of the memory it came from
         scope_by_id = {str(m["id"]): (m.get("scope") or f"agent:{agent_id}")
                        for m in memories}
+        known_ids = set(scope_by_id)
         linked = 0
+        off_vocab = 0
+        # entity anchors, keyed by the memory the edge was extracted from. The
+        # source id was already being resolved here and then thrown away, which
+        # is why a memory found by search had no way into the graph.
+        anchors: dict[str, set] = {}
         for e in edges:
-            scope = scope_by_id.get(str(e.get("source")), f"agent:{agent_id}")
+            source = str(e.get("source"))
+            scope = scope_by_id.get(source, f"agent:{agent_id}")
             try:
-                await graph.link(e["a"], e["rel"], e["b"], confidence=e["confidence"],
-                                 scope=scope, created_by=agent_id)
+                result = await graph.link(
+                    e["a"], e["rel"], e["b"], confidence=e["confidence"],
+                    scope=scope, created_by=agent_id)
                 linked += 1
+                if normalize_rel(e["rel"])[1] is False:
+                    off_vocab += 1
+                if source in known_ids:
+                    # Anchor the RESOLVED names, not the extracted spelling:
+                    # the anchor has to match what is in the graph or the join
+                    # back through it finds nothing.
+                    anchors.setdefault(source, set()).update(
+                        (result.get("a", e["a"]), result.get("b", e["b"])))
             except (GraphUnavailableError, ValueError) as err:
                 logger.debug(f"Graph extraction: skipped edge {e['a']}→{e['b']}: {err}")
+
+        anchored = 0
+        if anchors and hasattr(memory, "anchor_entities"):
+            for mem_id, names in anchors.items():
+                try:
+                    anchored += await memory.anchor_entities(mem_id, sorted(names))
+                except Exception as err:
+                    logger.debug(f"Graph extraction: anchoring {mem_id} failed: {err}")
 
         # advance the cursor even when the batch yielded nothing — these
         # memories are processed; the next pass reads the next batch
@@ -241,5 +275,6 @@ class Reflector:
         runtime_state.set_flag(
             cursor_key, [str(last.get("updated_at") or ""), str(last.get("id") or "")])
         logger.info(f"Graph extraction: {agent_id} — {len(memories)} memories read, "
-                    f"{linked} edges linked (model={self.model})")
+                    f"{linked} edges linked, {anchored} entity anchors, "
+                    f"{off_vocab} off-vocabulary relations (model={self.model})")
         return linked

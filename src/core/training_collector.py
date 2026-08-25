@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 _MAX_FIELD = 4000       # truncate long tool inputs/outputs/text blocks
 _MAX_INPUT = 20000      # truncate the assembled prompt / response
 _MAX_STEPS = 200        # cap tool steps captured per turn
+# Turns to scan back through when attributing a reward to an agent. A reaction
+# lands on something recent; reading the whole file to answer a thumbs-up would
+# cost more than the signal is worth.
+_REWARD_LOOKBACK = 500
 
 
 def _iso_now() -> str:
@@ -173,9 +177,20 @@ class TrainingCollector:
             logger.debug(f"record_turn failed: {e}")
 
     def record_reward(self, reply_message_id, agent_id, signal, user_id=None) -> None:
-        """Record a discrete human reward (👍/👎) keyed by reply_message_id."""
+        """Record a discrete human reward (👍/👎) keyed by reply_message_id.
+
+        The caller resolves the agent through feedback_map, which is only
+        written for replies that recalled a lesson: 32 of 1163 turns on the
+        live store. Every other reward landed with agent=null. The export path
+        survives that, because it joins to the turn on reply_message_id, but
+        the file is unreadable on its own and no per-agent reward count is
+        possible without redoing the join by hand. The turn record already
+        holds the answer, so look it up rather than storing a null.
+        """
         if not reply_message_id:
             return
+        if not agent_id:
+            agent_id = self._agent_for_reply(str(reply_message_id))
         self._write(self._rewards_path, {
             "ts": _iso_now(),
             "reply_message_id": str(reply_message_id),
@@ -183,6 +198,27 @@ class TrainingCollector:
             "signal": signal,          # "up" | "down"
             "user_id": user_id,
         })
+
+    def _agent_for_reply(self, reply_message_id: str) -> str | None:
+        """Which agent sent this reply, from the tail of turns.jsonl.
+
+        Scans backwards over a bounded window: a reaction lands on something
+        recent, and reading a 40MB file forwards to answer a thumbs-up would
+        cost more than the signal is worth.
+        """
+        try:
+            with open(self._turns_path, errors="replace") as fh:
+                tail = fh.readlines()[-_REWARD_LOOKBACK:]
+        except OSError:
+            return None
+        for line in reversed(tail):
+            try:
+                turn = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if str(turn.get("reply_message_id") or "") == reply_message_id:
+                return turn.get("agent")
+        return None
 
     def _extract_tools(self, project_dir, cli_sid) -> list[dict]:
         """Parse this turn's tool_use / tool_result / assistant-text steps from the

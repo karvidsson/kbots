@@ -1,55 +1,40 @@
 #!/usr/bin/env bash
-# Memory decay — daily lifecycle management.
-# Decays confidence, archives faded memories, purges old archives.
-# Run daily at 03:00 UTC via kbots-memory-decay.timer.
+# RETIRED 2026-08-22. Memory decay runs inside the engine now.
 #
-# Lifecycle:
-#   Day 0:  0.70 (new memory)
-#   Day 10: 0.59
-#   Day 30: 0.38
-#   Day 60: 0.05 → archived
-#   +90 days archived → permanently deleted
-#   Accessed → decay pauses
-#   Pinned → immune forever
+# This script implemented the decay lifecycle a second time, in SQL, and said
+# it ran "daily at 03:00 UTC via kbots-memory-decay.timer" — a systemd unit
+# that no macOS install has and no installer creates. It never ran anywhere.
+# It also resolved the database as $KBOTS_HOME/data/memory.db, which stopped
+# being the live store when data_dir moved to the overlay, so scheduling it
+# today would have decayed a retired database.
+#
+# It is kept as a signpost rather than deleted, because the timer name is
+# referenced in older docs and in scripts/settings.py, and a missing script
+# reads as "not installed yet" rather than "replaced".
+#
+# The engine task: src/core/memory_decay.py, gated on
+# defaults.memory.decay_enabled, tuned under defaults.memory.decay.
 set -uo pipefail
 
-KBOTS_HOME="${KBOTS_HOME:-$(cd "$(dirname "$0")/.." && pwd)}"
-DB_PATH="${KBOTS_DATA_DIR:-$KBOTS_HOME/data}/memory.db"
+cat <<'EOF'
+memory-decay.sh is retired.
 
-if [ ! -f "$DB_PATH" ]; then
-    echo "Memory DB not found at $DB_PATH"
-    exit 0
-fi
+Decay now runs inside the engine (src/core/memory_decay.py) on a daily task,
+against the store the engine itself opened. Enable and tune it in config:
 
-# Decay: non-pinned memories not accessed in 24h lose 0.0108 confidence/day (~60 days to archive)
-decayed=$(sqlite3 "$DB_PATH" "
-    UPDATE memories
-    SET confidence = MAX(confidence - 0.0108, 0.0),
-        updated_at = datetime('now')
-    WHERE pinned = 0
-      AND scope NOT LIKE 'archived%'
-      AND (last_accessed IS NULL OR last_accessed < datetime('now', '-1 day'));
-    SELECT changes();
-" 2>/dev/null || echo "0")
+  defaults:
+    memory:
+      decay_enabled: true
+      decay:
+        interval_hours: 24
+        rate: 0.0108           # confidence lost per day when not recalled
+        archive_threshold: 0.05
+        purge_archived: false  # archiving is reversible, deleting is not
 
-# Archive: memories below 0.05 confidence
-archived=$(sqlite3 "$DB_PATH" "
-    UPDATE memories
-    SET scope = 'archived:' || scope,
-        updated_at = datetime('now')
-    WHERE pinned = 0
-      AND scope NOT LIKE 'archived%'
-      AND confidence < 0.05;
-    SELECT changes();
-" 2>/dev/null || echo "0")
+Lessons never decay. To check what it has done:
 
-# Purge: archived memories older than 90 days — permanently deleted
-purged=$(sqlite3 "$DB_PATH" "
-    DELETE FROM memories
-    WHERE scope LIKE 'archived%'
-      AND updated_at < datetime('now', '-90 days');
-    SELECT changes();
-" 2>/dev/null || echo "0")
-
-now_utc=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
-echo "Memory decay completed at $now_utc: decayed=$decayed archived=$archived purged=$purged"
+  sqlite3 <data_dir>/memory.db \
+    "SELECT timestamp, new_value FROM changelog WHERE action IN ('decay','purge')
+     ORDER BY timestamp DESC LIMIT 10;"
+EOF
+exit 0

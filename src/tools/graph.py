@@ -71,6 +71,35 @@ async def memory_related(ctx: ToolContext, entity: str, depth: int = 1, limit: i
     return "\n".join(lines)
 
 
+@tool(name="memory_history", description="What the graph used to say about an entity, and when it changed", category="memory")
+async def memory_history(ctx: ToolContext, entity: str, limit: int = 50) -> str:
+    """Show every relationship touching an entity, superseded ones included.
+
+    Every other graph read shows only what is currently true. This one shows
+    what changed: when a single-valued fact is re-asserted with a new value,
+    the old edge is closed rather than deleted, and this is where it is still
+    visible. Use it when the question is "since when" or "what was it before".
+
+    Args:
+        entity: Entity name
+        limit: Max edges to return
+    """
+    try:
+        edges = await get_graph().history(entity, agent_id=ctx.agent_id, limit=limit)
+    except GraphUnavailableError as e:
+        return str(e)
+    if not edges:
+        return f"No history for '{entity}'."
+    lines = [f"History for '{entity}' ({len(edges)} edges, newest first):"]
+    for e in edges:
+        if e.get("current"):
+            when = f"since {e.get('valid_from') or 'unknown'}"
+        else:
+            when = f"{e.get('valid_from') or 'unknown'} → {e.get('valid_to')} (superseded)"
+        lines.append(f"  {e['src']} —{e['rel']}→ {e['dst']}  [{when}]")
+    return "\n".join(lines)
+
+
 @tool(name="memory_unlink", description="Remove a relationship you created from graph memory", category="memory")
 async def memory_unlink(ctx: ToolContext, a: str, rel: str, b: str) -> str:
     """Remove a relationship. Only edges you created (or scoped to you) can be removed."""
@@ -291,14 +320,25 @@ def _render_graph_html(nodes: list[dict], edges: list[dict], title: str) -> str:
     return re.sub("|".join(subs), lambda m: subs[m.group(0)], _HTML)
 
 
+def _may_view_all(agent_id: str) -> bool:
+    """Fleet view is for the coordinator / privileged agents only — it reveals
+    every agent's private edges."""
+    import os
+
+    from src.core.agent_scaffold import agent_is_privileged_or_coordinator
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    return bool(overlay) and agent_is_privileged_or_coordinator(Path(overlay), agent_id)
+
+
 @tool(
     name="memory_graph",
     description=(
-        "Render this agent's memory graph as an interactive HTML file (D3 force "
+        "Render the memory graph as an interactive HTML file (D3 force "
         "layout: zoom, drag, search, neighbourhood highlighting; needs internet "
         "to load D3). Default shows only your own memories; view='shared' adds the "
-        "global/group edges other agents contributed. Returns a file path; "
-        "deliver it to the user with send_discord_file."
+        "global/group edges other agents contributed; view='all' is the fleet-wide "
+        "map of every agent's edges (coordinator/privileged only). Returns a file "
+        "path; deliver it to the user with send_discord_file."
     ),
     category="memory",
 )
@@ -309,12 +349,19 @@ async def memory_graph(ctx: ToolContext, title: str = "Memory Graph", view: str 
         title: Heading shown on the page
         view: 'own' (default) — only this agent's memories (edges it created or
               scoped to it); 'shared' — everything visible to it, including
-              global/group edges from other agents
+              global/group edges from other agents; 'all' — every edge from
+              every agent regardless of scope (coordinator/privileged only)
     """
-    if view not in ("own", "shared"):
-        return "Invalid view — use 'own' (default) or 'shared'."
+    if view not in ("own", "shared", "all"):
+        return "Invalid view — use 'own' (default), 'shared', or 'all'."
+    if view == "all" and not _may_view_all(ctx.agent_id):
+        return ("view='all' shows every agent's private edges — only the "
+                "coordinator or a privileged agent may use it. Use 'shared' "
+                "for everything visible to you.")
     try:
-        data = await get_graph().export(agent_id=ctx.agent_id, own_only=(view == "own"))
+        data = await get_graph().export(agent_id=ctx.agent_id,
+                                        own_only=(view == "own"),
+                                        all_scopes=(view == "all"))
     except GraphUnavailableError as e:
         return str(e)
     if not data["edges"]:
@@ -322,6 +369,21 @@ async def memory_graph(ctx: ToolContext, title: str = "Memory Graph", view: str 
             return ("You have no memories in the graph yet — nothing to visualize. "
                     "Store relationships with memory_link first.")
         return "The memory graph is empty — nothing to visualize yet. Store relationships with memory_link first."
+    if view == "all":
+        # Colour the fleet view by owner: node type becomes the agent whose
+        # edges touch it ('shared' for global/group edges, 'mixed' when several
+        # agents touch the same entity), so the legend doubles as a per-agent
+        # breakdown with click-to-hide.
+        owners: dict[str, set] = {}
+        for e in data["edges"]:
+            scope = e.get("scope") or ""
+            owner = scope.removeprefix("agent:") if scope.startswith("agent:") else "shared"
+            for name in (e["src"], e["dst"]):
+                owners.setdefault(name, set()).add(owner)
+        for n in data["nodes"]:
+            o = owners.get(n["name"], set())
+            if o:
+                n["type"] = next(iter(o)) if len(o) == 1 else "mixed"
     doc = _render_graph_html(data["nodes"], data["edges"], title)
     out_dir = Path(ctx.project_dir) if ctx.project_dir else KBOTS_TMP
     out_dir.mkdir(parents=True, exist_ok=True)

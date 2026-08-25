@@ -15,14 +15,14 @@ uv run python setup.py
 4. **Git hooks** — installs the pre-commit hook, refreshing it on re-runs if it changed
 5. **Modules** — finds Layer 2 extension modules and asks which ones to enable
 6. **Vault** — sets up the encrypted credential vault, reusing one if it already exists
-7. **Discord** — bot token, guild choice, channel list
+7. **Main agent & Discord bot** — one name ("Atlas") drives the display name, folder, config key and bot account; then token, guild, install link, model, personality and routing — one agent, one bot, one step
 8. **Team** — configures the owner and team members
-9. **Agent** — name, model, and personality for the first agent
-10. **Machine control** — how much of the machine the main agent may touch: none (default), user shell, or root via a sudoers rule
-11. **HITL** — approval channel and approvers; which tools are gated (`send_email`, `install_mcp`, `create_agent`)
-12. **Compression** — context compression, if wanted; plus optional sub-steps 12b **Local models** (Ollama / LM Studio + tier router) and 12c **Training-data collection**
+9. **Machine control** — how much of the machine the main agent may touch: none (default), user shell, or root via a sudoers rule
+10. **HITL** — approval channel and approvers; which tools are gated (`send_email`, `install_mcp`, `create_agent`)
+11. **Compression** — context compression, if wanted; plus optional sub-steps for **Local models** (Ollama / LM Studio + tier router) and **Training-data collection**
+12. **Optional features** — Python extras (data analysis, reports, web search, …) saved to `<overlay>/extras` so every future sync keeps them installed
 13. **Config generation** — produces config.yaml, agents.yaml, team.json, mcp.yaml, and the agent AGENTS.md
-14. **Ops instance** — optionally adds a privileged dev/ops agent with its own bot and service
+14. **Ops instance** — optionally adds a privileged dev/ops agent (one name here too — bot account and folder derive from it) with its own bot and service
 15. **Extras** — additional team members or bots (further *agents* are created post-setup by your main agent via its `create_agent` tool)
 16. **Service** — Linux: systemd units via `scripts/install-systemd.sh`; macOS: launchd plist. Starts the service and verifies the agent comes online
 17. **Browser** — optionally fetches Chromium for headless browsing
@@ -132,11 +132,22 @@ uv run python vault-manage.py
 ### `scripts/chrome-debug.sh` — Debug Chrome for the `chrome_browser` Tool (macOS)
 Launches a separate Google Chrome with remote debugging enabled so the `chrome_browser` tool can drive your **real** browser — genuine fingerprint and logged-in sessions — to reach sites that block the headless `browser` tool. It runs on a debug profile seeded from your real one (cookies/logins carry over), leaving your everyday Chrome untouched. A dedicated profile dir is required because Chrome 136+ refuses remote debugging on the default profile for security.
 ```bash
-scripts/chrome-debug.sh            # start (or reuse) the debug Chrome
-scripts/chrome-debug.sh --refresh  # re-seed logins from your live profile
-scripts/chrome-debug.sh --status   # is the debug port up?
+scripts/chrome-debug.sh              # start (or reuse) the debug Chrome
+scripts/chrome-debug.sh --refresh    # re-seed logins from your live profile
+scripts/chrome-debug.sh --status     # is the debug port up?
+scripts/chrome-debug.sh --install    # supervise under launchd (recommended)
+scripts/chrome-debug.sh --uninstall  # remove the launchd job
 ```
 The `chrome_browser` tool auto-runs this on first use, so you normally don't call it directly. Env: `KBOTS_CHROME_DEBUG_PORT` (default 9222), `KBOTS_CHROME_DEBUG_DIR` (default `~/.kbots-chrome-debug`).
+
+**Supervision (`--install`):** an ad-hoc debug Chrome dies silently on a crash, a Chrome self-update relaunch (which drops CLI flags), ⌘Q, or a reboot — and CDP with it. `--install` writes a `com.kbots.chrome-debug` LaunchAgent with `KeepAlive`, so launchd restarts it with the right flags every time. On every successful start the script writes an endpoint discovery file (`$KBOTS_OVERLAY/data/chrome-debug.json`: port, user-data-dir, pid) which the `chrome_browser` tool uses to verify the responder on the port is *our* Chrome — a squatted port or the user's own flag-ignoring Chrome now gets a clear refusal instead of a confusing session. Note your own everyday Chrome **cannot** expose CDP (Chrome ≥136 ignores the flag on the default profile); logins the agents need belong in the debug Chrome's named profiles via the sign-in-once flow.
+
+**Dedicated per-agent instances:** by default every agent shares one debug Chrome (identity separation via named profiles, but one CDP port — any attached agent can reach any profile's tabs, and driving is serialized). For an agent holding real credentials, give it its own Chrome in `agents.yaml`:
+```yaml
+  atlas:
+    chrome_instance: {port: 9223}          # dir defaults to ~/.kbots-chrome-<agent>
+```
+That agent then gets its own data dir (real cookie isolation), its own reservation lane (parallel driving), and its own endpoint file. Supervise it too: `KBOTS_CHROME_DEBUG_PORT=9223 KBOTS_CHROME_DEBUG_DIR=~/.kbots-chrome-atlas scripts/chrome-debug.sh --install` (the label becomes `com.kbots.chrome-debug-9223`). Cost: one Chrome's RAM per dedicated agent.
 
 ## Testing
 

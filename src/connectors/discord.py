@@ -13,6 +13,7 @@ import discord
 from discord import app_commands
 
 from src.core.base import Attachment, Connector, IncomingMessage, VaultBackend
+from src.core.reply_shorten import ReplyShortener, wants_more
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +32,22 @@ def _normalize_bot_content(text: str) -> str:
     t = re.sub(r"<@[!&]?\d+>", " ", text or "")   # strip user/role mentions
     t = re.sub(r"[^\w\s]", " ", t)                # strip punctuation + emoji
     return re.sub(r"\s+", " ", t).strip().lower()
+
+
+# Gateway intents requested when an account does not name its own. Reactions
+# must be listed for BOTH scopes: Discord gates guild and DM reaction events on
+# separate bits, and agent home channels are DMs. Requesting only
+# guild_reactions means 👍/👎, ✅/❌ and the schedule-cancel ❌ are never
+# delivered where the owner actually presses them — silently, since an intent
+# you did not ask for produces no error, just no events.
+DEFAULT_INTENTS = [
+    "guilds",
+    "guild_messages",
+    "dm_messages",
+    "message_content",
+    "guild_reactions",
+    "dm_reactions",
+]
 
 
 class DiscordConnector(Connector):
@@ -53,10 +70,61 @@ class DiscordConnector(Connector):
         self._recent_sends: dict[str, tuple[str, float]] = {}
         # Outgoing mention resolution: (guild_id, name_lower) -> (markup|None, timestamp)
         self._mention_cache: dict[tuple[int, str], tuple[str | None, float]] = {}
+        # Server auto-setup context, set by main (the connector sees only its own
+        # config block, and provisioning has to read hitl/schedules/goals keys).
+        self._full_config: dict = {}
+        self._data_dir: str = ""
+        self._on_guild_setup = None
+        self._on_guild_intro = None
+        self._setup_profile: str = ""
+        # Long replies are cut at a structural boundary; the rest arrives on a
+        # reaction. Built here with no data dir, rebuilt in set_setup_context
+        # once the engine says where state lives.
+        self._shortener = ReplyShortener(config.get("reply"), store_dir=".")
+
+    def set_setup_context(self, config: dict, data_dir: str, on_guild_setup=None,
+                          profile: str = "", on_guild_intro=None) -> None:
+        """Give the connector what it needs to provision a newly joined server.
+
+        on_guild_setup(agent_id, guild_id, guild_name, outcomes) is awaited after
+        provisioning so the engine can hand that agent a turn. Optional: the
+        channels are created either way, because they are deterministic and must
+        not depend on an LLM turn succeeding.
+
+        on_guild_intro(agent_id, guild_id, guild_name, channel_id) is awaited
+        when a NON-setup bot joins a guild, so its agent introduces itself in
+        the platform-updates channel (the setup agent's provisioning turn
+        already covers its own introduction).
+
+        profile: the engine profile this process runs under ("" for the main
+        instance). A secondary instance (e.g. the rescue profile) sees only its
+        OWN agent list, in which its single agent looks like the setup account
+        — so provisioning is gated on the main instance here, not on config.
+        """
+        self._full_config = config or {}
+        self._data_dir = str(data_dir or "")
+        self._on_guild_setup = on_guild_setup
+        self._on_guild_intro = on_guild_intro
+        self._setup_profile = str(profile or "")
+        # `defaults.reply` is engine config, not connector config, so the
+        # shortener can only be built properly once the full config arrives.
+        reply_cfg = (self._full_config.get("defaults") or {}).get("reply") or {}
+        self._shortener = ReplyShortener(
+            reply_cfg, store_dir=Path(self._data_dir or ".") / "reply-overflow",
+            agent_configs=self._agent_configs)
+        if self._shortener.enabled:
+            logger.info(f"Reply shortening: ON (default over "
+                        f"{self._shortener.threshold_for(None)} chars, "
+                        f"expand with {self._shortener.emoji})")
 
     def set_agent_configs(self, agent_configs: dict[str, dict]) -> None:
         """Set agent configs so the connector knows which agents route to which bots."""
         self._agent_configs = agent_configs
+        # The shortener resolves per-agent settings out of these, and main sets
+        # them in either order relative to set_setup_context. Rebinding here
+        # means the per-agent config cannot be silently ignored depending on
+        # startup order.
+        self._shortener.agent_configs = agent_configs
 
     def set_skills(self, skills: dict[str, Any]) -> None:
         """Set available skills for slash command registration."""
@@ -91,9 +159,7 @@ class DiscordConnector(Connector):
                 logger.error(f"No token for Discord account '{account_name}' (key: {token_key})")
                 continue
 
-            intents_list = account_cfg.get("intents", [
-                "guilds", "guild_messages", "dm_messages", "message_content", "guild_reactions",
-            ])
+            intents_list = account_cfg.get("intents", DEFAULT_INTENTS)
             max_messages = account_cfg.get("max_messages", 1000)
 
             bot = DiscordBot(
@@ -180,6 +246,17 @@ class DiscordConnector(Connector):
             return None
         self._recent_sends[channel_id] = (content_for_dedup, time.monotonic())
 
+        # Shorten before splitting, not after: the 2000-char split is a
+        # transport limit and this is an editorial cut, and running them the
+        # other way round would footer a fragment.
+        # Skipped when files are attached — an artefact and its explanation
+        # arrive together or the attachment reads as unexplained.
+        rest = None
+        if not kwargs.get("no_shorten") and not discord_files:
+            shortened = self._shortener.shorten(content, agent_id=kwargs.get("agent_id"))
+            if shortened:
+                content, rest = shortened
+
         # Split long messages (Discord 2000 char limit)
         first_msg = None
         for i, chunk in enumerate(_split_message(content)):
@@ -197,6 +274,16 @@ class DiscordConnector(Connector):
                 sent = await channel.send(chunk, files=send_files)
             if first_msg is None:
                 first_msg = sent
+
+        if rest and first_msg is not None:
+            self._shortener.store.put(str(first_msg.id), rest, channel_id=str(channel_id))
+            try:
+                # Pre-added by the bot, so expanding is a tap on a control that
+                # is already there rather than something to remember.
+                await first_msg.add_reaction(self._shortener.emoji)
+            except discord.HTTPException as e:
+                logger.warning(f"reply-shorten: could not add {self._shortener.emoji}: {e} "
+                               f"(the footer still says 'more' works)")
 
         return first_msg
 
@@ -498,6 +585,10 @@ class DiscordBot:
         self.connector = connector
         self.admin_users = admin_users
 
+        # Set in on_ready: how a mention of THIS bot renders for its agent.
+        self._self_user_id: int | None = None
+        self._self_mention_name: str = ""
+
         # Bot-to-bot loop detection: bot_user_id -> [timestamps]
         self._bot_loop_hits: dict[int, list[float]] = {}
         # bot_user_id -> monotonic time until which the pair is hard-muted
@@ -527,7 +618,7 @@ class DiscordBot:
 
         # Build intents
         intents = discord.Intents.none()
-        for intent_name in (intents_list or ["guilds", "guild_messages", "dm_messages", "message_content"]):
+        for intent_name in (intents_list or DEFAULT_INTENTS):
             setattr(intents, intent_name, True)
 
         self.client = discord.Client(
@@ -542,9 +633,14 @@ class DiscordBot:
         self.client.event(self.on_resumed)
         self.client.event(self.on_message)
         self.client.event(self.on_raw_reaction_add)
+        self.client.event(self.on_guild_join)
+
+        # Kept for server provisioning, which needs REST calls of its own.
+        self._token = ""
 
     async def start(self, token: str) -> None:
         """Start the bot (non-blocking — runs in background task)."""
+        self._token = token
         self._register_commands()
 
         import asyncio
@@ -588,6 +684,174 @@ class DiscordBot:
                          f"on shutdown: {e}")
         await self.client.close()
 
+    async def _sync_nickname(self, guild) -> None:
+        """Set this bot's guild nickname to its configured agent name.
+
+        Mechanical, not taste: the configured name IS the answer, so no agent
+        turn is spent on it. The account username may differ (a reused bot
+        application) and renaming it is rate-limited to 2/hour — a per-guild
+        nickname is always available with the Change Nickname permission and
+        makes the bot show up under the right name the moment it joins.
+        Skipped when the account name or existing nick already matches.
+        """
+        name = getattr(self, "_self_mention_name", "")
+        me = getattr(guild, "me", None)
+        if not name or me is None:
+            return
+        if getattr(me, "nick", None) == name or getattr(me, "name", "") == name:
+            return
+        try:
+            await me.edit(nick=name)
+            logger.info(f"[{self.account_name}] set nickname '{name}' in "
+                        f"'{getattr(guild, 'name', guild.id)}'")
+        except Exception as e:
+            logger.info(f"[{self.account_name}] could not set nickname in "
+                        f"'{getattr(guild, 'name', guild.id)}': {e}")
+
+    async def on_guild_join(self, guild) -> None:
+        """A server invited this bot: provision the channels a fleet needs.
+
+        The whole point is that the owner does nothing. Four channel roles and a
+        category are wired by ID, and copying five IDs out of Discord into YAML
+        is most of what installing kbots costs. It is also entirely mechanical,
+        so it is code here and not a prompt: existing channels are adopted,
+        anything already configured is left alone, and re-running changes
+        nothing. Only the parts that need taste, the avatar and the
+        introduction, are handed to the agent afterwards — the nickname is
+        mechanical and set right here for EVERY bot, not just the setup one.
+
+        One bot does this. Eight bots racing to create the same five channels
+        would produce duplicates of each, and Discord would allow all of them.
+        """
+        from src.core import server_setup
+
+        guild_id, guild_name = str(guild.id), getattr(guild, "name", "")
+
+        # Before any provisioning gate: every bot aligns its own nickname and
+        # schedules its introduction — including the ones that never provision.
+        await self._sync_nickname(guild)
+        asyncio.create_task(self._join_intro(guild_id, guild_name),
+                            name=f"join-intro-{self.account_name}-{guild_id}")
+
+        full_config = getattr(self.connector, "_full_config", {}) or {}
+        if not (full_config.get("server_setup", {}) or {}).get("on_guild_join", True):
+            logger.info(f"[{self.account_name}] joined '{guild_name}' — auto-setup "
+                        f"is disabled (server_setup.on_guild_join)")
+            return
+
+        # A secondary instance (rescue profile) loads only its own agent list,
+        # in which its single agent elects itself setup account — that is how
+        # a dual-instance install got every channel created twice. Only the
+        # main instance provisions.
+        if getattr(self.connector, "_setup_profile", ""):
+            logger.info(f"[{self.account_name}] joined '{guild_name}' — secondary "
+                        f"instance (profile "
+                        f"'{self.connector._setup_profile}'), the main instance "
+                        f"owns server setup")
+            return
+
+        configs = getattr(self.connector, "_agent_configs", {}) or {}
+        if not server_setup.is_setup_account(configs, self.account_name):
+            logger.info(f"[{self.account_name}] joined '{guild_name}' — another "
+                        f"bot owns server setup, doing nothing")
+            return
+
+        data_dir = getattr(self.connector, "_data_dir", "") or "data"
+        if server_setup.guild_is_set_up(data_dir, guild_id):
+            logger.info(f"[{self.account_name}] re-joined '{guild_name}' "
+                        f"({guild_id}) — already provisioned, doing nothing")
+            return
+
+        # The done-marker lands only AFTER provisioning; the claim is what
+        # stops two near-simultaneous joins from racing to create duplicates.
+        if not server_setup.claim_guild_setup(data_dir, guild_id, self.account_name):
+            logger.info(f"[{self.account_name}] joined '{guild_name}' "
+                        f"({guild_id}) — provisioning already claimed, doing nothing")
+            return
+
+        logger.info(f"[{self.account_name}] joined '{guild_name}' ({guild_id}) "
+                    f"— provisioning kbots channels")
+        try:
+            outcomes = await server_setup.provision_guild(
+                guild_id, self._token, full_config)
+            server_setup.wire(outcomes)
+        except Exception as e:
+            logger.error(f"Server setup failed for guild {guild_id}: {e}", exc_info=True)
+            # Release so a re-invite (or the other instance) can retry —
+            # provisioning is adopt-before-create, so a retry is safe.
+            server_setup.release_guild_claim(data_dir, guild_id)
+            return
+
+        for out in outcomes:
+            logger.info(f"  setup {out.key}: {out.action} {out.channel_id or out.detail}")
+        server_setup.record_guild_setup(data_dir, guild_id, {
+            "name": guild_name,
+            "channels": {o.key: o.channel_id for o in outcomes if o.channel_id},
+            "failed": [o.key for o in outcomes if o.action == "failed"],
+        })
+
+        from src.core.identity_boot import agent_for_account
+        agent_id = agent_for_account(configs, "discord", self.account_name)
+        handler = getattr(self.connector, "_on_guild_setup", None)
+        if handler and agent_id:
+            # The setup turn already asks for an introduction — mark it so the
+            # join-intro task never posts a second one for this agent.
+            server_setup.record_intro(data_dir, guild_id, agent_id)
+            try:
+                await handler(agent_id, guild_id, guild_name, outcomes)
+            except Exception as e:
+                logger.error(f"Guild-setup turn for {agent_id} failed: {e}")
+
+    async def _join_intro(self, guild_id: str, guild_name: str) -> None:
+        """Introduce this bot's agent in the platform-updates channel, once.
+
+        The setup agent introduces itself as part of provisioning; every other
+        bot used to join silently and sit there until someone asked what it
+        was for. The channel may still be seconds away from existing when two
+        bots are invited back-to-back, so this waits for it briefly.
+        """
+        from src.core import server_setup
+        from src.core.identity_boot import agent_for_account
+
+        handler = getattr(self.connector, "_on_guild_intro", None)
+        configs = getattr(self.connector, "_agent_configs", {}) or {}
+        agent_id = agent_for_account(configs, "discord", self.account_name)
+        if handler is None or not agent_id:
+            return
+
+        data_dir = getattr(self.connector, "_data_dir", "") or "data"
+        full_config = getattr(self.connector, "_full_config", {}) or {}
+
+        # The setup bot's provisioning turn includes its introduction — when
+        # this join is about to provision, that path owns the intro.
+        if (not getattr(self.connector, "_setup_profile", "")
+                and (full_config.get("server_setup", {}) or {}).get("on_guild_join", True)
+                and server_setup.is_setup_account(configs, self.account_name)
+                and not server_setup.guild_is_set_up(data_dir, guild_id)):
+            return
+
+        if server_setup.intro_done(data_dir, guild_id, agent_id):
+            return
+
+        channel = ""
+        for _ in range(18):  # provisioning by the other bot: up to ~3 min
+            channel = server_setup.intro_channel(full_config)
+            if channel:
+                break
+            await asyncio.sleep(10)
+        if not channel:
+            logger.info(f"[{self.account_name}] no updates/alerts channel wired "
+                        f"in '{guild_name}' — skipping join introduction")
+            return
+
+        # Recorded BEFORE the turn: one introduction per (guild, agent), even
+        # if the model flubs it — a re-add must not become an intro loop.
+        server_setup.record_intro(data_dir, guild_id, agent_id)
+        try:
+            await handler(agent_id, guild_id, guild_name, channel)
+        except Exception as e:
+            logger.error(f"Join-intro turn for {agent_id} failed: {e}")
+
     async def on_ready(self) -> None:
         """Called when bot connects to Discord."""
         logger.info(
@@ -598,12 +862,35 @@ class DiscordBot:
         # Record this bot's Discord identity in the roster so other agents recognize
         # it as a teammate (resolve_discord_user / user-context) rather than an
         # unknown guest — the bots know their own id only once connected.
+        # The name recorded here must be the CONFIGURED one, not client.user.name.
+        # The live Discord name is set in the developer portal and nothing
+        # reconciles it with config, so an account named differently from its
+        # agent added a roster row under a name no config knows. That row is then
+        # the name the agent reads back as its own and hands to set_agent_avatar,
+        # which resolves it to a vault key that was never created and fails with
+        # "no bot token found" — the avatar unreachable for a reason that had
+        # nothing to do with avatars.
         try:
+            from src.core.identity_boot import agent_for_account, configured_name
             from src.tools.team import record_bot_identity
             if self.client.user:
-                record_bot_identity(self.client.user.name, str(self.client.user.id))
+                configs = getattr(self.connector, "_agent_configs", {}) or {}
+                agent_id = agent_for_account(configs, "discord", self.account_name)
+                name = (configured_name(configs, agent_id) if agent_id
+                        else self.client.user.name)  # an account no agent claims
+                # Cache for incoming self-mention rendering (before the roster
+                # write, which may fail): _render_mentions must use this name,
+                # not the Discord-side one — see the comment there.
+                self._self_user_id = self.client.user.id
+                self._self_mention_name = name
+                record_bot_identity(name, str(self.client.user.id))
         except Exception as e:
             logger.debug(f"roster identity sync failed: {e}")
+
+        # Guilds joined while this bot was offline never fire on_guild_join,
+        # so align the nickname here too (no-op when it already matches).
+        for guild in self.client.guilds:
+            await self._sync_nickname(guild)
 
         # Clear any stale guild-specific commands, then sync global only.
         # Global commands work everywhere (servers + DMs). Guild commands
@@ -815,8 +1102,19 @@ class DiscordBot:
         Mentions of users outside the resolved lists stay as raw markup.
         """
         content = message.content
+        self_id = getattr(self, "_self_user_id", None)
+        self_name = getattr(self, "_self_mention_name", "")
         for user in message.mentions:
-            name = getattr(user, "display_name", None) or user.name
+            # The bot's OWN mention renders as the agent's configured name,
+            # not the Discord-side one. The account's username can differ from
+            # the agent's name (a fresh install reusing an existing bot app),
+            # and an agent whose AGENTS.md calls it one thing, reading mail
+            # addressed to another, concludes the message is for someone else
+            # and stays silent — with no error anywhere.
+            if self_id is not None and user.id == self_id and self_name:
+                name = self_name
+            else:
+                name = getattr(user, "display_name", None) or user.name
             for pattern in (f"<@{user.id}>", f"<@!{user.id}>"):
                 content = content.replace(pattern, f"@{name}")
         for role in message.role_mentions:
@@ -847,6 +1145,19 @@ class DiscordBot:
         now = time.monotonic()
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_mentioned = self.client.user in message.mentions if self.client.user else False
+
+        # "more" on a shortened reply is answered from the file, not by a turn.
+        # Spending an LLM call to re-emit text already written would be slower
+        # than the message it shortened, and could come back different.
+        shortener = getattr(self.connector, "_shortener", None)
+        if (shortener and shortener.enabled and not message.author.bot
+                and wants_more(message.content)):
+            rest = shortener.store.take_latest_for_channel(str(message.channel.id))
+            if rest:
+                await self.connector.send(str(message.channel.id), rest,
+                                          bot_account=self.account_name,
+                                          no_shorten=True)
+                return
         if not is_mentioned and self.client.user:
             # Check role mentions — Discord auto-creates a managed role for
             # bots, and its tags carry the owning bot's id. This works without
@@ -968,6 +1279,17 @@ class DiscordBot:
             return
 
         emoji = str(payload.emoji)
+
+        # Expand a shortened reply. Checked first and cheap: it is a read of
+        # one file and it must never be shadowed by another handler.
+        shortener = getattr(self.connector, "_shortener", None)
+        if shortener and emoji == shortener.emoji:
+            rest = shortener.store.take(str(payload.message_id))
+            if rest:
+                await self.connector.send(str(payload.channel_id), rest,
+                                          bot_account=self.account_name,
+                                          no_shorten=True)
+            return
 
         # Lesson feedback: 👍/👎 on a reply nudges the lessons it used.
         if emoji in ("👍", "👎"):

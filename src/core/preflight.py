@@ -159,15 +159,36 @@ def _check_permissions(config: dict) -> list[str]:
     cfg_env = os.environ.get("CLAUDE_CONFIG_DIR")
     claude_json = (Path(cfg_env) / ".claude.json") if cfg_env else Path.home() / ".claude.json"
     claude_dir = Path(cfg_env) if cfg_env else Path.home() / ".claude"
+    consequence = ("the service can't manage its Claude Code config, which breaks "
+                   "headless workspace-trust and can leave agents unable to use ANY tools")
     for p in (claude_json, claude_dir, claude_dir / "settings.json"):
         try:
-            if p.exists() and (p.stat().st_uid != uid or not os.access(p, os.W_OK)):
+            if not p.exists():
+                continue
+            wrong_owner = p.stat().st_uid != uid
+            unwritable = not os.access(p, os.W_OK)
+            if not (wrong_owner or unwritable):
+                continue
+            if wrong_owner:
+                warns.append(f"{p} is not owned by '{user}' — {consequence}. "
+                             f"Fix: sudo chown -R {user} {claude_json} {claude_dir}")
+            else:
+                # Owned correctly and still unwritable: on Linux this is almost
+                # always the systemd sandbox, not the filesystem. Saying "run
+                # chown" here sends the reader to a fix that cannot work and
+                # that they have usually already tried, which is exactly what
+                # happened on a fresh VPS install: ProtectHome=read-only with
+                # ReadWritePaths naming only directories leaves a file at the
+                # root of $HOME unwritable while `ls -l` shows the right owner.
                 warns.append(
-                    f"{p} is not owned/writable by '{user}' — the service can't manage its "
-                    f"Claude Code config, which breaks headless workspace-trust and can leave "
-                    f"agents unable to use ANY tools. "
-                    f"Fix: sudo chown -R {user} {claude_json} {claude_dir}")
-                break  # one message covers the pair
+                    f"{p} is owned by '{user}' but is NOT writable — {consequence}. "
+                    f"The owner is right, so this is not a chown problem: if this "
+                    f"host runs the systemd unit, the path is read-only inside the "
+                    f"service's mount namespace. Grant the service HOME directory "
+                    f"itself in ReadWritePaths in kbots.service — Claude Code "
+                    f"rewrites ~/.claude.json atomically via a temp file beside "
+                    f"it, so listing the file by name is not enough).")
+            break  # one message covers the pair
         except OSError:
             pass
 
@@ -259,6 +280,18 @@ async def run_preflight(config: dict, vault, storage_path: str) -> bool:
     passed = 0
     failed = 0
     warnings = 0
+
+    # --- No config at all: name the fix, not just the symptoms ---
+    # Without this, a fresh clone died on "kbots: missing required key" and
+    # "Data directory missing" — both true, neither telling the user that the
+    # actual next step is the setup wizard.
+    if not any(config.values()):
+        logger.error(
+            "  ✗ config: no configuration found. If this is a fresh install, "
+            "run `uv run python setup.py` — or copy config/config.yaml.example "
+            "to config/config.yaml and edit it."
+        )
+        failed += 1
 
     # --- Config schema validation (missing required keys + wrong types) ---
     # Unknown-key warnings are emitted at DEBUG only — deployments legitimately

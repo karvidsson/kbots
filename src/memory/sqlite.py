@@ -13,6 +13,8 @@ from pathlib import Path
 
 from src.core.base import PROJECT_ROOT, MemoryBackend
 from src.core.embedding import EmbeddingEngine
+from src.lib.canonical import entity_key
+from src.memory.query import fts_query
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +47,37 @@ class SQLiteMemory(MemoryBackend):
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute("PRAGMA synchronous=NORMAL")
+        # Deleting a row normally only unlinks it: the text stays readable in
+        # the freed page until something happens to overwrite it. For a store
+        # whose delete is called to honour an erasure request, that is the
+        # whole point, so pay the small write cost and zero the bytes.
+        self.db.execute("PRAGMA secure_delete=ON")
 
         self.embedding = EmbeddingEngine(model_dir=model_dir)
+        self._embed_failures = 0
+        # Whether one agent's memories are readable by the rest of the fleet.
+        # On by default: these are one owner's agents working on one owner's
+        # business, and knowledge that cannot leave the agent that learned it
+        # is relearned by seven others. `private:<id>` opts a memory out.
+        self.fleet_read = bool(config.get("fleet_read", True))
         self._ensure_schema()
 
         count = self.db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
         db_size = Path(db_path).stat().st_size / (1024 * 1024)
         logger.info(f"SQLite memory: {count} memories, {db_size:.1f}MB ({db_path})")
+        # Said at boot, where it is read, rather than only at the moment of
+        # failure. A store whose vectors are missing looks healthy from every
+        # angle except the one query that needs them.
+        missing = self.missing_embeddings()
+        if missing:
+            logger.warning(
+                f"{missing} of {count} memories have no embedding and are invisible to "
+                f"semantic search. Backfill: scripts/memory-backfill.py --only embeddings")
+
+    def missing_embeddings(self) -> int:
+        """How many stored memories have no vector."""
+        return self.db.execute(
+            "SELECT COUNT(*) FROM memories WHERE embedding IS NULL").fetchone()[0]
 
     def _ensure_schema(self) -> None:
         """Create tables if they don't exist. Matches legacy memory-api schema exactly."""
@@ -95,6 +121,24 @@ class SQLiteMemory(MemoryBackend):
                 new_value TEXT,
                 reason TEXT
             );
+
+            -- Entity anchors: which graph entities a memory mentions.
+            -- Without these the two stores can only be joined by matching
+            -- names in prose, so a memory found by search offers no way into
+            -- the graph and an entity found by traversal offers no way back
+            -- to the facts that mention it. The reflector already resolves
+            -- each extracted edge to its source memory id and used to throw
+            -- that link away; this is where it lands now.
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                memory_id TEXT NOT NULL,
+                entity TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (memory_id, entity_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_entities_key
+                ON memory_entities(entity_key);
 
             CREATE TABLE IF NOT EXISTS tracking (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,14 +205,29 @@ class SQLiteMemory(MemoryBackend):
         # Match legacy scope format: 'agent:main' instead of just 'agent'
         if scope == "agent" and agent_id:
             scope = f"agent:{agent_id}"
+        elif scope == "private" and agent_id:
+            scope = f"private:{agent_id}"
 
-        # Generate embedding
+        # Generate embedding. A failure here is survivable — the memory is
+        # still stored and still findable by keyword — but it silently removes
+        # that memory from semantic search forever, because semantic_search
+        # filters on `embedding IS NOT NULL`. It was survivable 237 times in a
+        # row on the live fleet without anyone noticing, so it is counted and
+        # reported rather than logged once per memory at warning level.
         try:
             vec = self.embedding.embed_one(content)
             blob = EmbeddingEngine.to_blob(vec)
         except Exception as e:
-            logger.warning(f"Embedding generation failed: {e}")
             blob = None
+            self._embed_failures += 1
+            if self._embed_failures == 1:
+                logger.error(f"Embedding generation failed, memories are being stored "
+                             f"WITHOUT vectors and will not be reachable by semantic "
+                             f"search: {e}")
+            elif self._embed_failures % 25 == 0:
+                logger.error(f"{self._embed_failures} memories stored without vectors "
+                             f"so far. Run scripts/memory-backfill.py --only embeddings "
+                             f"once the model is available.")
 
         memory_id = str(uuid.uuid4())
         tags_json = json.dumps(tags) if tags else None
@@ -187,25 +246,76 @@ class SQLiteMemory(MemoryBackend):
         return memory_id
 
     def _scope_filter(self, agent_id: str | None, prefix: str = "") -> tuple[str, list]:
-        """Build parameterised scope filter. Returns (sql_fragment, params)."""
+        """Build parameterised scope filter. Returns (sql_fragment, params).
+
+        Four scopes, and two of them are new because the old two did not work:
+
+        `global`      everyone.
+        `agent:<id>`  authored by <id>. Readable by the whole fleet when
+                      `fleet_read` is on, which is the default. Measured on the
+                      live store: 235 of 237 memories were agent-scoped and 0
+                      were global, so every agent was searching a corpus of its
+                      own handful of notes while six weeks of the fleet's
+                      lessons sat one row away and unreadable. Nothing chose
+                      that: it is the default of memory_store, which no caller
+                      ever overrode.
+        `private:<id>`only <id>, always, regardless of `fleet_read`. Sharing by
+                      default is only defensible if there is somewhere to put
+                      the things that should not be shared.
+        `group:<name>`members only, from `defaults.memory.groups`. This used to
+                      match `group:%` for everyone, so a group scope was a
+                      global scope with a misleading name.
+        """
         col = f"{prefix}scope" if prefix else "scope"
         target_col = f"{prefix}scope_target" if prefix else "scope_target"
-        clauses = [f"{col} LIKE ?", f"{col} LIKE ?"]
-        params: list = ["global%", "group:%"]
+        clauses = [f"{col} LIKE ?"]
+        params: list = ["global%"]
+
+        if self.fleet_read:
+            clauses.append(f"{col} LIKE ?")
+            params.append("agent:%")
+
         if agent_id:
             clauses.append(f"{col} LIKE ?")
             params.append(f"agent:{agent_id}%")
-            clauses.append(f"{target_col} = ?")
+            clauses.append(f"{col} = ?")
+            params.append(f"private:{agent_id}")
+            clauses.append(f"({target_col} = ? AND {col} NOT LIKE 'private:%')")
             params.append(agent_id)
+            for group in self.groups_for(agent_id):
+                clauses.append(f"{col} = ?")
+                params.append(f"group:{group}")
+
         return " OR ".join(clauses), params
+
+    def groups_for(self, agent_id: str) -> list[str]:
+        """Groups this agent belongs to, from `defaults.memory.groups`."""
+        out = []
+        for name, members in (self.config.get("groups") or {}).items():
+            if agent_id in (members or []):
+                out.append(str(name))
+        return out
 
     async def search(self, query: str, agent_id: str | None = None,
                      limit: int = 10, **kwargs) -> list[dict]:
-        """FTS5 keyword search with scope filtering."""
+        """FTS5 keyword search with scope filtering.
+
+        The query is rewritten into a safe FTS5 expression before it reaches
+        MATCH. Callers pass raw user text here (auto-recall passes the whole
+        message), and a sentence is not an FTS5 query: on the live store, 71%
+        of real user messages raised a syntax error and fell through to a
+        `LIKE '%whole message%'` that matched nothing. See memory/query.py.
+        """
         type_filter = kwargs.get("type")
         category_filter = kwargs.get("category")
 
         scope_sql, scope_params = self._scope_filter(agent_id, prefix="m.")
+
+        match_expr = fts_query(query)
+        if match_expr is None:
+            # Nothing searchable in the input. Returning everything would be
+            # worse than returning nothing, so return nothing.
+            return []
 
         sql = f"""
             SELECT m.*, rank
@@ -215,7 +325,7 @@ class SQLiteMemory(MemoryBackend):
               AND ({scope_sql})
               AND m.scope NOT LIKE 'archived%'
         """
-        params: list = [query] + scope_params
+        params: list = [match_expr] + scope_params
 
         if type_filter:
             sql += " AND m.type = ?"
@@ -230,15 +340,20 @@ class SQLiteMemory(MemoryBackend):
         try:
             rows = self.db.execute(sql, params).fetchall()
         except sqlite3.OperationalError:
-            # FTS query syntax error — fall back to LIKE
-            fallback_sql = f"""SELECT m.*, 0 as rank FROM memories m
+            # Should be unreachable now that the expression is built rather
+            # than passed through, but a corrupt FTS index lands here too.
+            # Fall back on the longest single term, NOT the whole input: the
+            # old `LIKE '%<entire user message>%'` could only match a memory
+            # that contained the message verbatim, so it always returned zero.
+            longest = max(match_expr.replace('"', "").split(" OR "),
+                          key=len, default="")
+            rows = self.db.execute(
+                f"""SELECT m.*, 0 as rank FROM memories m
                     WHERE m.content LIKE ?
                       AND ({scope_sql})
                       AND m.scope NOT LIKE 'archived%'
-                    ORDER BY m.updated_at DESC LIMIT ?"""
-            rows = self.db.execute(
-                fallback_sql,
-                [f"%{query}%"] + scope_params + [limit],
+                    ORDER BY m.updated_at DESC LIMIT ?""",
+                [f"%{longest}%"] + scope_params + [limit],
             ).fetchall()
 
         results = [self._row_to_dict(r) for r in rows]
@@ -268,7 +383,7 @@ class SQLiteMemory(MemoryBackend):
 
         rows = self.db.execute(
             f"""SELECT id, content, type, category, confidence, tags, pinned,
-                       created_at, embedding
+                       created_at, created_by, embedding
                 FROM memories
                 WHERE embedding IS NOT NULL
                   AND ({scope_sql})
@@ -300,18 +415,115 @@ class SQLiteMemory(MemoryBackend):
 
         return scored[:limit]
 
+    # === Entity anchors (the join between this store and the graph) ===
+
+    async def anchor_entities(self, memory_id: str, entities) -> int:
+        """Record that `memory_id` mentions these graph entities.
+
+        Idempotent: re-extracting the same memory re-asserts the same anchors
+        rather than duplicating them. Keyed on the canonical entity key, so
+        "Dr. Sable" and "Dr.Sable" anchor the same memory once.
+        """
+        n = 0
+        for name in entities or []:
+            key = entity_key(str(name))
+            if not key:
+                continue
+            self.db.execute(
+                "INSERT OR IGNORE INTO memory_entities (memory_id, entity, entity_key) "
+                "VALUES (?, ?, ?)", (str(memory_id), str(name), key))
+            n += 1
+        if n:
+            self.db.commit()
+        return n
+
+    async def entities_for_memories(self, memory_ids) -> list[str]:
+        """Entities anchored to any of these memories, most-mentioned first.
+
+        Ordered rather than DISTINCT-in-scan-order because the caller takes
+        only the top few as traversal anchors. An entity mentioned by several
+        of the hits is what the results are collectively about; one mentioned
+        by a single hit is a detail of that one memory. Unordered, which anchor
+        got the budget depended on SQLite's scan order.
+        """
+        ids = [str(m) for m in memory_ids or []]
+        if not ids:
+            return []
+        rows = self.db.execute(
+            f"""SELECT entity, COUNT(*) AS n FROM memory_entities
+                WHERE memory_id IN ({','.join('?' * len(ids))})
+                GROUP BY entity_key
+                ORDER BY n DESC, entity""", ids).fetchall()
+        return [r["entity"] for r in rows]
+
+    async def memories_for_entities(self, entities, agent_id: str | None = None,
+                                    limit: int = 10) -> list[dict]:
+        """Memories anchored to any of these entities, scope-filtered.
+
+        This is the step that makes a graph hop worth taking: traversal yields
+        entity names, and what the agent needs is the facts about them.
+        """
+        keys = [k for k in (entity_key(str(e)) for e in entities or []) if k]
+        if not keys:
+            return []
+        scope_sql, scope_params = self._scope_filter(agent_id, prefix="m.")
+        rows = self.db.execute(
+            f"""SELECT DISTINCT m.* FROM memories m
+                JOIN memory_entities me ON me.memory_id = m.id
+                WHERE me.entity_key IN ({','.join('?' * len(keys))})
+                  AND ({scope_sql})
+                  AND m.scope NOT LIKE 'archived%'
+                ORDER BY m.pinned DESC, m.confidence DESC, m.updated_at DESC
+                LIMIT ?""",
+            keys + scope_params + [limit],
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
     async def forget(self, memory_id: int | str) -> None:
-        """Delete a memory by ID (string UUID or int rowid)."""
-        old = self.db.execute("SELECT content FROM memories WHERE id = ?", (str(memory_id),)).fetchone()
-        if not old:
-            # Try by rowid for backwards compat
-            old = self.db.execute("SELECT content FROM memories WHERE rowid = ?", (memory_id,)).fetchone()
-            self.db.execute("DELETE FROM memories WHERE rowid = ?", (memory_id,))
+        """Delete a memory by ID (string UUID or int rowid). Content does not survive.
+
+        Forgetting used to leave the text in the database twice over. `store`
+        writes the full content into changelog.new_value, and `forget` wrote it
+        again into changelog.old_value, so a memory deleted on request read
+        clean by SELECT and was still there in full. Both records are purged
+        here, along with the row and its FTS entry.
+
+        What remains is a content-free tombstone: which id was deleted, when,
+        and by whom. That keeps the audit trail answering "was this removed?"
+        without being a copy of the thing removed.
+        """
+        row = self.db.execute("SELECT id FROM memories WHERE id = ?",
+                              (str(memory_id),)).fetchone()
+        if row:
+            record_id = str(memory_id)
+            self.db.execute("DELETE FROM memories WHERE id = ?", (record_id,))
         else:
-            self.db.execute("DELETE FROM memories WHERE id = ?", (str(memory_id),))
-        self._log_change(None, "memories", "delete", str(memory_id),
-                         old["content"] if old else None, None)
+            # Legacy callers may pass a rowid; resolve it to the real id so the
+            # changelog purge below targets the right records.
+            row = self.db.execute("SELECT id FROM memories WHERE rowid = ?",
+                                  (memory_id,)).fetchone()
+            record_id = str(row["id"]) if row else str(memory_id)
+            self.db.execute("DELETE FROM memories WHERE rowid = ?", (memory_id,))
+
+        # Every prior trace of this record, including the insert that carried
+        # the content and any update diffs.
+        self.db.execute("DELETE FROM changelog WHERE table_name = 'memories' AND record_id = ?",
+                        (record_id,))
+        # Anchors name entities the deleted memory mentioned. Leaving them
+        # behind would keep a forgotten memory reachable by entity and leak
+        # which entities it was about.
+        self.db.execute("DELETE FROM memory_entities WHERE memory_id = ?", (record_id,))
+        self._log_change(None, "memories", "delete", record_id, None, None)
         self.db.commit()
+
+        # secure_delete zeroes the page as written, but the pre-delete image is
+        # still sitting in the write-ahead log until it is folded back in. A
+        # checkpoint is what actually removes it from disk.
+        try:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error as e:
+            logger.warning(f"forget({record_id}): WAL checkpoint failed, deleted content "
+                           f"may persist in the -wal file until the next one: {e}")
 
     # === Extended operations (used by tools and agent_manager) ===
 
@@ -501,44 +713,63 @@ class SQLiteMemory(MemoryBackend):
         self.db.commit()
         return {"duplicates_found": len(duplicates), "removed": removed, "details": duplicates[:20]}
 
-    async def decay(self, decay_rate: float = 0.0108, archive_threshold: float = 0.05) -> dict:
-        """Decay confidence of unaccessed memories. Pinned memories are exempt.
+    # Categories decay never touches. A lesson is the most expensive kind of
+    # memory the fleet holds: it exists because something went wrong once and
+    # somebody paid for finding out. Forgetting it means paying again, and a
+    # lesson that has not been recalled for sixty days is not stale, it is a
+    # mistake that has not recurred yet.
+    IMMUNE_CATEGORIES = ("lesson",)
 
-        Called daily. Memories not accessed in 24h lose confidence at a flat rate.
-        At 0.0108/day from default 0.7: ~60 days to archive, ~90 days archived to purge.
+    async def decay(self, decay_rate: float = 0.0108, archive_threshold: float = 0.05,
+                    purge: bool = False, purge_after_days: int = 90) -> dict:
+        """Decay confidence of unaccessed memories, and archive the faded ones.
 
-        Lifecycle:
+        Memories not accessed in 24h lose confidence at a flat rate. From the
+        default 0.7 at 0.0108/day that is roughly 60 days to the archive
+        threshold. Recall resets last_accessed, so anything the fleet actually
+        uses never decays.
+
             Day 0:  0.70 (new memory)
-            Day 10: 0.59
             Day 30: 0.38
-            Day 60: 0.05 → archived
-            +90 days archived → permanently deleted
-            Accessed → last_accessed resets, decay pauses
-            Pinned → immune forever
+            Day 60: 0.05 -> archived (hidden from every read, still on disk)
+            Accessed -> decay pauses
+            Pinned, or category in IMMUNE_CATEGORIES -> never decays
+
+        `purge` deletes archived memories older than `purge_after_days`. It is
+        OFF by default and the caller has to ask for it: archiving is
+        reversible by editing one column and deleting is not, so the two do not
+        belong behind the same switch. This was previously unconditional, which
+        made "decay" a synonym for "delete in 150 days" on a store where
+        nothing had ever been recalled.
         """
         yesterday = (datetime.utcnow() - timedelta(days=1)).isoformat()
+        immune = ",".join("?" * len(self.IMMUNE_CATEGORIES))
 
         # Decay: reduce confidence for non-pinned memories not accessed in 24h
         cursor = self.db.execute(
-            """UPDATE memories
+            f"""UPDATE memories
                SET confidence = MAX(confidence - ?, 0.0),
                    updated_at = CURRENT_TIMESTAMP
                WHERE pinned = 0
                  AND scope NOT LIKE 'archived%'
+                 AND (category IS NULL OR category NOT IN ({immune}))
                  AND (last_accessed IS NULL OR last_accessed < ?)""",
-            (decay_rate, yesterday),
+            (decay_rate, *self.IMMUNE_CATEGORIES, yesterday),
         )
         decayed = cursor.rowcount
 
-        # Archive: memories below threshold
+        # Archive: memories below threshold. Not a delete — the row keeps its
+        # original scope behind an `archived:` prefix, so restoring one is a
+        # string edit rather than a restore from backup.
         cursor = self.db.execute(
-            """UPDATE memories
+            f"""UPDATE memories
                SET scope = 'archived:' || scope,
                    updated_at = CURRENT_TIMESTAMP
                WHERE pinned = 0
                  AND scope NOT LIKE 'archived%'
+                 AND (category IS NULL OR category NOT IN ({immune}))
                  AND confidence < ?""",
-            (archive_threshold,),
+            (*self.IMMUNE_CATEGORIES, archive_threshold),
         )
         archived = cursor.rowcount
 
@@ -548,24 +779,26 @@ class SQLiteMemory(MemoryBackend):
                              json.dumps({"decayed": decayed, "archived": archived}))
             self.db.commit()
 
-        # Purge: hard-delete archived memories older than 90 days
-        purge_cutoff = (datetime.utcnow() - timedelta(days=90)).isoformat()
-        cursor = self.db.execute(
-            """DELETE FROM memories
-               WHERE scope LIKE 'archived%'
-                 AND updated_at < ?""",
-            (purge_cutoff,),
-        )
-        purged = cursor.rowcount
-
-        if purged:
-            self._log_change("system", "memories", "purge",
-                             "batch", None,
-                             json.dumps({"purged": purged}))
-            self.db.commit()
+        purged = 0
+        if purge:
+            purge_cutoff = (datetime.utcnow()
+                            - timedelta(days=purge_after_days)).isoformat()
+            cursor = self.db.execute(
+                """DELETE FROM memories
+                   WHERE scope LIKE 'archived%'
+                     AND updated_at < ?""",
+                (purge_cutoff,),
+            )
+            purged = cursor.rowcount
+            if purged:
+                self._log_change("system", "memories", "purge",
+                                 "batch", None,
+                                 json.dumps({"purged": purged}))
+                self.db.commit()
 
         return {"decayed": decayed, "archived": archived, "purged": purged,
-                "decay_rate": decay_rate, "archive_threshold": archive_threshold}
+                "decay_rate": decay_rate, "archive_threshold": archive_threshold,
+                "purge_enabled": purge}
 
     async def backfill_embeddings(self, batch_size: int = 50) -> dict:
         """Generate embeddings for memories that don't have them yet."""

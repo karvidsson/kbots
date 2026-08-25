@@ -11,6 +11,7 @@ import getpass
 import json
 import os
 import re
+import secrets as py_secrets
 import shutil
 import stat
 import subprocess
@@ -33,8 +34,13 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from src.core.agent_scaffold import scaffold_agent
-    from src.core.base import resolve_vault_key_file
+    from src.core.agent_scaffold import (
+        AGENT_NAME_RULE,
+        agent_name_error,
+        scaffold_agent,
+        suggest_agent_name,
+    )
+    from src.core.base import resolve_vault_key_file, write_private_file
     from src.vault.fernet import FernetVault
 except ImportError:
     print("kbots modules not found. Run: uv sync")
@@ -52,16 +58,38 @@ CYAN = "\033[36m"
 RESET = "\033[0m"
 
 
-def banner():
-    print(f"""
-{BOLD}{CYAN}╔══════════════════════════════════════╗
-║           kbots Setup Wizard         ║
-║    The Agent Routing System          ║
-╚══════════════════════════════════════╝{RESET}
-""")
+TAGLINE = "one process · LLM-agnostic · trains itself"
+
+# Vault passphrases gate every stored credential; with the KDF alone a short
+# one is trivially brute-forceable if secrets.enc + .salt ever leak.
+MIN_PASSPHRASE_LEN = 12
+
+
+def banner(title: str = "kbots Setup Wizard"):
+    """Boxed banner, built rather than hand-drawn.
+
+    The two hand-drawn boxes had drifted: settings.py rendered 38 characters
+    inside a 40-character border, so it printed crooked. Centring in code means
+    a retitle cannot misalign it again.
+    """
+    lines = [title, TAGLINE]
+    inner = max(len(line) for line in lines) + 8
+    top = "╔" + "═" * inner + "╗"
+    bottom = "╚" + "═" * inner + "╝"
+    body = "\n".join(f"║{line.center(inner)}║" for line in lines)
+    print(f"\n{BOLD}{CYAN}{top}\n{body}\n{bottom}{RESET}\n")
+
+
+_PROGRESS = {"current": 0, "total": 0}
 
 
 def header(text: str):
+    # While main() drives the step list, replace each step's hardcoded
+    # "Step N:" prefix with a live "Step k/total:" — the user sees how far
+    # along they are, and the numbering can't drift from the list again.
+    m = re.match(r"Step \d+[a-z]?: (.*)", text)
+    if m and _PROGRESS["total"]:
+        text = f"Step {_PROGRESS['current']}/{_PROGRESS['total']}: {m.group(1)}"
     print(f"\n{BOLD}{CYAN}── {text} ──{RESET}\n")
 
 
@@ -199,8 +227,14 @@ def _looks_like_discord_token(s: str) -> bool:
     )
 
 
-def validate_discord_token(token: str) -> dict | None:
-    """Validate a Discord bot token by calling the API. Returns bot info or None.
+def validate_discord_token(token: str) -> tuple[dict | None, str]:
+    """Validate a Discord bot token by calling the API.
+
+    Returns (bot_info, "") on success, (None, reason) on failure — where
+    reason is "invalid" for a rejected token and "network" when Discord could
+    not be reached. The two must stay distinguishable: an invalid token should
+    be re-entered, while a network failure is a legitimate reason to store the
+    token unverified (air-gapped installs).
 
     A User-Agent is required — Discord's API is fronted by Cloudflare, which
     blocks header-less requests with a 403 (error 1010) before the token is
@@ -215,9 +249,87 @@ def validate_discord_token(token: str) -> dict | None:
             },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
+            return json.loads(resp.read().decode()), ""
+    except urllib.error.HTTPError:
+        return None, "invalid"
+    except urllib.error.URLError:
+        return None, "network"
+
+
+def ask_discord_token(prompt: str) -> str:
+    """Collect a bot token without echoing it.
+
+    Tokens grant full control of the bot account, and a bare input() leaves
+    them in terminal scrollback and session recordings — so entry is hidden,
+    always, rather than behind an opt-in.
+    """
+    return ask_secret(f"{prompt} (input hidden, Enter to skip)")
+
+
+# Discord permission bits for the invite URL — the minimal set kbots needs
+# (README → Quickstart Step 1). Administrator is deliberately absent: it
+# would hand any leaked token or prompt-injected agent action full control
+# of the server. Manage Channels goes to the setup account alone, so server
+# auto-setup can create the fleet channels.
+_INVITE_PERMS = (
+    (1 << 6)     # Add Reactions — HITL approval cards, reply "show more"
+    | (1 << 10)  # View Channels
+    | (1 << 11)  # Send Messages
+    | (1 << 14)  # Embed Links
+    | (1 << 15)  # Attach Files
+    | (1 << 16)  # Read Message History
+    | (1 << 26)  # Change Nickname — identity boot sets the agent's own nick
+)
+_PERM_MANAGE_CHANNELS = 1 << 4
+
+
+def invite_url(app_id: str, manage_channels: bool = False) -> str:
+    """The OAuth2 install link for a bot application."""
+    perms = _INVITE_PERMS | (_PERM_MANAGE_CHANNELS if manage_channels else 0)
+    return ("https://discord.com/oauth2/authorize"
+            f"?client_id={app_id}&scope=bot%20applications.commands"
+            f"&permissions={perms}")
+
+
+def _application_id(token: str, bot_info: dict | None) -> str:
+    """The application (client) id an invite URL needs.
+
+    /oauth2/applications/@me is authoritative; the bot USER id from /users/@me
+    equals it for modern applications and covers the offline-validated case.
+    """
+    try:
+        req = urllib.request.Request(
+            "https://discord.com/api/v10/oauth2/applications/@me",
+            headers={
+                "Authorization": f"Bot {token.strip()}",
+                "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            app_id = json.loads(resp.read().decode()).get("id", "")
+            if app_id:
+                return str(app_id)
     except (urllib.error.URLError, urllib.error.HTTPError):
-        return None
+        pass
+    return str((bot_info or {}).get("id", "") or "")
+
+
+def show_invite_link(state: dict, bot_name: str, token: str,
+                     bot_info: dict | None, manage_channels: bool = False) -> None:
+    """Print a bot's server-install link and remember it for the summary.
+
+    Silent when Discord is unreachable and the token was never validated —
+    there is nothing to build the link from, and the air-gapped install that
+    hits this path has no use for an OAuth URL anyway.
+    """
+    app_id = _application_id(token, bot_info)
+    if not app_id:
+        return
+    url = invite_url(app_id, manage_channels)
+    info("Install link — open it to add this bot to a server (grants the "
+         "minimal permission set kbots needs; no Administrator):")
+    print(f"    {CYAN}{url}{RESET}")
+    state.setdefault("invite_urls", {})[bot_name] = url
 
 
 # ==========================================================================
@@ -239,7 +351,14 @@ def step_dependencies(state: dict):
     if shutil.which("uv"):
         ok("uv")
     else:
-        info("uv not found — installing...")
+        # Ask first, like every other curl|sh in this step (pkgx, Claude CLI) —
+        # piping a remote script to a shell is a trust decision, not a detail.
+        info("uv not found. It will be installed by piping "
+             "https://astral.sh/uv/install.sh to sh.")
+        if not ask_yn("Install uv now?", default=True):
+            err("uv is required. Install it manually (https://docs.astral.sh/uv/) "
+                "and re-run setup.")
+            sys.exit(1)
         try:
             subprocess.run(
                 ["bash", "-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
@@ -432,9 +551,23 @@ def step_overlay(state: dict):
 
     # Create directory structure. tools/ and skills/ exist upfront so the
     # hot-reload watcher registers them at boot (create_tool/create_skill).
-    for d in ["config", "agents", "systemd", "tools", "skills",
+    # codex/ must exist BEFORE any agent is scaffolded: agent_session_dirs
+    # grants only directories that exist, so a missing codex meant every
+    # agent's generated settings silently omitted the shared-documents dir
+    # ("Agent workspace directory does not exist, not granting it").
+    for d in ["config", "agents", "systemd", "tools", "skills", "codex",
               "tmp/media", "tmp/docs", "tmp/scratch"]:
         (overlay / d).mkdir(parents=True, exist_ok=True)
+
+    # config/ holds the vault; tmp/ holds agent scratch, fetched media and
+    # docs. Owner-only, so other local users can't list key names or read
+    # whatever agents drop there. chmod rather than mkdir(mode=...) so a
+    # pre-existing overlay gets tightened too.
+    for private in ("config", "tmp"):
+        try:
+            (overlay / private).chmod(0o700)
+        except OSError as e:
+            warn(f"Could not tighten permissions on {overlay / private}: {e}")
 
     # .gitignore
     gitignore = overlay / ".gitignore"
@@ -457,6 +590,7 @@ def step_overlay(state: dict):
             "# Secrets\n"
             "config/secrets.enc\n"
             "config/secrets.salt\n"
+            "config/secrets.kdf\n"
         )
 
     # Add kbots env vars to the shell profile so interactive tools
@@ -472,16 +606,25 @@ def step_overlay(state: dict):
         env_block = f"\n# kbots environment\nexport KBOTS_OVERLAY={overlay}\n"
         if state.get("kbots_modules"):
             env_block += f"export KBOTS_MODULES={state['kbots_modules']}\n"
-        with open(profile, "a") as f:
-            f.write(env_block)
+        _write_profile_block(profile, env_block)
         _track_undo(state, f"~/{profile.name} env exports",
                     lambda p=profile, b=env_block: _strip_profile_block(p, b))
         ok(f"Added kbots env vars to ~/{profile.name}")
+    elif _relocate_profile_block(profile):
+        ok(f"Moved kbots env vars above the interactive guard in ~/{profile.name} "
+           f"(they were invisible to cron and non-interactive ssh)")
     else:
         info(f"KBOTS_OVERLAY already in ~/{profile.name}")
 
     ok(f"Overlay: {overlay}")
     state["overlay"] = overlay
+    # Export into the wizard's own process too, not just the shell profile:
+    # later steps (scaffold_agent → agent_session_dirs) read KBOTS_OVERLAY at
+    # call time, and the profile export only reaches new shells. Without this,
+    # a first run generated agent sandbox rules pointing at /tmp instead of
+    # <overlay>/tmp — an install that only healed when setup was re-run from
+    # a fresh shell.
+    os.environ["KBOTS_OVERLAY"] = str(overlay)
 
 
 def step_hooks(state: dict):
@@ -642,6 +785,9 @@ def step_modules(state: dict):
         state["kbots_modules"] = ":".join(modules_paths)
         state["kbots_modules_root"] = str(modules_root)
         state["selected_modules"] = selected
+        # Same reasoning as KBOTS_OVERLAY in step_overlay: later steps in this
+        # process must see it, not just future shells.
+        os.environ["KBOTS_MODULES"] = state["kbots_modules"]
         print()
         for mod in selected:
             ok(f"Module: {mod}")
@@ -649,6 +795,25 @@ def step_modules(state: dict):
         state["kbots_modules"] = ""
         state["selected_modules"] = []
         ok("No extension modules selected (core tools only)")
+
+
+def _offer_kdf_upgrade(vault: FernetVault, passphrase: str) -> None:
+    """Offer to rekey a vault still on legacy KDF parameters.
+
+    Without this, a vault created before the 600k-iteration default stayed at
+    100k (and possibly the shared legacy salt) through every setup re-run —
+    the wizard early-returns on a working key file, so there was no moment the
+    upgrade could ever happen.
+    """
+    if vault.kdf_current():
+        return
+    info("This vault still uses legacy key-derivation parameters (weaker "
+         "against brute force if the files ever leak).")
+    if ask_yn("Upgrade it now? (re-encrypts in place, same passphrase)",
+              default=True):
+        changed = vault.rekey(passphrase)
+        for what, detail in changed.items():
+            ok(f"Vault {what}: {detail}")
 
 
 def step_vault(state: dict):
@@ -668,6 +833,10 @@ def step_vault(state: dict):
     if not vault_path.exists():
         _track_path(state, vault_path)
         _track_path(state, vault_path.with_suffix(".salt"))
+        # .kdf records the KDF iteration count. An orphan from an aborted run
+        # poisons the next vault: it would be read as authoritative for a
+        # vault created with different parameters.
+        _track_path(state, vault_path.with_suffix(".kdf"))
 
     if vault_path.exists():
         info("Existing vault found.")
@@ -677,6 +846,7 @@ def step_vault(state: dict):
                 passphrase = key_file.read_text().strip()
                 vault.unlock(passphrase)
                 ok(f"Vault unlocked ({len(vault.list_keys())} secrets)")
+                _offer_kdf_upgrade(vault, passphrase)
                 state["vault"] = vault
                 state["vault_existed"] = True
                 return
@@ -688,10 +858,9 @@ def step_vault(state: dict):
             try:
                 vault.unlock(passphrase)
                 ok(f"Vault unlocked ({len(vault.list_keys())} secrets)")
+                _offer_kdf_upgrade(vault, passphrase)
                 if ask_yn("Save passphrase to key file for auto-unlock?"):
-                    key_file.parent.mkdir(parents=True, exist_ok=True)
-                    key_file.write_text(passphrase + "\n")
-                    key_file.chmod(0o600)
+                    write_private_file(key_file, passphrase + "\n")
                     ok(f"Key file saved to {key_file}")
                 state["vault"] = vault
                 state["vault_existed"] = True
@@ -704,9 +873,17 @@ def step_vault(state: dict):
 
     else:
         while True:
-            passphrase = ask_secret("Create a vault passphrase")
-            if len(passphrase) < 4:
-                err("Passphrase must be at least 4 characters.")
+            passphrase = ask_secret(
+                "Create a vault passphrase (Enter to generate one)")
+            if not passphrase:
+                passphrase = py_secrets.token_urlsafe(24)
+                print(f"  Generated passphrase: {BOLD}{passphrase}{RESET}")
+                info("Shown only once — store it in a password manager. It is the")
+                info("only way to unlock the vault if the key file is ever lost.")
+                break
+            if len(passphrase) < MIN_PASSPHRASE_LEN:
+                err(f"Passphrase must be at least {MIN_PASSPHRASE_LEN} characters "
+                    f"— or press Enter to generate a strong one.")
                 continue
             confirm = ask_secret("Confirm passphrase")
             if passphrase != confirm:
@@ -720,77 +897,138 @@ def step_vault(state: dict):
         vault.delete("_setup")
         ok("Vault created")
 
-        key_file.parent.mkdir(parents=True, exist_ok=True)
-        key_file.write_text(passphrase + "\n")
-        key_file.chmod(0o600)
-        ok(f"Key file saved to {key_file}")
+        # The key file trades encryption-at-rest for unattended start: the
+        # service reads the passphrase from it at boot, and so can anyone else
+        # who can read the file. That trade is fine for most installs, but it
+        # has to be a choice the user saw — SECURITY.md calls any unencrypted
+        # secret on disk a vulnerability, and this is the one sanctioned
+        # exception.
+        print()
+        info("The service needs this passphrase at every start. Saving it to a")
+        info(f"key file ({key_file}, owner-only 0600) lets the service start")
+        info("unattended after a reboot — but anyone who can read that file can")
+        info("unlock the vault.")
+        if ask_yn("Save passphrase to the key file for unattended start?",
+                  default=True):
+            write_private_file(key_file, passphrase + "\n")
+            ok(f"Key file saved to {key_file}")
+        else:
+            warn("No key file — the service cannot auto-start after a reboot.")
+            warn("Start it in a terminal (it will prompt), or create the key "
+                 "file later by re-running setup.")
 
         state["vault"] = vault
         state["vault_existed"] = False
 
 
+def ask_display_name(prompt: str, default: str) -> tuple[str, str]:
+    """One name question instead of three.
+
+    The user gives the Discord-facing name they actually want ('Atlas');
+    the internal name — folder, config key, bot account — is derived from it
+    ('atlas', 'My Bot 2' → 'my-bot-2') instead of being asked separately.
+    Only when nothing usable survives derivation does the question repeat.
+    """
+    while True:
+        display = ask(prompt, default) or default
+        internal = suggest_agent_name(display)
+        if internal and not agent_name_error(internal):
+            info(f"Internal name: {internal} (folder, config key, bot account)")
+            return display, internal
+        err(f"Couldn't derive an internal name from {display!r} "
+            f"— it must contain letters ({AGENT_NAME_RULE}).")
+
+
 def step_discord(state: dict):
-    header("Step 7: Discord Bot")
-    info("kbots connects to Discord via a bot account.")
+    header("Step 7: Main Agent & Discord Bot")
+    info("Your primary AI agent and the Discord bot account it speaks through")
+    info("— one agent, one bot, so it's one step.")
+    print()
+
+    vault: FernetVault = state["vault"]
+
+    display_name, internal = ask_display_name(
+        "Agent name (shown in Discord — you'll @mention this)", "Main")
+    description = ask("One-line description", "Primary agent")
+    model = ask_choice("LLM model", ["sonnet", "opus"], default="sonnet")
+    info("Optionally set a personality for the agent's identity file (AGENTS.md).")
+    personality = ask("Personality (e.g., 'concise and direct', "
+                      "'friendly and detailed')", "concise and direct")
+
+    state["agent"] = {
+        "name": internal,
+        "display_name": display_name,
+        "description": description,
+        "model": model,
+        "personality": personality,
+    }
+    state["bot_name"] = internal
+    state["bot_token_key"] = "discord-token"
+
+    print()
+    info("Now the bot account itself.")
     info("Create one at: https://discord.com/developers/applications")
     info("Required intents: Message Content, Server Members, Guild Messages")
     info("Tip: README → QUICKSTART Step 1 has a Claude-in-Chrome prompt that")
     info("automates the whole portal setup (except copying the token).")
     print()
 
-    vault: FernetVault = state["vault"]
-
-    # First prompt does double duty: a token pasted here is used directly
-    # (common mistake is pasting the token at a yes/no gate), 'y' opens a
-    # hidden token prompt, and 'n'/blank skips Discord.
-    first = ask("Paste your bot token now, or type 'y' to enter it hidden "
-                "('n' to skip)")
-    if _looks_like_discord_token(first):
-        token = first
-    elif first.lower() in ("y", "yes"):
-        token = ask_secret("Bot token")
-    else:
-        warn("Skipped — add a token later via vault-manage.py, then restart.")
-        state["discord_skip"] = True
-        return
-
-    # Token
-    while True:
-        if not token:
-            token = ask_secret("Bot token")
-        if not token:
-            warn("Skipped Discord setup.")
-            state["discord_skip"] = True
-            return
-
+    # A re-run against an existing vault shouldn't force a re-paste — the
+    # token is already stored, and hunting it down again is the most annoying
+    # part of a second pass through the wizard.
+    token = ""
+    if state.get("vault_existed") and vault.get("discord-token"):
+        if ask_yn("A Discord bot token is already in the vault. Keep it?",
+                  default=True):
+            token = vault.get("discord-token")
+    if not token:
+        token = ask_discord_token("Paste your bot token")
+    while token:
         info("Validating token...")
-        bot_info = validate_discord_token(token)
+        bot_info, reason = validate_discord_token(token)
         if bot_info:
             ok(f"Bot verified: {bot_info.get('username', '?')}#{bot_info.get('discriminator', '0')}")
             break
-        else:
-            if ask_yn("Token validation failed. Use it anyway?", default=False):
+        if reason == "network":
+            # Air-gapped or offline installs can't reach Discord — storing the
+            # token unverified is a legitimate choice there. A rejected token
+            # is not: keeping it just moves the failure to first boot.
+            if ask_yn("Couldn't reach Discord to validate. Store the token "
+                      "unverified?", default=False):
                 break
-            continue
+        else:
+            err("Discord rejected that token — re-copy it from the Developer "
+                "Portal (Bot → Reset Token if it was regenerated).")
+        token = ask_discord_token("Paste your bot token")
 
-    vault.set("discord-token", token)
-    ok("Token stored in vault")
+    if not token:
+        warn("Skipped — add a token later via vault-manage.py, then restart.")
+        state["discord_skip"] = True
+    else:
+        vault.set("discord-token", token)
+        ok("Token stored in vault")
 
-    # Guild ID + your user ID (validated snowflakes)
-    info("Tip: enable Discord Developer Mode (Settings → Advanced), then "
-         "right-click → Copy ID. Or read the server ID from the URL: "
-         "discord.com/channels/<server-id>/<channel-id>.")
-    guild_id = ask_id("Server (guild) ID")
-    state["guild_id"] = guild_id
+        # Guild ID + your user ID (validated snowflakes)
+        info("Tip: enable Discord Developer Mode (Settings → Advanced), then "
+             "right-click → Copy ID. Or read the server ID from the URL: "
+             "discord.com/channels/<server-id>/<channel-id>.")
+        guild_id = ask_id("Server (guild) ID")
+        state["guild_id"] = guild_id
 
-    user_id = ask_id("Your Discord user ID (makes you the admin)")
-    state["owner_discord_id"] = user_id
-    state["discord_skip"] = False
+        user_id = ask_id("Your Discord user ID (makes you the admin)")
+        state["owner_discord_id"] = user_id
+        state["discord_skip"] = False
 
-    # Bot account name
-    bot_name = ask("Internal name for this bot account", "main")
-    state["bot_name"] = bot_name
-    state["bot_token_key"] = "discord-token"
+        # Manage Channels: the main bot is the setup account — server
+        # auto-setup creates the fleet channels through it on guild join.
+        print()
+        show_invite_link(state, internal, token, bot_info, manage_channels=True)
+
+    # Routing (asked even when Discord was skipped — the agent config must
+    # exist either way, and the account wiring activates once a token lands).
+    print()
+    state["agent"]["routing"] = _ask_routing(internal)
+    ok(f"Agent: {display_name} ({model})")
 
 
 def step_team(state: dict):
@@ -820,37 +1058,6 @@ def step_team(state: dict):
     }
     state["team_members"] = [state["owner"]]
     ok(f"Owner profile: {name} ({role})")
-
-
-def step_agent(state: dict):
-    header("Step 9: First Agent")
-    info("Configure your primary AI agent.")
-    print()
-
-    agent_name = ask("Agent internal name (lowercase, no spaces)", "main")
-    display_name = ask("Display name (shown in Discord)", agent_name.upper())
-    description = ask("One-line description", "Primary agent")
-    model = ask_choice("LLM model", ["sonnet", "opus"], default="sonnet")
-
-    state["agent"] = {
-        "name": agent_name,
-        "display_name": display_name,
-        "description": description,
-        "model": model,
-    }
-
-    # Agent personality
-    print()
-    info("Optionally set a personality for the agent's identity file (AGENTS.md).")
-    personality = ask("Personality (e.g., 'concise and direct', 'friendly and detailed')", "concise and direct")
-    state["agent"]["personality"] = personality
-
-    # Routing
-    print()
-    bot_name = state.get("bot_name", "main")
-    state["agent"]["routing"] = _ask_routing(bot_name)
-
-    ok(f"Agent: {display_name} ({model})")
 
 
 def step_full_control(state: dict):
@@ -928,16 +1135,24 @@ def step_hitl(state: dict):
         }
         return
 
-    channel_id = ask("Discord channel ID for approvals (ops/alerts channel)")
+    # Blank is the recommended answer: server auto-setup creates
+    # #kbots-approvals when the main bot joins the guild and wires it live
+    # (adopting an existing channel of that name, never repointing one set
+    # here). The ID prompt exists for people who want an EXISTING channel
+    # under a different name. ask_id, not ask: a typo would silently point
+    # the fail-closed gate at a nonexistent channel and every gated action
+    # would hang.
+    info("Approvals channel: leave blank (recommended) and the main bot")
+    info("creates + wires #kbots-approvals itself when it joins your server.")
+    info("Enter an ID only to use an existing channel with a different name.")
+    channel_id = ask_id("Approvals channel ID (Enter for automatic)")
     approvers = [state.get("owner_discord_id", "")]
     approvers = [a for a in approvers if a]
 
-    more = ask_yn("Add more approvers?", default=False)
-    while more:
-        uid = ask("Discord user ID")
-        if uid:
-            approvers.append(uid)
-        more = ask_yn("Add another?", default=False)
+    if ask_yn("Add more approvers?", default=False):
+        for uid in ask_ids("approver user"):
+            if uid not in approvers:
+                approvers.append(uid)
 
     print()
     info("Default gated tools: send_email, install_mcp, create_agent, create_tool, "
@@ -1111,6 +1326,62 @@ def step_training(state: dict):
     state["training_collection"] = training
 
 
+# Optional dependency groups from pyproject.toml that a deployment can enable.
+# sync.sh reads <overlay>/extras and passes each name as `uv sync --extra` on
+# every sync, so a choice made here survives updates.
+_PY_EXTRAS = [
+    ("embeddings", "semantic memory recall (local embeddings) — recommended"),
+    ("data", "data-analysis stack (pandas, matplotlib, scipy, scikit-learn)"),
+    ("reports", "PDF / report generation (fpdf2, markdown)"),
+    ("search", "Tavily web search tool"),
+    ("api", "HTTP API + webhook server (FastAPI)"),
+    ("design", "PowerPoint generation (python-pptx)"),
+    ("graph", "graph memory backend"),
+    ("stagehand", "AI-driven browser automation"),
+]
+
+
+def step_pyextras(state: dict):
+    header("Step 13: Optional Features")
+    overlay: Path = state["overlay"]
+    extras_file = overlay / "extras"
+
+    current: list[str] = []
+    if extras_file.exists():
+        current = extras_file.read_text().replace(",", " ").split()
+
+    info("Optional feature sets (Python extras). The final dependency sync in")
+    info("this run installs them, and every later sync keeps them installed.")
+    print()
+    for i, (name, desc) in enumerate(_PY_EXTRAS, 1):
+        mark = f"{GREEN}✓{RESET}" if name in current else " "
+        print(f"    [{i}] {mark} {name} — {desc}")
+    print()
+    info("Enter numbers (comma-separated), 'all', or blank to keep as is.")
+    choice = ask("Extras", "")
+
+    if choice:
+        if choice.lower() == "all":
+            selected = [n for n, _ in _PY_EXTRAS]
+        else:
+            selected = []
+            for c in choice.split(","):
+                try:
+                    i = int(c.strip()) - 1
+                    if 0 <= i < len(_PY_EXTRAS):
+                        selected.append(_PY_EXTRAS[i][0])
+                except ValueError:
+                    pass
+        extras_file.write_text("\n".join(selected) + ("\n" if selected else ""))
+        ok(f"Extras: {' '.join(selected) or 'none'} (saved to {_display(extras_file, overlay)})")
+    else:
+        ok(f"Extras unchanged: {' '.join(current) or 'none'}")
+
+    info("Vendor integrations (google, trello, notion, github, …) are separate —")
+    info("they live in extras/ in the engine repo and install by copying into")
+    info("the overlay. See extras/README.md.")
+
+
 def step_generate(state: dict):
     header("Step 13: Generating Config Files")
 
@@ -1177,6 +1448,12 @@ def step_generate(state: dict):
             "compression": state.get("compression", {"enabled": False, "level": "standard"}),
         },
         "admin_users": {"discord": [owner_discord]},
+        # ON for fresh installs: each agent aligns its Discord account name
+        # and avatar with its config on first boot, so a reused bot app named
+        # something else doesn't ship a stranger's identity. The example
+        # config defaults this OFF because renaming is outward-facing and
+        # rate-limited — a caveat for established fleets, not a new install.
+        "identity": {"reconcile_on_boot": True},
     }
 
     # Local models + tier routing (from step_local_models). Router config in
@@ -1258,31 +1535,38 @@ def step_ops_instance(state: dict):
     overlay: Path = state["overlay"]
     vault: FernetVault = state["vault"]
 
-    agent_name = ask("Ops agent internal name", "engineer")
-    display_name = ask("Display name", agent_name.capitalize() + " Bot")
+    display_name, agent_name = ask_display_name(
+        "Ops agent name (shown in Discord — you'll @mention this)", "Engineer")
     description = ask("Description", "Privileged ops agent — unsandboxed, owner-only")
     model = ask_choice("Model", ["sonnet", "opus"], default="opus")
 
-    # Bot account
+    # Bot account — same derived name; one agent, one bot, one name.
+    bot_name = agent_name
     print()
     info("The ops agent needs its own Discord bot account.")
-    bot_name = ask("Bot account name", agent_name)
-    token = ask_secret(f"Discord bot token for '{bot_name}' (empty to skip)")
+    token = ask_discord_token(f"Discord bot token for '{display_name}'")
 
-    if token:
+    while token:
         info("Validating token...")
-        bot_info = validate_discord_token(token)
+        bot_info, reason = validate_discord_token(token)
         if bot_info:
             ok(f"Bot verified: {bot_info.get('username', '?')}")
+            break
+        if reason == "network":
+            if ask_yn("Couldn't reach Discord to validate. Store the token "
+                      "unverified?", default=False):
+                break
         else:
-            if not ask_yn("Validation failed. Store anyway?", default=False):
-                token = None
+            err("Discord rejected that token — re-copy it from the Developer "
+                "Portal.")
+        token = ask_discord_token(f"Discord bot token for '{display_name}'")
 
     if token:
         vault_key = f"discord-{bot_name}"
         vault.set(vault_key, token)
         ok(f"Token stored as '{vault_key}'")
         state.setdefault("extra_bots", {})[bot_name] = vault_key
+        show_invite_link(state, bot_name, token, bot_info)
     else:
         warn("No token — add it later via vault-manage.py")
 
@@ -1352,9 +1636,15 @@ def step_ops_instance(state: dict):
     for p in written:
         ok(f"Created {_display(p, overlay)}")
 
+    state["ops_profile"] = ops_profile
+
     print()
     ok(f"Ops instance configured — agent: {display_name}")
-    info("Service setup will be offered in a later step.")
+    if sys.platform == "darwin":
+        info("The ops agent runs inside the main service — nothing more to install.")
+    else:
+        info("Its service unit (kbots-rescue.service, unsandboxed) is rendered "
+             "and installed in the Systemd Services step.")
 
 
 def step_extras(state: dict):
@@ -1380,6 +1670,137 @@ def step_extras(state: dict):
             _add_bot(state)
 
 
+def service_account_home(unit_text: str) -> Path:
+    """The home directory of the account the unit runs as.
+
+    `%h` in a SYSTEM unit is the service manager's home, which is root's, not
+    the `User=`'s. The template ships `Environment=HOME=%h` with a comment
+    saying it is rewritten at install time, and nothing rewrote it: a fresh
+    Debian install failed with `failed to create directory /root/.cache/uv:
+    Permission denied` and exited 2 before doing anything. Worse than the crash
+    is the near miss, since the same %h would send Claude Code to
+    /root/.claude/.credentials.json, where an authenticated service account
+    reads as unauthenticated.
+
+    Resolved from the unit's own User= rather than from whoever runs setup,
+    because setup is routinely run under sudo.
+    """
+    import pwd
+
+    for line in unit_text.splitlines():
+        if line.startswith("User="):
+            user = line.split("=", 1)[1].strip()
+            if user:
+                try:
+                    return Path(pwd.getpwnam(user).pw_dir)
+                except KeyError:
+                    # The account is created by install-systemd.sh, which may
+                    # not have run yet. Debian's adduser --system default.
+                    return Path("/home") / user
+    return Path.home()
+
+
+def service_writable_dirs(overlay: Path) -> list[Path]:
+    """Directories the unit grants ReadWritePaths and something must create.
+
+    /tmp and the home dotfile dirs are excluded: the first always exists, and
+    the second belong to an account setup may not be able to write into.
+    """
+    return [ENGINE_ROOT / "data", overlay / "agents", overlay / "config",
+            overlay / "data", overlay / "tmp", overlay / "tools",
+            overlay / "skills"]
+
+
+def render_service_unit(unit_text: str, overlay: Path, env_lines: list[str]) -> str:
+    """Fill the template's install-time placeholders.
+
+    ReadWritePaths gains tools/ and skills/: create_tool and create_skill write
+    a .py or .yaml into them and tool_scope keeps its sidecar in tools/, so
+    without them every agent-authored capability fails on Linux while working
+    perfectly on the developer's Mac, which has no sandbox.
+    """
+    home = service_account_home(unit_text)
+    out = []
+    for line in unit_text.split("\n"):
+        if line.startswith("Environment=HOME="):
+            out.append(f"Environment=HOME={home}")
+        elif line.startswith("Environment=PATH="):
+            out.append(f"Environment=PATH={home}/.local/bin:/usr/local/bin:/usr/bin:/bin")
+            out.extend(env_lines)
+        elif line.startswith("ReadWritePaths="):
+            paths = " ".join(str(d) for d in service_writable_dirs(overlay))
+            # ~/.claude.json lives at the root of a read-only home
+            # (ProtectHome=read-only). Claude Code rewrites it ATOMICALLY to
+            # mark a workspace trusted: mkstemp(~/.claude.json.XXXX.tmp) then
+            # rename. Granting only the .claude directory, or even the file
+            # itself by name, leaves the temp file's parent read-only, so the
+            # write fails with EROFS, trust never persists, and every agent
+            # gets "unapproved-permission" on every tool. Grant the home dir.
+            out.append(f"ReadWritePaths={paths} /tmp {home}/.cache {home}/.claude {home}")
+        elif line.startswith("ReadOnlyPaths="):
+            out.append(f"ReadOnlyPaths={ENGINE_ROOT} {overlay}")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def render_rescue_unit(template: str, overlay: Path, env_lines: list[str],
+                       uv_path: str) -> str:
+    """Render the rescue (ops) instance unit the same way the main unit is.
+
+    A raw copy of the template — which is what the wizard used to tell people
+    to do — crash-loops on a real install: `Environment=HOME=%h` resolves to
+    ROOT's home in a system unit, so the vault key file and Claude credentials
+    are looked up in the wrong place, and nothing sets KBOTS_OVERLAY, so the
+    instance can't find agents.rescue.yaml or the vault at all.
+
+    render_service_unit fixes HOME/PATH and injects the env lines; the rescue
+    template carries no ReadWritePaths/ReadOnlyPaths lines, so no sandbox is
+    introduced — the whole point of the rescue instance is that it has none.
+    """
+    if str(ENGINE_ROOT) != "/opt/kbots":
+        # flags=re.M: without it $ only matches end-of-STRING, so a path that
+        # ends a line mid-file (WorkingDirectory=/opt/kbots) is never rewritten.
+        template = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), template, flags=re.M)
+    template = template.replace("ExecStart=/usr/local/bin/uv", f"ExecStart={uv_path}")
+    return render_service_unit(template, overlay, env_lines)
+
+
+def build_health_config(state: dict) -> dict:
+    """Everything scripts/health-audit.sh needs to audit THIS deployment.
+
+    Built from wizard state rather than shipped as an example: the service
+    list, vault keys and paths are per-deployment facts the wizard already
+    holds, and a generic template would audit nothing real.
+    """
+    overlay: Path = state["overlay"]
+    services = ["kbots"]
+    if state.get("ops_profile") == "rescue":
+        services.append("kbots-rescue")
+    vault_keys: list[str] = []
+    if not state.get("discord_skip"):
+        vault_keys.append(state.get("bot_token_key", "discord-token"))
+    vault_keys += list((state.get("extra_bots") or {}).values())
+    return {
+        "deployment": "kbots",
+        "paths": {
+            "kbots_home": str(ENGINE_ROOT),
+            "overlay": str(overlay),
+            "vault": str(overlay / "config" / "secrets.enc"),
+            "memory_db": str(ENGINE_ROOT / "data" / "memory.db"),
+            "embeddings_model": str(ENGINE_ROOT / "data" / "models"
+                                    / "bge-small-en-v1.5"),
+        },
+        "thresholds": {"disk_percent": 80, "ram_percent": 85,
+                       "swap_percent": 70, "load_per_cpu": 1.5},
+        "services": services,
+        "config_files": [str(overlay / "config" / "config.yaml"),
+                         str(overlay / "config" / "agents.yaml"),
+                         str(overlay / "config" / "team.json")],
+        "vault_expected_keys": vault_keys,
+    }
+
+
 def step_systemd(state: dict):
     header("Step 16: Systemd Services")
 
@@ -1395,6 +1816,12 @@ def step_systemd(state: dict):
         info("You'll need to symlink them to /etc/systemd/system/ manually")
         print()
 
+    # The nightly health audit (and the system_audit tool) refuse to run
+    # without this file, and nothing ever shipped or generated one — so no
+    # deployment had a working audit until someone authored it by hand.
+    _write_yaml(overlay / "config" / "health-config.yaml",
+                build_health_config(state), state)
+
     # --- Generate timer unit files (required for memory decay, health, integrity) ---
     timers_dir = ENGINE_ROOT / "config" / "timers"
     if timers_dir.exists():
@@ -1408,7 +1835,7 @@ def step_systemd(state: dict):
             # (the default from install-systemd.sh) survive `git pull` unscathed.
             content = f.read_text()
             if str(ENGINE_ROOT) != "/opt/kbots":
-                content = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), content)
+                content = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), content, flags=re.M)
 
             # Inject KBOTS_OVERLAY into service files (after KBOTS_HOME line)
             if f.name.endswith(".service"):
@@ -1441,7 +1868,7 @@ def step_systemd(state: dict):
 
         # Rewrite /opt/kbots only for non-default installs; vanilla paths pass through.
         if str(ENGINE_ROOT) != "/opt/kbots":
-            service = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), service)
+            service = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), service, flags=re.M)
         service = service.replace(
             "ExecStart=/usr/local/bin/uv",
             f"ExecStart={uv_path}",
@@ -1452,28 +1879,36 @@ def step_systemd(state: dict):
         if state.get("kbots_modules"):
             env_lines.append(f"Environment=KBOTS_MODULES={state['kbots_modules']}")
 
-        lines = service.split("\n")
-        new_lines = []
-        kbots_home = Path.home()
-        for line in lines:
-            if line.startswith("Environment=PATH="):
-                new_lines.append(line)
-                new_lines.extend(env_lines)
-            elif line.startswith("ReadWritePaths="):
-                # Replace with overlay-aware paths regardless of template formatting
-                new_lines.append(
-                    f"ReadWritePaths={ENGINE_ROOT}/data {overlay}/agents {overlay}/config "
-                    f"{overlay}/data {overlay}/tmp /tmp {kbots_home}/.cache {kbots_home}/.claude {kbots_home}"
-                )
-            elif line.startswith("ReadOnlyPaths="):
-                new_lines.append(f"ReadOnlyPaths={ENGINE_ROOT} {overlay}")
-            else:
-                new_lines.append(line)
-        service = "\n".join(new_lines)
+        service = render_service_unit(service, overlay, env_lines)
+
+        # Every writable path must exist before the unit starts. systemd builds
+        # the mount namespace BEFORE exec, so a ReadWritePaths entry that is
+        # missing fails at step NAMESPACE with status=226 and a message naming
+        # the path rather than the permission, and the service restart-loops
+        # without ever reaching the code that would have created it.
+        for d in service_writable_dirs(overlay):
+            try:
+                d.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                warn(f"Could not create {d}: {e} — the service may fail at step NAMESPACE")
 
         out_path = overlay / "systemd" / "kbots.service"
         out_path.write_text(service)
         ok(f"Service file: {_display(out_path)}")
+
+        # --- Rescue (ops) instance unit, if one was configured ---
+        # Written into overlay/systemd BEFORE install-systemd.sh runs, so the
+        # same pass symlinks and reloads it with everything else.
+        if state.get("ops_profile") == "rescue":
+            rescue_template = ENGINE_ROOT / "config" / "kbots-rescue.service"
+            if rescue_template.exists():
+                rescue = render_rescue_unit(
+                    rescue_template.read_text(), overlay, env_lines, uv_path)
+                rescue_out = overlay / "systemd" / "kbots-rescue.service"
+                rescue_out.write_text(rescue)
+                ok(f"Service file: {_display(rescue_out)}")
+            else:
+                warn(f"Rescue unit template not found: {rescue_template}")
 
     # --- Install into systemd (bash script handles symlinks, reload, enable) ---
     install_script = ENGINE_ROOT / "scripts" / "install-systemd.sh"
@@ -1488,8 +1923,12 @@ def step_systemd(state: dict):
                 for line in result.stdout.strip().split("\n"):
                     info(line.strip())
 
-            def _undo_systemd():
-                for unit in ("kbots.service",):
+            undo_units = ["kbots.service"]
+            if state.get("ops_profile") == "rescue":
+                undo_units.append("kbots-rescue.service")
+
+            def _undo_systemd(units=tuple(undo_units)):
+                for unit in units:
                     subprocess.run(["sudo", "-n", "systemctl", "disable", "--now", unit],
                                    capture_output=True)
                     subprocess.run(["sudo", "-n", "rm", "-f",
@@ -1511,6 +1950,23 @@ def step_systemd(state: dict):
                 else:
                     err(f"Failed to start service: {start.stderr.strip()}")
                     info("Start manually: sudo systemctl start kbots")
+
+                # install-systemd.sh symlinks the rescue unit but only enables
+                # timers and the main service — enable it here, or the ops
+                # agent stays configured-but-never-served.
+                if state.get("ops_profile") == "rescue":
+                    info("Starting rescue (ops) service...")
+                    rstart = subprocess.run(
+                        ["sudo", "-n", "systemctl", "enable", "--now",
+                         "kbots-rescue.service"],
+                        capture_output=True, text=True,
+                    )
+                    if rstart.returncode == 0:
+                        ok("Rescue service started — the ops agent serves its own bot")
+                        info("Logs: journalctl -u kbots-rescue -f")
+                    else:
+                        err(f"Failed to start rescue service: {rstart.stderr.strip()}")
+                        info("Start manually: sudo systemctl enable --now kbots-rescue")
         else:
             err("Systemd installation failed:")
             if result.stderr.strip():
@@ -1528,6 +1984,12 @@ def step_launchd(state: dict):
     header("Step 16: launchd Service (macOS)")
 
     overlay: Path = state["overlay"]
+
+    # Timers are Linux-only, but the system_audit tool runs the same script
+    # on demand — it needs this file on macOS too.
+    _write_yaml(overlay / "config" / "health-config.yaml",
+                build_health_config(state), state)
+
     template_path = ENGINE_ROOT / "config" / "kbots.launchd.plist"
     if not template_path.exists():
         err(f"launchd template not found: {template_path}")
@@ -1728,6 +2190,11 @@ def step_summary(state: dict):
     else:
         print(f"  {BOLD}Discord:{RESET}    connected (guild: {state.get('guild_id', '?')})")
 
+    if state.get("invite_urls"):
+        print(f"\n  {BOLD}Bot install links{RESET} (add a bot to a server any time):")
+        for name, url in state["invite_urls"].items():
+            print(f"    {name}: {CYAN}{url}{RESET}")
+
     if sys.platform == "darwin":
         restart_cmd = "launchctl kickstart -k gui/$(id -u)/com.kbots.agent"
         logs_cmd = f"tail -f {overlay}/data/launchd.stderr.log"
@@ -1801,20 +2268,46 @@ def _add_bot(state: dict):
     overlay: Path = state["overlay"]
     vault: FernetVault = state["vault"]
     bot_name = ask("Bot account name (internal)")
-    token = ask_secret("Bot token")
+
+    # Same validation loop as the main bot — a token stored unchecked here
+    # would only surface as a connect failure at first boot.
+    token = ask_discord_token("Bot token")
+    while token:
+        info("Validating token...")
+        bot_info, reason = validate_discord_token(token)
+        if bot_info:
+            ok(f"Bot verified: {bot_info.get('username', '?')}")
+            break
+        if reason == "network":
+            if ask_yn("Couldn't reach Discord to validate. Store the token "
+                      "unverified?", default=False):
+                break
+        else:
+            err("Discord rejected that token — re-copy it from the Developer "
+                "Portal.")
+        token = ask_discord_token("Bot token")
+    if not token:
+        warn("Skipped — no token entered.")
+        return
 
     vault_key = f"discord-{bot_name}"
     vault.set(vault_key, token)
     ok(f"Token stored as '{vault_key}'")
+    show_invite_link(state, bot_name, token, bot_info)
 
-    # Add to config.yaml
+    # Add to config.yaml. setdefault, not raw indexing: a config written by an
+    # earlier version (or hand-edited) may lack the intermediate keys, and a
+    # KeyError here used to abort the wizard and roll back the whole run.
     config_path = overlay / "config" / "config.yaml"
     with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 
-    cfg["connectors"]["discord"]["accounts"][bot_name] = {"token_key": vault_key}
+    discord_cfg = cfg.setdefault("connectors", {}).setdefault("discord", {})
+    discord_cfg.setdefault("accounts", {})[bot_name] = {"token_key": vault_key}
     config_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
     ok(f"Bot '{bot_name}' added to config")
+    info("Note: the bot serves nothing until an agent routes to it "
+         "(agents.yaml → routing.discord.account).")
 
 
 # ==========================================================================
@@ -1837,11 +2330,11 @@ def _ask_routing(bot_account: str, default_mentions: bool = True) -> dict:
     channels = ask_ids("channel") if scope in (2, 4) else []
     categories = ask_ids("category") if scope in (3, 4) else []
 
-    guilds = []
-    if ask_yn("Restrict to specific server(s)? (most people: No — the bot only "
-              "works where it's invited anyway)", default=False):
-        guilds = ask_ids("server/guild")
-
+    # routing.discord.guilds (a per-agent server allowlist) is deliberately NOT
+    # asked here. The wizard serves single-server installs, where the answer is
+    # always "no restriction" — and defaulting it to the install's guild would
+    # be worse: the agent would silently ignore any server the bot is invited
+    # to later. The router still honors the key for hand-edited agents.yaml.
     users = []
     if ask_yn("Only respond to specific user(s)? (most people: No — team access "
               "tiers already gate who can talk to it)", default=False):
@@ -1856,41 +2349,44 @@ def _ask_routing(bot_account: str, default_mentions: bool = True) -> dict:
     }
     if categories:
         routing["discord"]["categories"] = categories
-    if guilds:
-        routing["discord"]["guilds"] = guilds
     if users:
         routing["discord"]["users"] = users
 
     return routing
 
 
-def _write_yaml(path: Path, data: dict, state: dict):
-    if path.exists() and state.get("vault_existed"):
-        if not ask_yn(f"  {_display(path)} exists. Overwrite?", default=False):
-            warn(f"Skipped {_display(path)}")
-            return
+def _confirm_overwrite(path: Path) -> bool:
+    """Ask before clobbering an existing config file.
+
+    Keyed on the file's own existence — this used to be gated on whether the
+    VAULT pre-existed, so re-running the wizard after the vault was deleted or
+    moved silently overwrote config.yaml and team.json.
+    """
+    if not path.exists():
+        return True
+    return ask_yn(f"  {_display(path)} exists. Overwrite?", default=False)
+
+
+def _write_config(path: Path, text: str):
+    """config.yaml and team.json hold guild/admin IDs and real names — written
+    owner-only, same as the vault files beside them."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+    write_private_file(path, text)
+
+
+def _write_yaml(path: Path, data: dict, state: dict):
+    if not _confirm_overwrite(path):
+        warn(f"Skipped {_display(path)}")
+        return
+    _write_config(path, yaml.dump(data, default_flow_style=False, sort_keys=False))
     ok(f"Created {_display(path)}")
 
 
 def _write_json(path: Path, data: dict, state: dict):
-    if path.exists() and state.get("vault_existed"):
-        if not ask_yn(f"  {_display(path)} exists. Overwrite?", default=False):
-            warn(f"Skipped {_display(path)}")
-            return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n")
-    ok(f"Created {_display(path)}")
-
-
-def _write_file(path: Path, content: str, state: dict):
-    if path.exists() and state.get("vault_existed"):
-        if not ask_yn(f"  {_display(path)} exists. Overwrite?", default=False):
-            warn(f"Skipped {_display(path)}")
-            return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+    if not _confirm_overwrite(path):
+        warn(f"Skipped {_display(path)}")
+        return
+    _write_config(path, json.dumps(data, indent=2) + "\n")
     ok(f"Created {_display(path)}")
 
 
@@ -1951,6 +2447,70 @@ def _strip_profile_block(profile_path: Path, block: str) -> None:
         content = profile_path.read_text()
         if block and block in content:
             profile_path.write_text(content.replace(block, ""))
+
+
+# Debian/Ubuntu ~/.bashrc returns early for non-interactive shells. Anything
+# exported below this guard does not exist in cron, in `ssh host '<cmd>'`, or
+# in a script-driven `bash -c` — exactly the shells that run kbots tooling
+# unattended. The export has to go ABOVE it.
+_PROFILE_GUARDS = (
+    re.compile(r"^\s*case\s+\$-\s+in"),                        # case $- in *i*) ;; *) return;; esac
+    re.compile(r"^\s*\[\s*-z\s+[\"']?\$PS1[\"']?\s*\]\s*&&\s*return"),   # [ -z "$PS1" ] && return
+    re.compile(r"^\s*\[\[\s*\$-\s*!=\s*\*i\*\s*\]\]\s*&&\s*return"),     # [[ $- != *i* ]] && return
+)
+
+
+def _guard_index(lines: list[str]) -> int | None:
+    """Index of the interactive-shell guard, or None if the profile has none."""
+    for i, line in enumerate(lines):
+        if any(g.match(line) for g in _PROFILE_GUARDS):
+            return i
+    return None
+
+
+def _write_profile_block(profile_path: Path, block: str) -> None:
+    """Add `block` to the profile, above the interactive guard if there is one.
+
+    The block is written verbatim so _strip_profile_block still matches it.
+    """
+    content = profile_path.read_text() if profile_path.exists() else ""
+    lines = content.splitlines(keepends=True)
+    idx = _guard_index(lines)
+    if idx is None:
+        with open(profile_path, "a") as f:
+            f.write(block)
+        return
+    lines.insert(idx, block.lstrip("\n"))
+    profile_path.write_text("".join(lines))
+
+
+def _relocate_profile_block(profile_path: Path) -> bool:
+    """Move an already-installed kbots export block above the guard.
+
+    Setup's idempotency check is "is KBOTS_OVERLAY in the file", so without
+    this every host installed before the fix keeps its export stranded below
+    the guard forever and re-running setup silently leaves it there.
+    Returns True if anything moved.
+    """
+    if not profile_path.exists():
+        return False
+    lines = profile_path.read_text().splitlines(keepends=True)
+    idx = _guard_index(lines)
+    if idx is None:
+        return False
+    is_export = re.compile(r"^\s*export\s+KBOTS_(OVERLAY|MODULES)=").match
+    moved = [line for line in lines[idx:] if is_export(line)]
+    if not moved:
+        return False
+    kept = [line for i, line in enumerate(lines)
+            if not (i >= idx and (is_export(line)
+                                  or line.strip() == "# kbots environment"))]
+    new_idx = _guard_index(kept)
+    if new_idx is None:
+        return False
+    kept[new_idx:new_idx] = ["# kbots environment\n", *moved, "\n"]
+    profile_path.write_text("".join(kept))
+    return True
 
 
 def _rollback(state: dict) -> None:
@@ -2016,12 +2576,12 @@ def main():
         step_vault,
         step_discord,
         step_team,
-        step_agent,
         step_full_control,
         step_hitl,
         step_compression,
         step_local_models,
         step_training,
+        step_pyextras,
         step_generate,
         step_ops_instance,
         step_extras,
@@ -2031,11 +2591,27 @@ def main():
         step_summary,
     ]
 
+    _PROGRESS["total"] = len(steps)
+
     try:
         for step in steps:
+            _PROGRESS["current"] += 1
             step(state)
     except KeyboardInterrupt:
         print(f"\n\n  {YELLOW}Setup interrupted.{RESET}")
+        # An abort late in the run used to cost every answer given so far —
+        # rollback was the only option. Keeping is safe: the wizard detects
+        # existing files on a re-run (vault unlocks from the key file, configs
+        # prompt before overwrite), so continuing is mostly pressing Enter.
+        if sys.stdin.isatty() and (state.get("_undo") or state.get("_created_paths")):
+            info("Keep what's been set up so far and re-run setup later to "
+                 "continue — or roll everything back now.")
+            try:
+                if ask_yn("Keep progress? (No = roll back)", default=True):
+                    ok("Kept. Continue any time with: uv run python setup.py")
+                    sys.exit(130)
+            except (KeyboardInterrupt, EOFError):
+                print()
         _rollback(state)
         sys.exit(130)
     except Exception as e:
