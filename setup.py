@@ -1635,21 +1635,15 @@ def step_ops_instance(state: dict):
     for p in written:
         ok(f"Created {_display(p, overlay)}")
 
+    state["ops_profile"] = ops_profile
+
     print()
     ok(f"Ops instance configured — agent: {display_name}")
     if sys.platform == "darwin":
         info("The ops agent runs inside the main service — nothing more to install.")
     else:
-        # The wizard's systemd step installs only the MAIN unit; promising the
-        # rescue service "in a later step" left it configured and never served.
-        # Say what actually has to happen instead.
-        info("The rescue instance needs its own (unsandboxed) service unit,")
-        info("which the wizard does not install. After setup finishes:")
-        info(f"  sudo cp {ENGINE_ROOT}/config/kbots-rescue.service /etc/systemd/system/")
-        info("  sudo systemctl daemon-reload")
-        info("  sudo systemctl enable --now kbots-rescue.service")
-        info(f"Check the unit's paths first if the engine is not at /opt/kbots "
-             f"(yours: {ENGINE_ROOT}).")
+        info("Its service unit (kbots-rescue.service, unsandboxed) is rendered "
+             "and installed in the Systemd Services step.")
 
 
 def step_extras(state: dict):
@@ -1756,6 +1750,28 @@ def render_service_unit(unit_text: str, overlay: Path, env_lines: list[str]) -> 
     return "\n".join(out)
 
 
+def render_rescue_unit(template: str, overlay: Path, env_lines: list[str],
+                       uv_path: str) -> str:
+    """Render the rescue (ops) instance unit the same way the main unit is.
+
+    A raw copy of the template — which is what the wizard used to tell people
+    to do — crash-loops on a real install: `Environment=HOME=%h` resolves to
+    ROOT's home in a system unit, so the vault key file and Claude credentials
+    are looked up in the wrong place, and nothing sets KBOTS_OVERLAY, so the
+    instance can't find agents.rescue.yaml or the vault at all.
+
+    render_service_unit fixes HOME/PATH and injects the env lines; the rescue
+    template carries no ReadWritePaths/ReadOnlyPaths lines, so no sandbox is
+    introduced — the whole point of the rescue instance is that it has none.
+    """
+    if str(ENGINE_ROOT) != "/opt/kbots":
+        # flags=re.M: without it $ only matches end-of-STRING, so a path that
+        # ends a line mid-file (WorkingDirectory=/opt/kbots) is never rewritten.
+        template = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), template, flags=re.M)
+    template = template.replace("ExecStart=/usr/local/bin/uv", f"ExecStart={uv_path}")
+    return render_service_unit(template, overlay, env_lines)
+
+
 def step_systemd(state: dict):
     header("Step 16: Systemd Services")
 
@@ -1784,7 +1800,7 @@ def step_systemd(state: dict):
             # (the default from install-systemd.sh) survive `git pull` unscathed.
             content = f.read_text()
             if str(ENGINE_ROOT) != "/opt/kbots":
-                content = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), content)
+                content = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), content, flags=re.M)
 
             # Inject KBOTS_OVERLAY into service files (after KBOTS_HOME line)
             if f.name.endswith(".service"):
@@ -1817,7 +1833,7 @@ def step_systemd(state: dict):
 
         # Rewrite /opt/kbots only for non-default installs; vanilla paths pass through.
         if str(ENGINE_ROOT) != "/opt/kbots":
-            service = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), service)
+            service = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), service, flags=re.M)
         service = service.replace(
             "ExecStart=/usr/local/bin/uv",
             f"ExecStart={uv_path}",
@@ -1845,6 +1861,20 @@ def step_systemd(state: dict):
         out_path.write_text(service)
         ok(f"Service file: {_display(out_path)}")
 
+        # --- Rescue (ops) instance unit, if one was configured ---
+        # Written into overlay/systemd BEFORE install-systemd.sh runs, so the
+        # same pass symlinks and reloads it with everything else.
+        if state.get("ops_profile") == "rescue":
+            rescue_template = ENGINE_ROOT / "config" / "kbots-rescue.service"
+            if rescue_template.exists():
+                rescue = render_rescue_unit(
+                    rescue_template.read_text(), overlay, env_lines, uv_path)
+                rescue_out = overlay / "systemd" / "kbots-rescue.service"
+                rescue_out.write_text(rescue)
+                ok(f"Service file: {_display(rescue_out)}")
+            else:
+                warn(f"Rescue unit template not found: {rescue_template}")
+
     # --- Install into systemd (bash script handles symlinks, reload, enable) ---
     install_script = ENGINE_ROOT / "scripts" / "install-systemd.sh"
     if has_sudo and install_script.exists():
@@ -1858,8 +1888,12 @@ def step_systemd(state: dict):
                 for line in result.stdout.strip().split("\n"):
                     info(line.strip())
 
-            def _undo_systemd():
-                for unit in ("kbots.service",):
+            undo_units = ["kbots.service"]
+            if state.get("ops_profile") == "rescue":
+                undo_units.append("kbots-rescue.service")
+
+            def _undo_systemd(units=tuple(undo_units)):
+                for unit in units:
                     subprocess.run(["sudo", "-n", "systemctl", "disable", "--now", unit],
                                    capture_output=True)
                     subprocess.run(["sudo", "-n", "rm", "-f",
@@ -1881,6 +1915,23 @@ def step_systemd(state: dict):
                 else:
                     err(f"Failed to start service: {start.stderr.strip()}")
                     info("Start manually: sudo systemctl start kbots")
+
+                # install-systemd.sh symlinks the rescue unit but only enables
+                # timers and the main service — enable it here, or the ops
+                # agent stays configured-but-never-served.
+                if state.get("ops_profile") == "rescue":
+                    info("Starting rescue (ops) service...")
+                    rstart = subprocess.run(
+                        ["sudo", "-n", "systemctl", "enable", "--now",
+                         "kbots-rescue.service"],
+                        capture_output=True, text=True,
+                    )
+                    if rstart.returncode == 0:
+                        ok("Rescue service started — the ops agent serves its own bot")
+                        info("Logs: journalctl -u kbots-rescue -f")
+                    else:
+                        err(f"Failed to start rescue service: {rstart.stderr.strip()}")
+                        info("Start manually: sudo systemctl enable --now kbots-rescue")
         else:
             err("Systemd installation failed:")
             if result.stderr.strip():
