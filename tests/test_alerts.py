@@ -1,6 +1,16 @@
 """AlertSender — bot-token resolution via the connector's account map."""
 
+import pytest
+
 from src.core.alerts import AlertSender
+
+
+@pytest.fixture(autouse=True)
+def _isolated_runtime_state(tmp_path, monkeypatch):
+    """channel_id consults runtime_state, which resolves its JSON via
+    KBOTS_OVERLAY at call time — on a live install the real alert_channel
+    flag beats every test's empty config. Point it at an empty overlay."""
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
 
 
 class _FakeVault:
