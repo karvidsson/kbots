@@ -280,6 +280,18 @@ async def run_preflight(config: dict, vault, storage_path: str) -> bool:
     failed = 0
     warnings = 0
 
+    # --- No config at all: name the fix, not just the symptoms ---
+    # Without this, a fresh clone died on "kbots: missing required key" and
+    # "Data directory missing" — both true, neither telling the user that the
+    # actual next step is the setup wizard.
+    if not any(config.values()):
+        logger.error(
+            "  ✗ config: no configuration found. If this is a fresh install, "
+            "run `uv run python setup.py` — or copy config/config.yaml.example "
+            "to config/config.yaml and edit it."
+        )
+        failed += 1
+
     # --- Config schema validation (missing required keys + wrong types) ---
     # Unknown-key warnings are emitted at DEBUG only — deployments legitimately
     # add custom sections; treating those as boot-time noise is wrong.

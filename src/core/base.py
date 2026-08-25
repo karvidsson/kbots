@@ -187,6 +187,26 @@ def harden_path(path, file_mode: int = 0o600, dir_mode: int = 0o700) -> None:
         logger.debug(f"harden_path({path}) failed: {e}")
 
 
+def write_private_file(path: Path, content: str, dir_mode: int = 0o700) -> None:
+    """Write a sensitive file so it is 0600 from its first byte on disk.
+
+    write_text() + chmod() leaves a window where the file sits at the umask
+    default (0644 on most hosts) with the secret already inside; opening with
+    an explicit 0600 mode closes it. The parent directory is created 0700 only
+    when it does not exist yet — an existing ~/.config keeps its mode.
+    """
+    path = Path(path)
+    if not path.parent.exists():
+        path.parent.mkdir(parents=True, mode=dir_mode)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, content.encode())
+    finally:
+        os.close(fd)
+    # O_CREAT's mode only applies to new files — repair a pre-existing one.
+    os.chmod(path, 0o600)
+
+
 def read_vault_key_file(key_file: Path) -> str:
     """Read the plaintext vault passphrase, enforcing owner-only permissions.
 
