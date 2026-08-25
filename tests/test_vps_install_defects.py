@@ -254,6 +254,7 @@ def test_overlay_is_detected_from_the_service_unit(tmp_path, monkeypatch):
     spec.loader.exec_module(vm)
 
     monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    vm.SYSTEM_UNIT_PATHS = ()   # the REAL host units would beat the fixture
     home = tmp_path / "home"
     (home / ".config/systemd/user").mkdir(parents=True)
     (home / ".config/systemd/user/kbots.service").write_text(
@@ -274,6 +275,7 @@ def test_overlay_is_detected_from_the_shell_profile_a_stale_shell_never_read(
     spec.loader.exec_module(vm)
 
     monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    vm.SYSTEM_UNIT_PATHS = ()   # the REAL host units would beat the fixture
     home = tmp_path / "home"
     home.mkdir()
     (home / ".bashrc").write_text(GUARDED_BASHRC + BLOCK)

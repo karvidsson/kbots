@@ -122,13 +122,22 @@ if ! "$SCRIPT_DIR/sync.sh" >/dev/null 2>&1 && ! uv sync >/dev/null 2>&1; then
 fi
 
 log "GATE: ruff + pytest on new code"
+# The gate runs in a THROWAWAY env (UV_PROJECT_ENVIRONMENT), never the live
+# .venv. `uv run` without --no-sync reconciles the env it targets against the
+# lockfile + requested extras — aimed at .venv, that silently UNINSTALLED the
+# 38 Layer 2/3 extras sync.sh had just put back, and the service then booted
+# with --no-sync into the pruned env. Core imports fine, so the health check
+# passed; every tool needing matplotlib/lxml/fpdf2/… broke with no signal.
+# (--no-sync alone is not an option: the gate needs dev extras the live .venv
+# deliberately lacks.)
+GATE_ENV="$OVERLAY/tmp/gate-venv"
 # `.` not a path list: ruff honours the excludes in pyproject.toml, so a new
 # top-level dir (extras/ was the one that slipped through) is linted the day it
 # lands instead of whenever someone remembers to extend this line.
-if ! uv run --extra dev ruff check .; then
+if ! UV_PROJECT_ENVIRONMENT="$GATE_ENV" uv run --extra dev ruff check .; then
     log "LINT FAILED — not deploying"; rollback; exit 1
 fi
-if ! uv run --extra dev pytest -q; then
+if ! UV_PROJECT_ENVIRONMENT="$GATE_ENV" uv run --extra dev pytest -q; then
     log "TESTS FAILED — not deploying"; rollback; exit 1
 fi
 

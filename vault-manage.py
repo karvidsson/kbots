@@ -259,6 +259,12 @@ def cmd_migrate_salt(v):
     print(f"  Vault re-encrypted with new key. Total secrets: {len(v.list_keys())}")
 
 
+# Module-level so tests can point detection away from the REAL host units:
+# on any live install these files exist and would beat every test fixture.
+SYSTEM_UNIT_PATHS = (Path("/etc/systemd/system/kbots.service"),
+                     Path("/etc/systemd/system/k-agents.service"))
+
+
 def detect_overlay() -> tuple[str, str] | None:
     """Find the overlay this host actually runs, and say where the answer came from.
 
@@ -278,8 +284,7 @@ def detect_overlay() -> tuple[str, str] | None:
         return env, "KBOTS_OVERLAY"
 
     # The service unit is authoritative: it is what the running engine reads.
-    for unit in (Path("/etc/systemd/system/kbots.service"),
-                 Path("/etc/systemd/system/k-agents.service"),
+    for unit in (*SYSTEM_UNIT_PATHS,
                  Path.home() / ".config/systemd/user/kbots.service"):
         try:
             m = re.search(r"^Environment=KBOTS_OVERLAY=(.+)$", unit.read_text(), re.M)
