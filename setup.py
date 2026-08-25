@@ -543,6 +543,7 @@ def step_overlay(state: dict):
             "# Secrets\n"
             "config/secrets.enc\n"
             "config/secrets.salt\n"
+            "config/secrets.kdf\n"
         )
 
     # Add kbots env vars to the shell profile so interactive tools
@@ -570,6 +571,13 @@ def step_overlay(state: dict):
 
     ok(f"Overlay: {overlay}")
     state["overlay"] = overlay
+    # Export into the wizard's own process too, not just the shell profile:
+    # later steps (scaffold_agent → agent_session_dirs) read KBOTS_OVERLAY at
+    # call time, and the profile export only reaches new shells. Without this,
+    # a first run generated agent sandbox rules pointing at /tmp instead of
+    # <overlay>/tmp — an install that only healed when setup was re-run from
+    # a fresh shell.
+    os.environ["KBOTS_OVERLAY"] = str(overlay)
 
 
 def step_hooks(state: dict):
@@ -730,6 +738,9 @@ def step_modules(state: dict):
         state["kbots_modules"] = ":".join(modules_paths)
         state["kbots_modules_root"] = str(modules_root)
         state["selected_modules"] = selected
+        # Same reasoning as KBOTS_OVERLAY in step_overlay: later steps in this
+        # process must see it, not just future shells.
+        os.environ["KBOTS_MODULES"] = state["kbots_modules"]
         print()
         for mod in selected:
             ok(f"Module: {mod}")
@@ -775,6 +786,10 @@ def step_vault(state: dict):
     if not vault_path.exists():
         _track_path(state, vault_path)
         _track_path(state, vault_path.with_suffix(".salt"))
+        # .kdf records the KDF iteration count. An orphan from an aborted run
+        # poisons the next vault: it would be read as authoritative for a
+        # vault created with different parameters.
+        _track_path(state, vault_path.with_suffix(".kdf"))
 
     if vault_path.exists():
         info("Existing vault found.")
@@ -1550,7 +1565,19 @@ def step_ops_instance(state: dict):
 
     print()
     ok(f"Ops instance configured — agent: {display_name}")
-    info("Service setup will be offered in a later step.")
+    if sys.platform == "darwin":
+        info("The ops agent runs inside the main service — nothing more to install.")
+    else:
+        # The wizard's systemd step installs only the MAIN unit; promising the
+        # rescue service "in a later step" left it configured and never served.
+        # Say what actually has to happen instead.
+        info("The rescue instance needs its own (unsandboxed) service unit,")
+        info("which the wizard does not install. After setup finishes:")
+        info(f"  sudo cp {ENGINE_ROOT}/config/kbots-rescue.service /etc/systemd/system/")
+        info("  sudo systemctl daemon-reload")
+        info("  sudo systemctl enable --now kbots-rescue.service")
+        info(f"Check the unit's paths first if the engine is not at /opt/kbots "
+             f"(yours: {ENGINE_ROOT}).")
 
 
 def step_extras(state: dict):

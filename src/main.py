@@ -78,6 +78,14 @@ def load_config(profile: str | None = None) -> dict:
         with open(main_file) as f:
             main_config = yaml.safe_load(f) or {}
         logger.info(f"Config loaded from {main_file}")
+    else:
+        # Falling through to {} used to be silent, so a fresh clone failed
+        # later with schema errors that never named the actual problem.
+        logger.warning(
+            "No config.yaml found in any config dir ("
+            + ", ".join(str(d) for d in config_dirs)
+            + ") — starting with an empty config."
+        )
 
     agents_file = _find_config_file(f"agents{suffix}.yaml", config_dirs)
     if not agents_file:
