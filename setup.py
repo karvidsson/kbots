@@ -11,6 +11,7 @@ import getpass
 import json
 import os
 import re
+import secrets as py_secrets
 import shutil
 import stat
 import subprocess
@@ -39,7 +40,7 @@ try:
         scaffold_agent,
         suggest_agent_name,
     )
-    from src.core.base import resolve_vault_key_file
+    from src.core.base import resolve_vault_key_file, write_private_file
     from src.vault.fernet import FernetVault
 except ImportError:
     print("kbots modules not found. Run: uv sync")
@@ -58,6 +59,10 @@ RESET = "\033[0m"
 
 
 TAGLINE = "one process · LLM-agnostic · trains itself"
+
+# Vault passphrases gate every stored credential; with the KDF alone a short
+# one is trivially brute-forceable if secrets.enc + .salt ever leak.
+MIN_PASSPHRASE_LEN = 12
 
 
 def banner(title: str = "kbots Setup Wizard"):
@@ -236,8 +241,14 @@ def _looks_like_discord_token(s: str) -> bool:
     )
 
 
-def validate_discord_token(token: str) -> dict | None:
-    """Validate a Discord bot token by calling the API. Returns bot info or None.
+def validate_discord_token(token: str) -> tuple[dict | None, str]:
+    """Validate a Discord bot token by calling the API.
+
+    Returns (bot_info, "") on success, (None, reason) on failure — where
+    reason is "invalid" for a rejected token and "network" when Discord could
+    not be reached. The two must stay distinguishable: an invalid token should
+    be re-entered, while a network failure is a legitimate reason to store the
+    token unverified (air-gapped installs).
 
     A User-Agent is required — Discord's API is fronted by Cloudflare, which
     blocks header-less requests with a 403 (error 1010) before the token is
@@ -252,9 +263,21 @@ def validate_discord_token(token: str) -> dict | None:
             },
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.URLError, urllib.error.HTTPError):
-        return None
+            return json.loads(resp.read().decode()), ""
+    except urllib.error.HTTPError:
+        return None, "invalid"
+    except urllib.error.URLError:
+        return None, "network"
+
+
+def ask_discord_token(prompt: str) -> str:
+    """Collect a bot token without echoing it.
+
+    Tokens grant full control of the bot account, and a bare input() leaves
+    them in terminal scrollback and session recordings — so entry is hidden,
+    always, rather than behind an opt-in.
+    """
+    return ask_secret(f"{prompt} (input hidden, Enter to skip)")
 
 
 # ==========================================================================
@@ -276,7 +299,14 @@ def step_dependencies(state: dict):
     if shutil.which("uv"):
         ok("uv")
     else:
-        info("uv not found — installing...")
+        # Ask first, like every other curl|sh in this step (pkgx, Claude CLI) —
+        # piping a remote script to a shell is a trust decision, not a detail.
+        info("uv not found. It will be installed by piping "
+             "https://astral.sh/uv/install.sh to sh.")
+        if not ask_yn("Install uv now?", default=True):
+            err("uv is required. Install it manually (https://docs.astral.sh/uv/) "
+                "and re-run setup.")
+            sys.exit(1)
         try:
             subprocess.run(
                 ["bash", "-c", "curl -LsSf https://astral.sh/uv/install.sh | sh"],
@@ -472,6 +502,16 @@ def step_overlay(state: dict):
     for d in ["config", "agents", "systemd", "tools", "skills",
               "tmp/media", "tmp/docs", "tmp/scratch"]:
         (overlay / d).mkdir(parents=True, exist_ok=True)
+
+    # config/ holds the vault; tmp/ holds agent scratch, fetched media and
+    # docs. Owner-only, so other local users can't list key names or read
+    # whatever agents drop there. chmod rather than mkdir(mode=...) so a
+    # pre-existing overlay gets tightened too.
+    for private in ("config", "tmp"):
+        try:
+            (overlay / private).chmod(0o700)
+        except OSError as e:
+            warn(f"Could not tighten permissions on {overlay / private}: {e}")
 
     # .gitignore
     gitignore = overlay / ".gitignore"
@@ -728,9 +768,7 @@ def step_vault(state: dict):
                 vault.unlock(passphrase)
                 ok(f"Vault unlocked ({len(vault.list_keys())} secrets)")
                 if ask_yn("Save passphrase to key file for auto-unlock?"):
-                    key_file.parent.mkdir(parents=True, exist_ok=True)
-                    key_file.write_text(passphrase + "\n")
-                    key_file.chmod(0o600)
+                    write_private_file(key_file, passphrase + "\n")
                     ok(f"Key file saved to {key_file}")
                 state["vault"] = vault
                 state["vault_existed"] = True
@@ -743,9 +781,17 @@ def step_vault(state: dict):
 
     else:
         while True:
-            passphrase = ask_secret("Create a vault passphrase")
-            if len(passphrase) < 4:
-                err("Passphrase must be at least 4 characters.")
+            passphrase = ask_secret(
+                "Create a vault passphrase (Enter to generate one)")
+            if not passphrase:
+                passphrase = py_secrets.token_urlsafe(24)
+                print(f"  Generated passphrase: {BOLD}{passphrase}{RESET}")
+                info("Shown only once — store it in a password manager. It is the")
+                info("only way to unlock the vault if the key file is ever lost.")
+                break
+            if len(passphrase) < MIN_PASSPHRASE_LEN:
+                err(f"Passphrase must be at least {MIN_PASSPHRASE_LEN} characters "
+                    f"— or press Enter to generate a strong one.")
                 continue
             confirm = ask_secret("Confirm passphrase")
             if passphrase != confirm:
@@ -759,10 +805,25 @@ def step_vault(state: dict):
         vault.delete("_setup")
         ok("Vault created")
 
-        key_file.parent.mkdir(parents=True, exist_ok=True)
-        key_file.write_text(passphrase + "\n")
-        key_file.chmod(0o600)
-        ok(f"Key file saved to {key_file}")
+        # The key file trades encryption-at-rest for unattended start: the
+        # service reads the passphrase from it at boot, and so can anyone else
+        # who can read the file. That trade is fine for most installs, but it
+        # has to be a choice the user saw — SECURITY.md calls any unencrypted
+        # secret on disk a vulnerability, and this is the one sanctioned
+        # exception.
+        print()
+        info("The service needs this passphrase at every start. Saving it to a")
+        info(f"key file ({key_file}, owner-only 0600) lets the service start")
+        info("unattended after a reboot — but anyone who can read that file can")
+        info("unlock the vault.")
+        if ask_yn("Save passphrase to the key file for unattended start?",
+                  default=True):
+            write_private_file(key_file, passphrase + "\n")
+            ok(f"Key file saved to {key_file}")
+        else:
+            warn("No key file — the service cannot auto-start after a reboot.")
+            warn("Start it in a terminal (it will prompt), or create the key "
+                 "file later by re-running setup.")
 
         state["vault"] = vault
         state["vault_existed"] = False
@@ -779,38 +840,29 @@ def step_discord(state: dict):
 
     vault: FernetVault = state["vault"]
 
-    # First prompt does double duty: a token pasted here is used directly
-    # (common mistake is pasting the token at a yes/no gate), 'y' opens a
-    # hidden token prompt, and 'n'/blank skips Discord.
-    first = ask("Paste your bot token now, or type 'y' to enter it hidden "
-                "('n' to skip)")
-    if _looks_like_discord_token(first):
-        token = first
-    elif first.lower() in ("y", "yes"):
-        token = ask_secret("Bot token")
-    else:
-        warn("Skipped — add a token later via vault-manage.py, then restart.")
-        state["discord_skip"] = True
-        return
-
-    # Token
+    token = ask_discord_token("Paste your bot token")
     while True:
         if not token:
-            token = ask_secret("Bot token")
-        if not token:
-            warn("Skipped Discord setup.")
+            warn("Skipped — add a token later via vault-manage.py, then restart.")
             state["discord_skip"] = True
             return
 
         info("Validating token...")
-        bot_info = validate_discord_token(token)
+        bot_info, reason = validate_discord_token(token)
         if bot_info:
             ok(f"Bot verified: {bot_info.get('username', '?')}#{bot_info.get('discriminator', '0')}")
             break
-        else:
-            if ask_yn("Token validation failed. Use it anyway?", default=False):
+        if reason == "network":
+            # Air-gapped or offline installs can't reach Discord — storing the
+            # token unverified is a legitimate choice there. A rejected token
+            # is not: keeping it just moves the failure to first boot.
+            if ask_yn("Couldn't reach Discord to validate. Store the token "
+                      "unverified?", default=False):
                 break
-            continue
+        else:
+            err("Discord rejected that token — re-copy it from the Developer "
+                "Portal (Bot → Reset Token if it was regenerated).")
+        token = ask_discord_token("Paste your bot token")
 
     vault.set("discord-token", token)
     ok("Token stored in vault")
@@ -969,16 +1021,16 @@ def step_hitl(state: dict):
         }
         return
 
-    channel_id = ask("Discord channel ID for approvals (ops/alerts channel)")
+    # ask_id, not ask: a typo here would silently point the approval gate at a
+    # nonexistent channel (fail-closed, so every gated action would hang).
+    channel_id = ask_id("Discord channel ID for approvals (ops/alerts channel)")
     approvers = [state.get("owner_discord_id", "")]
     approvers = [a for a in approvers if a]
 
-    more = ask_yn("Add more approvers?", default=False)
-    while more:
-        uid = ask("Discord user ID")
-        if uid:
-            approvers.append(uid)
-        more = ask_yn("Add another?", default=False)
+    if ask_yn("Add more approvers?", default=False):
+        for uid in ask_ids("approver user"):
+            if uid not in approvers:
+                approvers.append(uid)
 
     print()
     info("Default gated tools: send_email, install_mcp, create_agent, create_tool, "
@@ -1310,16 +1362,22 @@ def step_ops_instance(state: dict):
     print()
     info("The ops agent needs its own Discord bot account.")
     bot_name = ask("Bot account name", agent_name)
-    token = ask_secret(f"Discord bot token for '{bot_name}' (empty to skip)")
+    token = ask_discord_token(f"Discord bot token for '{bot_name}'")
 
-    if token:
+    while token:
         info("Validating token...")
-        bot_info = validate_discord_token(token)
+        bot_info, reason = validate_discord_token(token)
         if bot_info:
             ok(f"Bot verified: {bot_info.get('username', '?')}")
+            break
+        if reason == "network":
+            if ask_yn("Couldn't reach Discord to validate. Store the token "
+                      "unverified?", default=False):
+                break
         else:
-            if not ask_yn("Validation failed. Store anyway?", default=False):
-                token = None
+            err("Discord rejected that token — re-copy it from the Developer "
+                "Portal.")
+        token = ask_discord_token(f"Discord bot token for '{bot_name}'")
 
     if token:
         vault_key = f"discord-{bot_name}"
@@ -1844,20 +1902,45 @@ def _add_bot(state: dict):
     overlay: Path = state["overlay"]
     vault: FernetVault = state["vault"]
     bot_name = ask("Bot account name (internal)")
-    token = ask_secret("Bot token")
+
+    # Same validation loop as the main bot — a token stored unchecked here
+    # would only surface as a connect failure at first boot.
+    token = ask_discord_token("Bot token")
+    while token:
+        info("Validating token...")
+        bot_info, reason = validate_discord_token(token)
+        if bot_info:
+            ok(f"Bot verified: {bot_info.get('username', '?')}")
+            break
+        if reason == "network":
+            if ask_yn("Couldn't reach Discord to validate. Store the token "
+                      "unverified?", default=False):
+                break
+        else:
+            err("Discord rejected that token — re-copy it from the Developer "
+                "Portal.")
+        token = ask_discord_token("Bot token")
+    if not token:
+        warn("Skipped — no token entered.")
+        return
 
     vault_key = f"discord-{bot_name}"
     vault.set(vault_key, token)
     ok(f"Token stored as '{vault_key}'")
 
-    # Add to config.yaml
+    # Add to config.yaml. setdefault, not raw indexing: a config written by an
+    # earlier version (or hand-edited) may lack the intermediate keys, and a
+    # KeyError here used to abort the wizard and roll back the whole run.
     config_path = overlay / "config" / "config.yaml"
     with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+        cfg = yaml.safe_load(f) or {}
 
-    cfg["connectors"]["discord"]["accounts"][bot_name] = {"token_key": vault_key}
+    discord_cfg = cfg.setdefault("connectors", {}).setdefault("discord", {})
+    discord_cfg.setdefault("accounts", {})[bot_name] = {"token_key": vault_key}
     config_path.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
     ok(f"Bot '{bot_name}' added to config")
+    info("Note: the bot serves nothing until an agent routes to it "
+         "(agents.yaml → routing.discord.account).")
 
 
 # ==========================================================================
@@ -1907,33 +1990,38 @@ def _ask_routing(bot_account: str, default_mentions: bool = True) -> dict:
     return routing
 
 
-def _write_yaml(path: Path, data: dict, state: dict):
-    if path.exists() and state.get("vault_existed"):
-        if not ask_yn(f"  {_display(path)} exists. Overwrite?", default=False):
-            warn(f"Skipped {_display(path)}")
-            return
+def _confirm_overwrite(path: Path) -> bool:
+    """Ask before clobbering an existing config file.
+
+    Keyed on the file's own existence — this used to be gated on whether the
+    VAULT pre-existed, so re-running the wizard after the vault was deleted or
+    moved silently overwrote config.yaml and team.json.
+    """
+    if not path.exists():
+        return True
+    return ask_yn(f"  {_display(path)} exists. Overwrite?", default=False)
+
+
+def _write_config(path: Path, text: str):
+    """config.yaml and team.json hold guild/admin IDs and real names — written
+    owner-only, same as the vault files beside them."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.dump(data, default_flow_style=False, sort_keys=False))
+    write_private_file(path, text)
+
+
+def _write_yaml(path: Path, data: dict, state: dict):
+    if not _confirm_overwrite(path):
+        warn(f"Skipped {_display(path)}")
+        return
+    _write_config(path, yaml.dump(data, default_flow_style=False, sort_keys=False))
     ok(f"Created {_display(path)}")
 
 
 def _write_json(path: Path, data: dict, state: dict):
-    if path.exists() and state.get("vault_existed"):
-        if not ask_yn(f"  {_display(path)} exists. Overwrite?", default=False):
-            warn(f"Skipped {_display(path)}")
-            return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n")
-    ok(f"Created {_display(path)}")
-
-
-def _write_file(path: Path, content: str, state: dict):
-    if path.exists() and state.get("vault_existed"):
-        if not ask_yn(f"  {_display(path)} exists. Overwrite?", default=False):
-            warn(f"Skipped {_display(path)}")
-            return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
+    if not _confirm_overwrite(path):
+        warn(f"Skipped {_display(path)}")
+        return
+    _write_config(path, json.dumps(data, indent=2) + "\n")
     ok(f"Created {_display(path)}")
 
 

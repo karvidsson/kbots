@@ -30,7 +30,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.core.base import resolve_vault_key_file  # noqa: E402
+from src.core.base import resolve_vault_key_file, write_private_file  # noqa: E402
 
 BOLD, DIM, GREEN, YELLOW, RED, RESET = (
     "\033[1m", "\033[2m", "\033[32m", "\033[33m", "\033[31m", "\033[0m")
@@ -181,9 +181,9 @@ def cmd_import(args):
         key_src = tmp / "vault-key"
         if key_src.exists():
             key_dst = resolve_vault_key_file()
-            key_dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(key_src, key_dst)
-            key_dst.chmod(0o600)
+            # write_private_file, not copy2+chmod: the copy would sit at the
+            # tarball's preserved mode until the chmod lands.
+            write_private_file(key_dst, key_src.read_text())
             ok(f"Vault key restored to {key_dst}")
         else:
             warn("No vault key in bundle — you'll be prompted for your vault "
