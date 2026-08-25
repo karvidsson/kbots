@@ -36,7 +36,7 @@ SystemCallFilter=~@mount @reboot @swap @debug @obsolete @cpu-emulation @raw-io
 CapabilityBoundingSet=
 LockPersonality=true
 RemoveIPC=true
-ReadWritePaths=/opt/kbots/data /opt/kbots/agents /opt/kbots/config /tmp %h/.cache %h/.claude
+ReadWritePaths=/opt/kbots/data /opt/kbots/agents /opt/kbots/config /tmp %h/.cache %h/.claude %h
 ReadOnlyPaths=/opt/kbots
 
 # Logging
