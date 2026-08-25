@@ -514,7 +514,6 @@ class DiscordConnector(Connector):
                 return token
 
         # Fallback to environment (for development)
-        import os
         return os.environ.get(key)
 
     def _find_bot_for_agent(self, agent_id: str) -> str | None:
@@ -1882,40 +1881,13 @@ class DiscordBot:
         """Register admin-only commands."""
         admin_group = app_commands.Group(name="admin", description="Admin commands")
 
-        @admin_group.command(name="restart", description="Restart an agent session")
-        @app_commands.describe(agent="Agent to restart (default: this channel's agent)")
-        async def cmd_restart(interaction: discord.Interaction, agent: str | None = None):
-            if not self._is_admin(interaction.user.id):
-                await interaction.response.send_message("Not authorized.", ephemeral=True)
-                return
-
-            agent_id = agent or self.connector.get_agent_for_channel(
-                str(interaction.channel_id), self.account_name
-            )
-            if not agent_id:
-                await interaction.response.send_message("No agent found.", ephemeral=True)
-                return
-
-            # TODO: actually restart the session
-            await interaction.response.send_message(
-                f"Restarting agent `{agent_id}`... *(not yet implemented)*", ephemeral=True
-            )
-
-        @admin_group.command(name="pause", description="Pause an agent")
-        @app_commands.describe(agent="Agent to pause")
-        async def cmd_pause(interaction: discord.Interaction, agent: str | None = None):
-            if not self._is_admin(interaction.user.id):
-                await interaction.response.send_message("Not authorized.", ephemeral=True)
-                return
-            await interaction.response.send_message("Pause not yet implemented.", ephemeral=True)
-
-        @admin_group.command(name="resume", description="Resume a paused agent")
-        @app_commands.describe(agent="Agent to resume")
-        async def cmd_resume(interaction: discord.Interaction, agent: str | None = None):
-            if not self._is_admin(interaction.user.id):
-                await interaction.response.send_message("Not authorized.", ephemeral=True)
-                return
-            await interaction.response.send_message("Resume not yet implemented.", ephemeral=True)
+        # /admin restart, /admin pause and /admin resume were registered,
+        # appeared in /help, and answered "not yet implemented". /admin restart
+        # was the worst of the three: it resolved the agent, validated it, and
+        # then did nothing, which reads exactly like success. A command that
+        # exists and does nothing is worse than one that does not exist,
+        # because the user stops looking for another way to do the thing.
+        # Removed rather than stubbed. Bring them back with an implementation.
 
         @admin_group.command(name="sync", description="Re-sync slash commands with Discord")
         async def cmd_sync(interaction: discord.Interaction):
@@ -2124,19 +2096,16 @@ class DiscordBot:
             if not self._is_admin(interaction.user.id):
                 await interaction.response.send_message("Not authorized.", ephemeral=True)
                 return
+            # Was `sudo systemctl restart`, which the unit's own
+            # NoNewPrivileges=true blocks outright, reported as success because
+            # the Popen was never polled. Exiting is privilege-free and works
+            # on both supervisors. See src/core/restart.py.
+            from src.core import restart as restart_mod
+
             await interaction.response.send_message(
-                "Restarting kbots... back in ~3 seconds.", ephemeral=True
-            )
-            import subprocess
-            import sys
-            if sys.platform == "darwin":
-                label = os.environ.get("KBOTS_LAUNCHD_LABEL", "com.kbots.agent")
-                subprocess.Popen(
-                    ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{label}"]
-                )
-            else:
-                service = os.environ.get("KBOTS_SERVICE_NAME", "kbots")
-                subprocess.Popen(["sudo", "systemctl", "restart", service])
+                restart_mod.restart_message(), ephemeral=True)
+            if restart_mod.can_restart():
+                asyncio.create_task(restart_mod.restart_self())
 
         @admin_group.command(
             name="update",
@@ -2153,7 +2122,26 @@ class DiscordBot:
             import asyncio
 
             from src.core.base import PROJECT_ROOT
+            from src.core.restart import engine_root_writable
+
             script = PROJECT_ROOT / "scripts" / "update.sh"
+
+            # update.sh starts with `git pull` inside the engine root, and a
+            # hardened unit lists that root under ReadOnlyPaths, so the pull can
+            # never succeed from inside the service. Refusing up front with the
+            # command that DOES work beats a 600s run that ends in a git error
+            # about a read-only filesystem, which reads like a broken repo.
+            if not engine_root_writable():
+                await interaction.followup.send(
+                    f"Can't self-update: `{PROJECT_ROOT}` is read-only inside this "
+                    f"service's sandbox (ProtectSystem/ReadOnlyPaths), so `git pull` "
+                    f"would fail. That is deliberate, not a misconfiguration.\n"
+                    f"Run this from a shell on the host instead:\n"
+                    f"```\ncd {PROJECT_ROOT} && scripts/self-deploy.sh\n```\n"
+                    f"It pulls, syncs dependencies, runs the gate and restarts, "
+                    f"with rollback if anything goes red.",
+                    ephemeral=True)
+                return
             try:
                 proc = await asyncio.create_subprocess_exec(
                     str(script),
@@ -2373,7 +2361,6 @@ class DiscordBot:
         Uses subprocess_exec with shlex.split to avoid shell injection.
         """
         import asyncio
-        import os
         import shlex
         kbots_home = os.environ.get("KBOTS_HOME", "/opt/kbots")
         # Build the child env from an explicit allowlist rather than inheriting
@@ -2478,22 +2465,25 @@ class DiscordBot:
 
         def _make_skill_callback(_connector, _skill_name, _kwarg_names, _account_name, _command=None):
             async def _skill_cmd(interaction: discord.Interaction, **kwargs):
+                # The admin gate comes BEFORE the deferral. Deferring first
+                # posts a public "thinking" bubble in-channel and only then
+                # denies, which tells the whole channel that someone tried and
+                # was refused.
+                if _command and not self._is_admin(interaction.user.id):
+                    await interaction.response.send_message(
+                        "This command runs a host script and is admin-only.",
+                        ephemeral=True,
+                    )
+                    logger.warning(
+                        f"Skill {_skill_name}: non-admin {interaction.user.id} blocked "
+                        "from direct-command path")
+                    return
                 await interaction.response.defer()
                 if _command:
                     # Direct-command skills execute a host script, bypassing the
                     # LLM, access control, HITL and audit — so gate them to admins
                     # (mirrors every /admin subcommand). LLM-path skills stay open:
                     # they emit an IncomingMessage and go through access control.
-                    if not self._is_admin(interaction.user.id):
-                        await interaction.followup.send(
-                            "This command runs a host script and is admin-only.",
-                            ephemeral=True,
-                        )
-                        logger.warning(
-                            f"Skill {_skill_name}: non-admin {interaction.user.id} blocked "
-                            "from direct-command path"
-                        )
-                        return
                     logger.debug(f"Skill {_skill_name}: direct command path → {_command}")
                     await DiscordBot._run_direct_command(interaction, _command)
                     return
