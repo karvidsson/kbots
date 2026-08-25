@@ -75,22 +75,30 @@ class DiscordConnector(Connector):
         self._full_config: dict = {}
         self._data_dir: str = ""
         self._on_guild_setup = None
+        self._setup_profile: str = ""
         # Long replies are cut at a structural boundary; the rest arrives on a
         # reaction. Built here with no data dir, rebuilt in set_setup_context
         # once the engine says where state lives.
         self._shortener = ReplyShortener(config.get("reply"), store_dir=".")
 
-    def set_setup_context(self, config: dict, data_dir: str, on_guild_setup=None) -> None:
+    def set_setup_context(self, config: dict, data_dir: str, on_guild_setup=None,
+                          profile: str = "") -> None:
         """Give the connector what it needs to provision a newly joined server.
 
         on_guild_setup(agent_id, guild_id, guild_name, outcomes) is awaited after
         provisioning so the engine can hand that agent a turn. Optional: the
         channels are created either way, because they are deterministic and must
         not depend on an LLM turn succeeding.
+
+        profile: the engine profile this process runs under ("" for the main
+        instance). A secondary instance (e.g. the rescue profile) sees only its
+        OWN agent list, in which its single agent looks like the setup account
+        — so provisioning is gated on the main instance here, not on config.
         """
         self._full_config = config or {}
         self._data_dir = str(data_dir or "")
         self._on_guild_setup = on_guild_setup
+        self._setup_profile = str(profile or "")
         # `defaults.reply` is engine config, not connector config, so the
         # shortener can only be built properly once the full config arrives.
         reply_cfg = (self._full_config.get("defaults") or {}).get("reply") or {}
@@ -692,6 +700,17 @@ class DiscordBot:
                         f"is disabled (server_setup.on_guild_join)")
             return
 
+        # A secondary instance (rescue profile) loads only its own agent list,
+        # in which its single agent elects itself setup account — that is how
+        # a dual-instance install got every channel created twice. Only the
+        # main instance provisions.
+        if getattr(self.connector, "_setup_profile", ""):
+            logger.info(f"[{self.account_name}] joined '{guild_name}' — secondary "
+                        f"instance (profile "
+                        f"'{self.connector._setup_profile}'), the main instance "
+                        f"owns server setup")
+            return
+
         configs = getattr(self.connector, "_agent_configs", {}) or {}
         if not server_setup.is_setup_account(configs, self.account_name):
             logger.info(f"[{self.account_name}] joined '{guild_name}' — another "
@@ -704,6 +723,13 @@ class DiscordBot:
                         f"({guild_id}) — already provisioned, doing nothing")
             return
 
+        # The done-marker lands only AFTER provisioning; the claim is what
+        # stops two near-simultaneous joins from racing to create duplicates.
+        if not server_setup.claim_guild_setup(data_dir, guild_id, self.account_name):
+            logger.info(f"[{self.account_name}] joined '{guild_name}' "
+                        f"({guild_id}) — provisioning already claimed, doing nothing")
+            return
+
         logger.info(f"[{self.account_name}] joined '{guild_name}' ({guild_id}) "
                     f"— provisioning kbots channels")
         try:
@@ -712,6 +738,9 @@ class DiscordBot:
             server_setup.wire(outcomes)
         except Exception as e:
             logger.error(f"Server setup failed for guild {guild_id}: {e}", exc_info=True)
+            # Release so a re-invite (or the other instance) can retry —
+            # provisioning is adopt-before-create, so a retry is safe.
+            server_setup.release_guild_claim(data_dir, guild_id)
             return
 
         for out in outcomes:
