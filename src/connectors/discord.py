@@ -578,6 +578,10 @@ class DiscordBot:
         self.connector = connector
         self.admin_users = admin_users
 
+        # Set in on_ready: how a mention of THIS bot renders for its agent.
+        self._self_user_id: int | None = None
+        self._self_mention_name: str = ""
+
         # Bot-to-bot loop detection: bot_user_id -> [timestamps]
         self._bot_loop_hits: dict[int, list[float]] = {}
         # bot_user_id -> monotonic time until which the pair is hard-muted
@@ -782,6 +786,11 @@ class DiscordBot:
                 agent_id = agent_for_account(configs, "discord", self.account_name)
                 name = (configured_name(configs, agent_id) if agent_id
                         else self.client.user.name)  # an account no agent claims
+                # Cache for incoming self-mention rendering (before the roster
+                # write, which may fail): _render_mentions must use this name,
+                # not the Discord-side one — see the comment there.
+                self._self_user_id = self.client.user.id
+                self._self_mention_name = name
                 record_bot_identity(name, str(self.client.user.id))
         except Exception as e:
             logger.debug(f"roster identity sync failed: {e}")
@@ -996,8 +1005,19 @@ class DiscordBot:
         Mentions of users outside the resolved lists stay as raw markup.
         """
         content = message.content
+        self_id = getattr(self, "_self_user_id", None)
+        self_name = getattr(self, "_self_mention_name", "")
         for user in message.mentions:
-            name = getattr(user, "display_name", None) or user.name
+            # The bot's OWN mention renders as the agent's configured name,
+            # not the Discord-side one. The account's username can differ from
+            # the agent's name (a fresh install reusing an existing bot app),
+            # and an agent whose AGENTS.md calls it one thing, reading mail
+            # addressed to another, concludes the message is for someone else
+            # and stays silent — with no error anywhere.
+            if self_id is not None and user.id == self_id and self_name:
+                name = self_name
+            else:
+                name = getattr(user, "display_name", None) or user.name
             for pattern in (f"<@{user.id}>", f"<@!{user.id}>"):
                 content = content.replace(pattern, f"@{name}")
         for role in message.role_mentions:
