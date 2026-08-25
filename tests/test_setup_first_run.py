@@ -54,6 +54,16 @@ def test_step_overlay_exports_env_into_own_process(tmp_path, home, feed, monkeyp
     assert os.environ["KBOTS_OVERLAY"] == str(overlay)
 
 
+def test_overlay_creates_every_dir_agents_are_granted(tmp_path, home, feed, monkeypatch):
+    """agent_session_dirs grants only directories that exist. codex/ was
+    missing from step_overlay's list, so every agent scaffolded during a
+    first run silently lost the shared-documents grant."""
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    overlay, _ = _run_step_overlay(tmp_path, feed)
+    for d in ("codex", "config", "agents", "tools", "skills", "tmp"):
+        assert (overlay / d).is_dir(), d
+
+
 def test_overlay_gitignore_covers_all_vault_files(tmp_path, home, feed, monkeypatch):
     monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
     overlay, _ = _run_step_overlay(tmp_path, feed)

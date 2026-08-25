@@ -574,7 +574,11 @@ def step_overlay(state: dict):
 
     # Create directory structure. tools/ and skills/ exist upfront so the
     # hot-reload watcher registers them at boot (create_tool/create_skill).
-    for d in ["config", "agents", "systemd", "tools", "skills",
+    # codex/ must exist BEFORE any agent is scaffolded: agent_session_dirs
+    # grants only directories that exist, so a missing codex meant every
+    # agent's generated settings silently omitted the shared-documents dir
+    # ("Agent workspace directory does not exist, not granting it").
+    for d in ["config", "agents", "systemd", "tools", "skills", "codex",
               "tmp/media", "tmp/docs", "tmp/scratch"]:
         (overlay / d).mkdir(parents=True, exist_ok=True)
 
