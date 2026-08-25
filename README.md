@@ -91,6 +91,8 @@ Prefer to do it by hand? Same steps:
    - Right-click **yourself** → Copy User ID (makes you the owner/admin)
    - Right-click the channel you want approval prompts in → Copy Channel ID
 
+Full reference — every permission and why, install links, fixing a bot invited with Administrator, server auto-setup: **[docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md)**.
+
 ### Step 2 — clone and launch the wizard
 
 ```bash
@@ -707,6 +709,7 @@ No sandbox for in-process tool execution (validation is a filter, not a boundary
 |----------|-------------|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design and operations, end to end |
 | [docs/PERMISSIONS.md](docs/PERMISSIONS.md) | Permissions & rights — per-platform setup (Linux/macOS/WSL2), failure catalog, runtime permission watch |
+| [docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md) | Discord bot setup — creating applications, the minimal permission set, install links, the Administrator trap |
 | [SCRIPTS.md](SCRIPTS.md) | Every script and what it's for |
 | [docs/TRAINING.md](docs/TRAINING.md) | Collect agent turns and fine-tune a local model (nanoGPT / MLX-LM / hosted / DPO-KTO) |
 | [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md) | Run agents on local models (Ollama / LM Studio) + the quality-first tier router |
