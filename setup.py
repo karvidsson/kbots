@@ -80,7 +80,16 @@ def banner(title: str = "kbots Setup Wizard"):
     print(f"\n{BOLD}{CYAN}{top}\n{body}\n{bottom}{RESET}\n")
 
 
+_PROGRESS = {"current": 0, "total": 0}
+
+
 def header(text: str):
+    # While main() drives the step list, replace each step's hardcoded
+    # "Step N:" prefix with a live "Step k/total:" — the user sees how far
+    # along they are, and the numbering can't drift from the list again.
+    m = re.match(r"Step \d+[a-z]?: (.*)", text)
+    if m and _PROGRESS["total"]:
+        text = f"Step {_PROGRESS['current']}/{_PROGRESS['total']}: {m.group(1)}"
     print(f"\n{BOLD}{CYAN}── {text} ──{RESET}\n")
 
 
@@ -730,6 +739,25 @@ def step_modules(state: dict):
         ok("No extension modules selected (core tools only)")
 
 
+def _offer_kdf_upgrade(vault: FernetVault, passphrase: str) -> None:
+    """Offer to rekey a vault still on legacy KDF parameters.
+
+    Without this, a vault created before the 600k-iteration default stayed at
+    100k (and possibly the shared legacy salt) through every setup re-run —
+    the wizard early-returns on a working key file, so there was no moment the
+    upgrade could ever happen.
+    """
+    if vault.kdf_current():
+        return
+    info("This vault still uses legacy key-derivation parameters (weaker "
+         "against brute force if the files ever leak).")
+    if ask_yn("Upgrade it now? (re-encrypts in place, same passphrase)",
+              default=True):
+        changed = vault.rekey(passphrase)
+        for what, detail in changed.items():
+            ok(f"Vault {what}: {detail}")
+
+
 def step_vault(state: dict):
     header("Step 6: Vault Setup")
     info("The vault encrypts your API tokens and secrets at rest.")
@@ -756,6 +784,7 @@ def step_vault(state: dict):
                 passphrase = key_file.read_text().strip()
                 vault.unlock(passphrase)
                 ok(f"Vault unlocked ({len(vault.list_keys())} secrets)")
+                _offer_kdf_upgrade(vault, passphrase)
                 state["vault"] = vault
                 state["vault_existed"] = True
                 return
@@ -767,6 +796,7 @@ def step_vault(state: dict):
             try:
                 vault.unlock(passphrase)
                 ok(f"Vault unlocked ({len(vault.list_keys())} secrets)")
+                _offer_kdf_upgrade(vault, passphrase)
                 if ask_yn("Save passphrase to key file for auto-unlock?"):
                     write_private_file(key_file, passphrase + "\n")
                     ok(f"Key file saved to {key_file}")
@@ -840,7 +870,16 @@ def step_discord(state: dict):
 
     vault: FernetVault = state["vault"]
 
-    token = ask_discord_token("Paste your bot token")
+    # A re-run against an existing vault shouldn't force a re-paste — the
+    # token is already stored, and hunting it down again is the most annoying
+    # part of a second pass through the wizard.
+    token = ""
+    if state.get("vault_existed") and vault.get("discord-token"):
+        if ask_yn("A Discord bot token is already in the vault. Keep it?",
+                  default=True):
+            token = vault.get("discord-token")
+    if not token:
+        token = ask_discord_token("Paste your bot token")
     while True:
         if not token:
             warn("Skipped — add a token later via vault-manage.py, then restart.")
@@ -1202,6 +1241,62 @@ def step_training(state: dict):
         info("Skipped — enable later: kbots.training_collection in config.yaml")
 
     state["training_collection"] = training
+
+
+# Optional dependency groups from pyproject.toml that a deployment can enable.
+# sync.sh reads <overlay>/extras and passes each name as `uv sync --extra` on
+# every sync, so a choice made here survives updates.
+_PY_EXTRAS = [
+    ("embeddings", "semantic memory recall (local embeddings) — recommended"),
+    ("data", "data-analysis stack (pandas, matplotlib, scipy, scikit-learn)"),
+    ("reports", "PDF / report generation (fpdf2, markdown)"),
+    ("search", "Tavily web search tool"),
+    ("api", "HTTP API + webhook server (FastAPI)"),
+    ("design", "PowerPoint generation (python-pptx)"),
+    ("graph", "graph memory backend"),
+    ("stagehand", "AI-driven browser automation"),
+]
+
+
+def step_pyextras(state: dict):
+    header("Step 13: Optional Features")
+    overlay: Path = state["overlay"]
+    extras_file = overlay / "extras"
+
+    current: list[str] = []
+    if extras_file.exists():
+        current = extras_file.read_text().replace(",", " ").split()
+
+    info("Optional feature sets (Python extras). The final dependency sync in")
+    info("this run installs them, and every later sync keeps them installed.")
+    print()
+    for i, (name, desc) in enumerate(_PY_EXTRAS, 1):
+        mark = f"{GREEN}✓{RESET}" if name in current else " "
+        print(f"    [{i}] {mark} {name} — {desc}")
+    print()
+    info("Enter numbers (comma-separated), 'all', or blank to keep as is.")
+    choice = ask("Extras", "")
+
+    if choice:
+        if choice.lower() == "all":
+            selected = [n for n, _ in _PY_EXTRAS]
+        else:
+            selected = []
+            for c in choice.split(","):
+                try:
+                    i = int(c.strip()) - 1
+                    if 0 <= i < len(_PY_EXTRAS):
+                        selected.append(_PY_EXTRAS[i][0])
+                except ValueError:
+                    pass
+        extras_file.write_text("\n".join(selected) + ("\n" if selected else ""))
+        ok(f"Extras: {' '.join(selected) or 'none'} (saved to {_display(extras_file, overlay)})")
+    else:
+        ok(f"Extras unchanged: {' '.join(current) or 'none'}")
+
+    info("Vendor integrations (google, trello, notion, github, …) are separate —")
+    info("they live in extras/ in the engine repo and install by copying into")
+    info("the overlay. See extras/README.md.")
 
 
 def step_generate(state: dict):
@@ -2217,6 +2312,7 @@ def main():
         step_compression,
         step_local_models,
         step_training,
+        step_pyextras,
         step_generate,
         step_ops_instance,
         step_extras,
@@ -2226,11 +2322,27 @@ def main():
         step_summary,
     ]
 
+    _PROGRESS["total"] = len(steps)
+
     try:
         for step in steps:
+            _PROGRESS["current"] += 1
             step(state)
     except KeyboardInterrupt:
         print(f"\n\n  {YELLOW}Setup interrupted.{RESET}")
+        # An abort late in the run used to cost every answer given so far —
+        # rollback was the only option. Keeping is safe: the wizard detects
+        # existing files on a re-run (vault unlocks from the key file, configs
+        # prompt before overwrite), so continuing is mostly pressing Enter.
+        if sys.stdin.isatty() and (state.get("_undo") or state.get("_created_paths")):
+            info("Keep what's been set up so far and re-run setup later to "
+                 "continue — or roll everything back now.")
+            try:
+                if ask_yn("Keep progress? (No = roll back)", default=True):
+                    ok("Kept. Continue any time with: uv run python setup.py")
+                    sys.exit(130)
+            except (KeyboardInterrupt, EOFError):
+                print()
         _rollback(state)
         sys.exit(130)
     except Exception as e:
