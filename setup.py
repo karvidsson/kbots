@@ -289,6 +289,72 @@ def ask_discord_token(prompt: str) -> str:
     return ask_secret(f"{prompt} (input hidden, Enter to skip)")
 
 
+# Discord permission bits for the invite URL — the minimal set kbots needs
+# (README → Quickstart Step 1). Administrator is deliberately absent: it
+# would hand any leaked token or prompt-injected agent action full control
+# of the server. Manage Channels goes to the setup account alone, so server
+# auto-setup can create the fleet channels.
+_INVITE_PERMS = (
+    (1 << 6)     # Add Reactions — HITL approval cards, reply "show more"
+    | (1 << 10)  # View Channels
+    | (1 << 11)  # Send Messages
+    | (1 << 14)  # Embed Links
+    | (1 << 15)  # Attach Files
+    | (1 << 16)  # Read Message History
+    | (1 << 26)  # Change Nickname — identity boot sets the agent's own nick
+)
+_PERM_MANAGE_CHANNELS = 1 << 4
+
+
+def invite_url(app_id: str, manage_channels: bool = False) -> str:
+    """The OAuth2 install link for a bot application."""
+    perms = _INVITE_PERMS | (_PERM_MANAGE_CHANNELS if manage_channels else 0)
+    return ("https://discord.com/oauth2/authorize"
+            f"?client_id={app_id}&scope=bot%20applications.commands"
+            f"&permissions={perms}")
+
+
+def _application_id(token: str, bot_info: dict | None) -> str:
+    """The application (client) id an invite URL needs.
+
+    /oauth2/applications/@me is authoritative; the bot USER id from /users/@me
+    equals it for modern applications and covers the offline-validated case.
+    """
+    try:
+        req = urllib.request.Request(
+            "https://discord.com/api/v10/oauth2/applications/@me",
+            headers={
+                "Authorization": f"Bot {token.strip()}",
+                "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            app_id = json.loads(resp.read().decode()).get("id", "")
+            if app_id:
+                return str(app_id)
+    except (urllib.error.URLError, urllib.error.HTTPError):
+        pass
+    return str((bot_info or {}).get("id", "") or "")
+
+
+def show_invite_link(state: dict, bot_name: str, token: str,
+                     bot_info: dict | None, manage_channels: bool = False) -> None:
+    """Print a bot's server-install link and remember it for the summary.
+
+    Silent when Discord is unreachable and the token was never validated —
+    there is nothing to build the link from, and the air-gapped install that
+    hits this path has no use for an OAuth URL anyway.
+    """
+    app_id = _application_id(token, bot_info)
+    if not app_id:
+        return
+    url = invite_url(app_id, manage_channels)
+    info("Install link — open it to add this bot to a server (grants the "
+         "minimal permission set kbots needs; no Administrator):")
+    print(f"    {CYAN}{url}{RESET}")
+    state.setdefault("invite_urls", {})[bot_name] = url
+
+
 # ==========================================================================
 # Steps
 # ==========================================================================
@@ -937,6 +1003,11 @@ def step_discord(state: dict):
     state["bot_name"] = bot_name
     state["bot_token_key"] = "discord-token"
 
+    # Manage Channels: the main bot is the setup account — server auto-setup
+    # creates the fleet channels through it on guild join.
+    print()
+    show_invite_link(state, bot_name, token, bot_info, manage_channels=True)
+
 
 def step_team(state: dict):
     header("Step 8: Team — Owner Profile")
@@ -1494,6 +1565,7 @@ def step_ops_instance(state: dict):
         vault.set(vault_key, token)
         ok(f"Token stored as '{vault_key}'")
         state.setdefault("extra_bots", {})[bot_name] = vault_key
+        show_invite_link(state, bot_name, token, bot_info)
     else:
         warn("No token — add it later via vault-manage.py")
 
@@ -2026,6 +2098,11 @@ def step_summary(state: dict):
     else:
         print(f"  {BOLD}Discord:{RESET}    connected (guild: {state.get('guild_id', '?')})")
 
+    if state.get("invite_urls"):
+        print(f"\n  {BOLD}Bot install links{RESET} (add a bot to a server any time):")
+        for name, url in state["invite_urls"].items():
+            print(f"    {name}: {CYAN}{url}{RESET}")
+
     if sys.platform == "darwin":
         restart_cmd = "launchctl kickstart -k gui/$(id -u)/com.kbots.agent"
         logs_cmd = f"tail -f {overlay}/data/launchd.stderr.log"
@@ -2124,6 +2201,7 @@ def _add_bot(state: dict):
     vault_key = f"discord-{bot_name}"
     vault.set(vault_key, token)
     ok(f"Token stored as '{vault_key}'")
+    show_invite_link(state, bot_name, token, bot_info)
 
     # Add to config.yaml. setdefault, not raw indexing: a config written by an
     # earlier version (or hand-edited) may lack the intermediate keys, and a
