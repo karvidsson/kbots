@@ -1659,22 +1659,43 @@ class AgentManager:
         return {"reset": False, "reason": "No session found."}
 
     async def get_agent_status(self, agent_id: str) -> dict:
-        """Get status info for an agent."""
+        """Get status info for an agent.
+
+        `self.sessions` holds one RETAINED CONVERSATION CONTEXT per channel the
+        agent has ever spoken in. It says nothing about whether work is
+        happening, and one of those entries is routinely a placeholder created
+        at boot for a channel that never received a turn. Reported as "Active
+        sessions: 2", an idle agent reads as an agent hung on two tasks, and
+        the natural next step is to restart the service, which destroys live
+        conversation state to fix a problem that does not exist.
+
+        Execution is tracked in two other places and neither was surfaced.
+        Both are needed: a turn waiting on HITL approval sits in
+        `_inflight_turns` with NO subprocess yet, so `_running_procs` alone
+        would report a genuinely blocked agent as idle.
+        """
         agent_cfg = self.agent_configs.get(agent_id)
         if not agent_cfg:
             return {"error": f"Unknown agent: {agent_id}"}
 
-        active_sessions = [
+        sessions = [
             s for s in self.sessions.values()
             if s.agent_id == agent_id
         ]
+        inflight = [t for t in self._inflight_turns.values()
+                    if t.get("agent_id") == agent_id]
 
         return {
             "agent_id": agent_id,
             "display_name": agent_cfg.get("display_name", agent_id),
             "llm_provider": agent_cfg.get("llm", {}).get("provider", "unknown"),
             "llm_model": agent_cfg.get("llm", {}).get("model", "unknown"),
-            "active_sessions": len(active_sessions),
-            "total_messages": sum(s.message_count for s in active_sessions),
+            # Kept under its old name for any caller that reads it, but it is a
+            # count of retained contexts and the label above it now says so.
+            "active_sessions": len(sessions),
+            "running": agent_id in self._running_procs or bool(inflight),
+            "inflight_turns": len(inflight),
+            "inflight_channels": [t.get("channel_id") for t in inflight],
+            "total_messages": sum(s.message_count for s in sessions),
             "tools": agent_cfg.get("tools", []),
         }
