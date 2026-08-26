@@ -55,6 +55,26 @@ def test_the_decision_shape_is_given_in_full(marker):
     assert marker in _context()
 
 
+def test_each_option_is_on_its_own_line():
+    """Run together as "A ... / B ..." the options read as one sentence and the
+    owner parses a slash to find where one choice ends and the next begins.
+    That is the work the block exists to save, so the template has to model the
+    layout rather than only the labels: agents copy the shape they are shown.
+    """
+    ctx = _context()
+    assert "A - " in ctx and "B - " in ctx
+    assert "/  B" not in ctx, "the old single-line form is still being modelled"
+    options = ctx[ctx.index("OPTIONS:"):]
+    assert options.splitlines()[0].strip() == "OPTIONS:", "the labels share a line"
+
+
+def test_the_decision_line_is_separated_from_the_options():
+    """A four-line block with no breathing room is skimmed as one paragraph."""
+    ctx = _context()
+    between = ctx[ctx.index("DECISION: <one line"):ctx.index("OPTIONS:")]
+    assert "\n\n" in between
+
+
 def test_the_word_budget_is_a_number_not_an_adjective():
     ctx = _context()
     assert str(sc.DECISION_WORD_BUDGET) in ctx

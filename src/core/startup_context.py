@@ -39,9 +39,18 @@ Pick exactly one of three shapes.
    this order, at the TOP of the message:
 
        DECISION: <one line: what is being chosen between>
-       OPTIONS:  A <one line>  /  B <one line>
+
+       OPTIONS:
+       A - <one line>
+       B - <one line>
+
        I'D PICK: <one line, and why>
        IF NO REPLY: <what you will do by default>
+
+   The options go on their own lines. Run together as "A ... / B ..." they
+   read as one sentence and the owner has to parse the slash to find where
+   one choice ends and the next begins, which is exactly the work this block
+   exists to save.
 
    Everything above the question is at most {DECISION_WORD_BUDGET} words.
    Evidence, reasoning and alternatives go BELOW that block, or in a file you
