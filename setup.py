@@ -1705,9 +1705,15 @@ def service_writable_dirs(overlay: Path) -> list[Path]:
 
     /tmp and the home dotfile dirs are excluded: the first always exists, and
     the second belong to an account setup may not be able to write into.
+
+    The shared-state directory is DERIVED from src.core.base, the same
+    resolver every state module writes through, rather than restated here.
+    Two hand-maintained lists that have to agree drifted four times, each one
+    surfacing as an EROFS days later inside the service and never in a test.
     """
+    from src.core.base import OVERLAY_STATE_DIR
     return [ENGINE_ROOT / "data", overlay / "agents", overlay / "config",
-            overlay / "data", overlay / "tmp", overlay / "tools",
+            overlay / OVERLAY_STATE_DIR, overlay / "tmp", overlay / "tools",
             overlay / "skills"]
 
 
@@ -1764,6 +1770,95 @@ def render_rescue_unit(template: str, overlay: Path, env_lines: list[str],
         template = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), template, flags=re.M)
     template = template.replace("ExecStart=/usr/local/bin/uv", f"ExecStart={uv_path}")
     return render_service_unit(template, overlay, env_lines)
+
+
+def render_timer_unit(content: str, overlay: Path) -> str:
+    """Render one config/timers/ unit: rewrite /opt/kbots for non-default
+    installs and inject KBOTS_OVERLAY after the KBOTS_HOME line."""
+    if str(ENGINE_ROOT) != "/opt/kbots":
+        content = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), content, flags=re.M)
+    if "Environment=KBOTS_HOME=" in content:
+        lines = []
+        for line in content.split("\n"):
+            lines.append(line)
+            if line.startswith("Environment=KBOTS_HOME="):
+                lines.append(f"Environment=KBOTS_OVERLAY={overlay}")
+        content = "\n".join(lines)
+    return content
+
+
+def render_main_unit(template: str, overlay: Path, env_lines: list[str],
+                     uv_path: str) -> str:
+    """Render config/kbots.service into the unit that actually gets installed."""
+    if str(ENGINE_ROOT) != "/opt/kbots":
+        template = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), template, flags=re.M)
+    template = template.replace("ExecStart=/usr/local/bin/uv", f"ExecStart={uv_path}")
+    return render_service_unit(template, overlay, env_lines)
+
+
+def installed_unit_env_lines(overlay: Path) -> list[str]:
+    """The Environment=KBOTS_* lines a previous render put in the overlay's
+    kbots.service — the wizard answers (modules path, overlay) an unattended
+    re-render has no other way to recover. Falls back to the process env."""
+    unit = overlay / "systemd" / "kbots.service"
+    lines: list[str] = []
+    if unit.exists():
+        for line in unit.read_text().split("\n"):
+            if line.startswith(("Environment=KBOTS_OVERLAY=",
+                                "Environment=KBOTS_MODULES=")):
+                lines.append(line)
+    if not any(ln.startswith("Environment=KBOTS_OVERLAY=") for ln in lines):
+        lines.insert(0, f"Environment=KBOTS_OVERLAY={overlay}")
+    if (not any(ln.startswith("Environment=KBOTS_MODULES=") for ln in lines)
+            and os.environ.get("KBOTS_MODULES")):
+        lines.append(f"Environment=KBOTS_MODULES={os.environ['KBOTS_MODULES']}")
+    return lines
+
+
+def rerender_units(overlay: Path) -> list[Path]:
+    """Regenerate every unit in <overlay>/systemd/ from the current templates.
+
+    The wizard is the only thing that rendered units, so a template fix that
+    landed upstream (cd533cf, 4411dde) reached no deployed machine: update.sh
+    pulled the new config/kbots.service, restarted the service, and the
+    service re-exec'd the OLD installed unit. This is the headless half of
+    step_systemd: no prompts, no sudo, no install — it writes the rendered
+    files and lets scripts/install-systemd.sh relink and daemon-reload.
+
+    Only units that already exist in the overlay are re-rendered, so an
+    install that never opted into the rescue instance does not gain one.
+    """
+    out_dir = overlay / "systemd"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+
+    timers_dir = ENGINE_ROOT / "config" / "timers"
+    if timers_dir.exists():
+        for f in sorted(timers_dir.iterdir()):
+            if f.is_file():
+                out = out_dir / f.name
+                out.write_text(render_timer_unit(f.read_text(), overlay))
+                written.append(out)
+
+    uv_path = shutil.which("uv") or f"{Path.home()}/.local/bin/uv"
+    env_lines = installed_unit_env_lines(overlay)
+
+    main_out = out_dir / "kbots.service"
+    if main_out.exists():
+        template = (ENGINE_ROOT / "config" / "kbots.service").read_text()
+        main_out.write_text(render_main_unit(template, overlay, env_lines, uv_path))
+        written.append(main_out)
+        for d in service_writable_dirs(overlay):
+            d.mkdir(parents=True, exist_ok=True)
+
+    rescue_out = out_dir / "kbots-rescue.service"
+    rescue_template = ENGINE_ROOT / "config" / "kbots-rescue.service"
+    if rescue_out.exists() and rescue_template.exists():
+        rescue_out.write_text(render_rescue_unit(
+            rescue_template.read_text(), overlay, env_lines, uv_path))
+        written.append(rescue_out)
+
+    return written
 
 
 def build_health_config(state: dict) -> dict:
@@ -1833,22 +1928,8 @@ def step_systemd(state: dict):
             # Templates carry literal /opt/kbots; rewrite only for non-default installs.
             # Keeping literals means vanilla Core installs with symlinked units
             # (the default from install-systemd.sh) survive `git pull` unscathed.
-            content = f.read_text()
-            if str(ENGINE_ROOT) != "/opt/kbots":
-                content = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), content, flags=re.M)
-
-            # Inject KBOTS_OVERLAY into service files (after KBOTS_HOME line)
-            if f.name.endswith(".service"):
-                lines = content.split("\n")
-                new_lines = []
-                for line in lines:
-                    new_lines.append(line)
-                    if line.startswith("Environment=KBOTS_HOME="):
-                        new_lines.append(f"Environment=KBOTS_OVERLAY={overlay}")
-                content = "\n".join(new_lines)
-
             out_path = overlay / "systemd" / f.name
-            out_path.write_text(content)
+            out_path.write_text(render_timer_unit(f.read_text(), overlay))
 
         ok(f"Timer units written to {_display(overlay / 'systemd')}")
 
@@ -1864,22 +1945,12 @@ def step_systemd(state: dict):
             err(f"Service template not found: {template_path}")
             return
 
-        service = template_path.read_text()
-
-        # Rewrite /opt/kbots only for non-default installs; vanilla paths pass through.
-        if str(ENGINE_ROOT) != "/opt/kbots":
-            service = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), service, flags=re.M)
-        service = service.replace(
-            "ExecStart=/usr/local/bin/uv",
-            f"ExecStart={uv_path}",
-        )
-
         # Inject environment variables after the PATH line
         env_lines = [f"Environment=KBOTS_OVERLAY={overlay}"]
         if state.get("kbots_modules"):
             env_lines.append(f"Environment=KBOTS_MODULES={state['kbots_modules']}")
 
-        service = render_service_unit(service, overlay, env_lines)
+        service = render_main_unit(template_path.read_text(), overlay, env_lines, uv_path)
 
         # Every writable path must exist before the unit starts. systemd builds
         # the mount namespace BEFORE exec, so a ReadWritePaths entry that is
@@ -2622,5 +2693,23 @@ def main():
     print(f"  {GREEN}{BOLD}kbots is ready.{RESET}\n")
 
 
+def _main_rerender_units() -> int:
+    """`setup.py --rerender-units` — the non-interactive path update.sh takes
+    when a pulled range touched a unit template."""
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    if not overlay:
+        print("KBOTS_OVERLAY is not set — cannot locate <overlay>/systemd/", file=sys.stderr)
+        return 2
+    written = rerender_units(Path(overlay))
+    if not written:
+        print(f"No units found under {overlay}/systemd/ — nothing re-rendered")
+        return 1
+    for path in written:
+        print(f"  rendered {path}")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--rerender-units" in sys.argv[1:]:
+        sys.exit(_main_rerender_units())
     main()

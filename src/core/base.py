@@ -274,6 +274,12 @@ def install_write_root() -> Path:
     return Path(overlay) if overlay else PROJECT_ROOT
 
 
+OVERLAY_STATE_DIR = "data"
+"""Where shared state lives under the overlay. setup.py derives the unit's
+ReadWritePaths from this same name, so the writable list and the write path
+cannot drift apart."""
+
+
 def overlay_state_path(name: str) -> Path | None:
     """Where a small shared state file is WRITTEN: the overlay's data/ directory.
 
@@ -287,7 +293,7 @@ def overlay_state_path(name: str) -> Path | None:
     One helper rather than a sixth copy of the same two lines.
     """
     overlay = os.environ.get("KBOTS_OVERLAY", "")
-    return Path(overlay) / "data" / name if overlay else None
+    return Path(overlay) / OVERLAY_STATE_DIR / name if overlay else None
 
 
 def overlay_state_legacy_path(name: str) -> Path | None:

@@ -61,6 +61,8 @@ scripts/full-control.sh status         # show current state
 
 ### `scripts/update.sh` — One-Command Update
 Updates a running install: pulls, syncs deps across layers, then hot-reloads (tools/skills/codex-only changes) or restarts the service (core changes — systemd on Linux, launchd on macOS). Also available from Discord as `/admin update`.
+
+If the pulled range touched a unit template (`config/*.service`, `config/timers/*`), it first re-renders `<overlay>/systemd/` with `setup.py --rerender-units` and relinks + `daemon-reload`s via `install-systemd.sh` — a restart alone re-execs the *installed* unit, not the template. That step needs passwordless sudo; without it the script prints the manual commands loudly instead of reporting a false success.
 ```bash
 cd "$KBOTS_HOME" && scripts/update.sh
 ```
