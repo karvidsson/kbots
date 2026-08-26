@@ -140,7 +140,11 @@ def test_every_state_path_is_inside_the_rendered_read_write_paths(overlay):
         template.read_text(), overlay, [f"Environment=KBOTS_OVERLAY={overlay}"])
     rw = [ln for ln in rendered.splitlines()
           if ln.startswith("ReadWritePaths=")][0].split("=", 1)[1].split()
-    granted = [Path(p) for p in rw]
+    # Only the grants the unit derives from the overlay. /tmp and the home
+    # dotfile dirs are always-writable system paths, and on Linux CI the
+    # pytest tmp_path itself lives under /tmp — which would make the overlay
+    # root look "granted" for a reason that has nothing to do with the unit.
+    granted = [Path(p) for p in rw if Path(p).is_relative_to(overlay)]
 
     def is_granted(path: Path) -> bool:
         return any(path == g or g in path.parents for g in granted)
