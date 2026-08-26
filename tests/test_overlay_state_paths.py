@@ -8,6 +8,7 @@ predates the move keeps its state.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -120,3 +121,35 @@ def test_clearing_a_legacy_only_flag_writes_the_current_file(overlay):
 
     runtime_state.set_flag("other", 1)
     assert runtime_state.get_flag("hitl", "unset") == "unset"
+
+
+# --- the unit's writable list and the write path are one thing -------------
+
+def test_every_state_path_is_inside_the_rendered_read_write_paths(overlay):
+    """The durable fix. setup.py used to restate `overlay / "data"` by hand
+    next to the helper's own `Path(overlay) / "data"`; nothing made them agree.
+    Now the unit derives the directory from src.core.base, and this pins it:
+    a state file the helper can produce is, by construction, under a path
+    the rendered unit grants ReadWritePaths to.
+    """
+    import setup as setup_wizard
+    from src.core import tool_scope
+
+    template = setup_wizard.ENGINE_ROOT / "config" / "kbots.service"
+    rendered = setup_wizard.render_service_unit(
+        template.read_text(), overlay, [f"Environment=KBOTS_OVERLAY={overlay}"])
+    rw = [ln for ln in rendered.splitlines()
+          if ln.startswith("ReadWritePaths=")][0].split("=", 1)[1].split()
+    granted = [Path(p) for p in rw]
+
+    def is_granted(path: Path) -> bool:
+        return any(path == g or g in path.parents for g in granted)
+
+    for name in ("schedules.json", "runtime.json", "triggers.json",
+                 "session_consent.json", "feedback_map.json", "anything-new.json"):
+        path = overlay_state_path(name)
+        assert is_granted(path), f"{path} is not under any ReadWritePaths entry"
+        assert not is_granted(overlay_state_legacy_path(name)), \
+            "the overlay root must stay read-only — only data/ is granted"
+
+    assert is_granted(tool_scope._scope_path())

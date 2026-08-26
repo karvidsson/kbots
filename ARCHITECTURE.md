@@ -982,6 +982,18 @@ Because the service unit launches with `uv run --no-sync`, starting the service 
 
 Skip the sync after a dependency change and one of two things happens: startup dies with an `ImportError` on the new dep, or the service quietly keeps executing old code under a bumped version number. Since the script does nothing when there's nothing to do, running it on every single deploy costs nothing and is the safe habit.
 
+**Unit changes need a re-render, not just a restart.** The service runs the unit under `<overlay>/systemd/` (symlinked from `/etc/systemd/system/`), which is *rendered* from `config/kbots.service` — pulling a new template changes nothing the service reads. `scripts/update.sh` handles this: when the pulled range touches `config/*.service` or `config/timers/*` it runs `setup.py --rerender-units` and `scripts/install-systemd.sh` (relink + `daemon-reload`) before the restart. Doing it by hand:
+
+```bash
+sudo -u kbots env KBOTS_OVERLAY=<overlay> uv run python setup.py --rerender-units
+sudo bash scripts/install-systemd.sh <overlay>
+sudo systemctl restart kbots
+```
+
+Never `sed -i` `/etc/systemd/system/kbots.service` directly — it is a symlink, and `sed -i` replaces it with a regular file, so later installs silently stop updating the live unit. Site-local overrides go in a drop-in under `/etc/systemd/system/kbots.service.d/`.
+
+**State vs code.** Everything the service writes at runtime goes through `overlay_state_path()` in `src/core/base.py`, which resolves under `<overlay>/data/`; `setup.py` derives the unit's `ReadWritePaths` from that same constant, and a test pins that every path the helper can produce is inside the granted set. A new state file therefore cannot land somewhere read-only. Code (`$KBOTS_HOME` itself) stays read-only to the service by design — updates come from a shell outside the sandbox, never from the agent.
+
 ### Git Workflow
 
 A pre-commit hook — shipped as `hooks/pre-commit` and put in place by `setup.py` — rejects commits made straight to `main`. Every Core change travels through a feature branch:
