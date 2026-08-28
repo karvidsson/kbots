@@ -1711,6 +1711,11 @@ def service_writable_dirs(overlay: Path) -> list[Path]:
 
     /tmp and the home dotfile dirs are excluded: the first always exists, and
     the second belong to an account setup may not be able to write into.
+
+    The shared-state directory is DERIVED from src.core.base, the same
+    resolver every state module writes through, rather than restated here.
+    Two hand-maintained lists that have to agree drifted four times, each one
+    surfacing as an EROFS days later inside the service and never in a test.
     """
     from src.core.base import overlay_writable_dirs
 

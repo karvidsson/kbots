@@ -982,6 +982,20 @@ Because the service unit launches with `uv run --no-sync`, starting the service 
 
 Skip the sync after a dependency change and one of two things happens: startup dies with an `ImportError` on the new dep, or the service quietly keeps executing old code under a bumped version number. Since the script does nothing when there's nothing to do, running it on every single deploy costs nothing and is the safe habit.
 
+**Unit changes need a re-render, not just a restart.** The service runs the unit under `<overlay>/systemd/` (symlinked from `/etc/systemd/system/`), which is *rendered* from `config/kbots.service` — pulling a new template changes nothing the service reads. Both `scripts/update.sh` and `scripts/self-deploy.sh` run `scripts/refresh_units.py --reload` before the restart, which re-renders through the same functions the wizard uses and carries forward the values already baked into the installed unit, so it needs no wizard state and asks nothing. It exits `10` when it changed something, which is what forces a restart the diff would otherwise have skipped. Doing it by hand:
+
+```bash
+uv run --no-sync python scripts/refresh_units.py --dry-run   # what would change
+uv run --no-sync python scripts/refresh_units.py --reload
+sudo systemctl restart kbots
+```
+
+Run it from a shell, not from inside the service: the sandbox mounts both the engine root and the overlay read-only, so the service cannot rewrite its own unit. It refuses to run from a checkout other than the one the installed unit runs from, which would otherwise repoint a live install at a development clone.
+
+Never `sed -i` `/etc/systemd/system/kbots.service` directly — it is a symlink, and `sed -i` replaces it with a regular file, so later installs silently stop updating the live unit. Site-local overrides go in a drop-in under `/etc/systemd/system/kbots.service.d/`.
+
+**State vs code.** Everything the service writes at runtime goes through `overlay_state_path()` in `src/core/base.py`, which resolves under `<overlay>/data/`; both that helper and `setup.py`'s `service_writable_dirs()` resolve against one list, `OVERLAY_WRITABLE_SUBDIRS` in the same module, and a test pins that every path the helper can produce is inside the granted set. A new state file therefore cannot land somewhere read-only. Code (`$KBOTS_HOME` itself) stays read-only to the service by design — updates come from a shell outside the sandbox, never from the agent.
+
 ### Git Workflow
 
 A pre-commit hook — shipped as `hooks/pre-commit` and put in place by `setup.py` — rejects commits made straight to `main`. Every Core change travels through a feature branch:
