@@ -59,6 +59,20 @@ while IFS= read -r f; do
     esac
 done < <(git diff --name-only "$OLD".."$NEW")
 
+# Re-render the live service unit from the template this pull may have changed.
+# `git pull` updates config/kbots.service; only this makes the machine run it.
+# Without it a unit fix is committed, merged, pulled — and running nowhere.
+if [ -f "$SCRIPT_DIR/refresh_units.py" ]; then
+    uv run --no-sync python "$SCRIPT_DIR/refresh_units.py" --reload
+    case $? in
+        # A changed unit forces the restart even when the diff was skills-only:
+        # a reloaded unit the process never restarted into is not installed.
+        10) NEED_RESTART=1 ;;
+        0)  ;;
+        *)  echo "Unit refresh failed — see above; not restarting."; exit 1 ;;
+    esac
+fi
+
 if [ "$NEED_RESTART" -eq 0 ]; then
     echo "Only tools/skills/codex changed — hot-reloaded live, no restart needed."
     exit 0

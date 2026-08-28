@@ -1703,12 +1703,18 @@ def service_account_home(unit_text: str) -> Path:
 def service_writable_dirs(overlay: Path) -> list[Path]:
     """Directories the unit grants ReadWritePaths and something must create.
 
+    The overlay half is NOT a list maintained here. It comes from
+    base.overlay_writable_dirs, which is also what overlay_state_path resolves
+    against, so a state file the engine adds is writable by construction rather
+    than by someone remembering to edit this function too. Keeping a second
+    copy here is how the same EROFS bug shipped four times.
+
     /tmp and the home dotfile dirs are excluded: the first always exists, and
     the second belong to an account setup may not be able to write into.
     """
-    return [ENGINE_ROOT / "data", overlay / "agents", overlay / "config",
-            overlay / "data", overlay / "tmp", overlay / "tools",
-            overlay / "skills"]
+    from src.core.base import overlay_writable_dirs
+
+    return [ENGINE_ROOT / "data", *overlay_writable_dirs(overlay)]
 
 
 def render_service_unit(unit_text: str, overlay: Path, env_lines: list[str]) -> str:
@@ -1742,6 +1748,55 @@ def render_service_unit(unit_text: str, overlay: Path, env_lines: list[str]) -> 
         else:
             out.append(line)
     return "\n".join(out)
+
+
+def build_service_unit(template: str, overlay: Path, env_lines: list[str],
+                       uv_path: str) -> str:
+    """Template on disk -> the exact unit this install should be running.
+
+    The whole transform, so the wizard and scripts/refresh_units.py cannot
+    render it differently. They used to be one path, because only the wizard
+    ever rendered a unit — and that was the bug: a unit fix could be committed,
+    pulled, and still never reach a single running machine, because nothing
+    short of re-running setup regenerated it.
+    """
+    # Rewrite /opt/kbots only for non-default installs; vanilla paths pass through.
+    # flags=re.M: without it $ only matches end-of-STRING, so a path that ends a
+    # line mid-file (WorkingDirectory=/opt/kbots) is never rewritten.
+    if str(ENGINE_ROOT) != "/opt/kbots":
+        template = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), template, flags=re.M)
+    template = template.replace("ExecStart=/usr/local/bin/uv", f"ExecStart={uv_path}")
+    return render_service_unit(template, overlay, env_lines)
+
+
+def build_timer_unit(template: str, overlay: Path) -> str:
+    """Same, for the maintenance timer/service units under config/timers/."""
+    if str(ENGINE_ROOT) != "/opt/kbots":
+        template = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), template, flags=re.M)
+    out = []
+    for line in template.split("\n"):
+        out.append(line)
+        if line.startswith("Environment=KBOTS_HOME="):
+            out.append(f"Environment=KBOTS_OVERLAY={overlay}")
+    return "\n".join(out)
+
+
+def build_launchd_plist(template: str, overlay: Path, uv_path: str,
+                        home: Path, path_env: str, modules: str = "") -> str:
+    """Template on disk -> this install's launchd plist. See build_service_unit."""
+    extra_env = ""
+    if modules:
+        extra_env = ("        <key>KBOTS_MODULES</key>\n"
+                     f"        <string>{modules}</string>")
+    content = (template
+               .replace("__UV__", uv_path)
+               .replace("__ENGINE_ROOT__", str(ENGINE_ROOT))
+               .replace("__PATH__", path_env)
+               .replace("__HOME__", str(home))
+               .replace("__OVERLAY__", str(overlay)))
+    if extra_env:
+        return content.replace("        <!-- __EXTRA_ENV__ -->", extra_env)
+    return content.replace("\n        <!-- __EXTRA_ENV__ -->", "")
 
 
 def render_rescue_unit(template: str, overlay: Path, env_lines: list[str],
@@ -1833,22 +1888,8 @@ def step_systemd(state: dict):
             # Templates carry literal /opt/kbots; rewrite only for non-default installs.
             # Keeping literals means vanilla Core installs with symlinked units
             # (the default from install-systemd.sh) survive `git pull` unscathed.
-            content = f.read_text()
-            if str(ENGINE_ROOT) != "/opt/kbots":
-                content = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), content, flags=re.M)
-
-            # Inject KBOTS_OVERLAY into service files (after KBOTS_HOME line)
-            if f.name.endswith(".service"):
-                lines = content.split("\n")
-                new_lines = []
-                for line in lines:
-                    new_lines.append(line)
-                    if line.startswith("Environment=KBOTS_HOME="):
-                        new_lines.append(f"Environment=KBOTS_OVERLAY={overlay}")
-                content = "\n".join(new_lines)
-
             out_path = overlay / "systemd" / f.name
-            out_path.write_text(content)
+            out_path.write_text(build_timer_unit(f.read_text(), overlay))
 
         ok(f"Timer units written to {_display(overlay / 'systemd')}")
 
@@ -1864,22 +1905,13 @@ def step_systemd(state: dict):
             err(f"Service template not found: {template_path}")
             return
 
-        service = template_path.read_text()
-
-        # Rewrite /opt/kbots only for non-default installs; vanilla paths pass through.
-        if str(ENGINE_ROOT) != "/opt/kbots":
-            service = re.sub(r"/opt/kbots(?=/|$)", str(ENGINE_ROOT), service, flags=re.M)
-        service = service.replace(
-            "ExecStart=/usr/local/bin/uv",
-            f"ExecStart={uv_path}",
-        )
-
         # Inject environment variables after the PATH line
         env_lines = [f"Environment=KBOTS_OVERLAY={overlay}"]
         if state.get("kbots_modules"):
             env_lines.append(f"Environment=KBOTS_MODULES={state['kbots_modules']}")
 
-        service = render_service_unit(service, overlay, env_lines)
+        service = build_service_unit(
+            template_path.read_text(), overlay, env_lines, uv_path)
 
         # Every writable path must exist before the unit starts. systemd builds
         # the mount namespace BEFORE exec, so a ReadWritePaths entry that is
@@ -1999,25 +2031,9 @@ def step_launchd(state: dict):
     uv_path = shutil.which("uv") or "/opt/homebrew/bin/uv"
     path_env = f"{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 
-    extra_env = ""
-    if state.get("kbots_modules"):
-        extra_env = (
-            "        <key>KBOTS_MODULES</key>\n"
-            f"        <string>{state['kbots_modules']}</string>"
-        )
-
-    content = (
-        template_path.read_text()
-        .replace("__UV__", uv_path)
-        .replace("__ENGINE_ROOT__", str(ENGINE_ROOT))
-        .replace("__PATH__", path_env)
-        .replace("__HOME__", str(home))
-        .replace("__OVERLAY__", str(overlay))
-    )
-    if extra_env:
-        content = content.replace("        <!-- __EXTRA_ENV__ -->", extra_env)
-    else:
-        content = content.replace("\n        <!-- __EXTRA_ENV__ -->", "")
+    content = build_launchd_plist(
+        template_path.read_text(), overlay, uv_path, home, path_env,
+        state.get("kbots_modules") or "")
 
     (overlay / "data").mkdir(parents=True, exist_ok=True)
     out_path = overlay / "systemd" / "com.kbots.agent.plist"
