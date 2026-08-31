@@ -21,8 +21,40 @@ WEB_FACING_TOOLS = frozenset({
     "gmail_read", "gmail_search", "download_file",
 })
 
+#: Which argument names a web-facing tool's target, best first. An alert that
+#: names only the tool cannot be acted on: "read_url stripped 1,656 chars" does
+#: not say whether that was a news site or somewhere nothing should have been
+#: fetching from, and those need opposite responses.
+_TARGET_ARGS = ("url", "query", "target", "q", "search", "link", "address")
 
-async def send_alert(message: str, channel_id: str, bot_token: str) -> bool:
+
+def describe_target(tool_name: str, kwargs: dict, limit: int = 120) -> str:
+    """The thing a web-facing tool was pointed at, for an alert line.
+
+    Argument names differ per tool (`url` for read_url, `query` for web_search,
+    and `browser` takes whichever of several it is driving), so this reads the
+    call rather than hard-coding a table that a new tool would silently fall out
+    of. Falls back to the first string argument, because a tool that names its
+    target something unforeseen should still be attributable.
+    """
+    if not kwargs:
+        return ""
+    for name in _TARGET_ARGS:
+        value = kwargs.get(name)
+        if isinstance(value, str) and value.strip():
+            return _clip(value.strip(), limit)
+    for value in kwargs.values():
+        if isinstance(value, str) and value.strip():
+            return _clip(value.strip(), limit)
+    return ""
+
+
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+async def send_alert(message: str, channel_id: str, bot_token: str) -> str | None:
     """Send an alert message to a Discord channel.
 
     Args:
@@ -30,11 +62,15 @@ async def send_alert(message: str, channel_id: str, bot_token: str) -> bool:
         channel_id: Discord channel ID
         bot_token: Discord bot token for authentication
 
-    Returns True if sent successfully, False otherwise.
+    Returns the id of the posted message, or None if it was not sent. The id
+    rather than a bare bool because a reaction handler needs something to key
+    a follow-up against, and this is the only place the created message is
+    visible; the response used to be discarded, so an alert could not be
+    referred to after it was posted.
     """
     if not channel_id or not bot_token:
         logger.warning(f"Security alert (no channel configured): {message}")
-        return False
+        return None
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -45,12 +81,18 @@ async def send_alert(message: str, channel_id: str, bot_token: str) -> bool:
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status in (200, 201):
-                    return True
+                    try:
+                        body = await resp.json()
+                        return str(body.get("id") or "") or None
+                    except Exception:
+                        # Posted, but the id could not be read. The alert is
+                        # what matters; a missing id costs only the follow-up.
+                        return None
                 logger.warning(f"Alert send failed (HTTP {resp.status})")
-                return False
+                return None
     except Exception as e:
         logger.warning(f"Alert send failed: {e}")
-        return False
+        return None
 
 
 class AlertSender:
@@ -81,22 +123,34 @@ class AlertSender:
     def enabled(self) -> bool:
         return bool(self.channel_id and self.bot_token)
 
-    async def send(self, message: str) -> bool:
-        """Send an alert. Fire-and-forget safe."""
+    async def send(self, message: str) -> str | None:
+        """Send an alert. Returns the posted message id, or None."""
         if not self.enabled:
             logger.warning(f"Security alert (no channel): {message}")
-            return False
+            return None
         return await send_alert(message, self.channel_id, self.bot_token)
 
-    def send_bg(self, message: str) -> None:
-        """Send an alert in the background — doesn't block the caller."""
+    def send_bg(self, message: str, on_sent=None) -> None:
+        """Send an alert in the background — doesn't block the caller.
+
+        `on_sent` is called with the posted message id once it exists. It is a
+        callback rather than a return value because the caller here is a
+        synchronous tool wrapper that must not wait on Discord; anything keyed
+        to the alert's message id has to be stored after the fact.
+        """
         if not self.enabled:
             logger.warning(f"Security alert (no channel): {message}")
             return
-        asyncio.create_task(
-            send_alert(message, self.channel_id, self.bot_token),
-            name="security-alert",
-        )
+
+        async def _send() -> None:
+            message_id = await send_alert(message, self.channel_id, self.bot_token)
+            if message_id and on_sent:
+                try:
+                    on_sent(message_id)
+                except Exception as e:
+                    logger.warning(f"Alert follow-up store failed: {e}")
+
+        asyncio.create_task(_send(), name="security-alert")
 
     def post_bg(self, channel_id: str, message: str) -> None:
         """Post to a specific channel with the alert bot's token, falling back
