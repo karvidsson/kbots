@@ -55,6 +55,13 @@ defaults:
     provider: claude_code
     model: sonnet
     max_tokens: 4096
+    # timeout: 3600            # how long ONE turn may run before it is given up on
+    # How long a RESUMED session may take to produce its first output — to load
+    # the transcript and connect its MCP servers. A liveness deadline only: once
+    # the CLI has proved it is up, the turn gets `timeout` like any other. Raise
+    # it only if resumes are being dropped on a slow machine; it does not limit
+    # how long an agent may work.
+    # resume_startup_timeout: 600
     # mcp_config: /path/to/mcp.yaml  # Optional: external MCP servers for all agents
     # Local models (optional): any agent can run on a local model instead of
     # Claude by setting `llm: {provider: local, model: qwen3.5:9b}` in agents.yaml.
