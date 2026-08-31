@@ -37,6 +37,39 @@ def _isolate_roster(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_runtime_flags(tmp_path, monkeypatch):
+    """No test may read this deployment's live runtime flags.
+
+    Same failure as `_isolate_roster` above, one file over. runtime.json holds
+    what an admin has flipped live (the HITL killswitch, the alert channel,
+    reply shortening), it resolves through KBOTS_OVERLAY, and a runtime flag
+    deliberately BEATS the config a caller passes in. So on a machine where the
+    feature is switched on, a test that constructs its subject with an explicit
+    config is silently overridden by production state.
+
+    It cost a deploy. Reply shortening was turned on fleet-wide at a 1200-char
+    threshold; the reply-shorten tests build a shortener at 300 and feed it a
+    ~500-char reply, got the live 1200 instead, and eight of them failed. The
+    gate in self-deploy.sh runs the suite against the live overlay, so it went
+    red and rolled back a release that was green in CI and green in a dev
+    checkout. Every machine that had used the feature would have failed the
+    same way, and only those machines.
+
+    Pointing the module's own path resolvers at a tmp file, rather than moving
+    KBOTS_OVERLAY, so tests that legitimately exercise overlay paths are
+    unaffected. `_read_path` returns the file whether or not it exists:
+    `get_flag` already treats an unreadable file as "no flags set".
+    """
+    from src.core import runtime_state
+
+    flags = tmp_path / "_isolated_runtime" / "runtime.json"
+    flags.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(runtime_state, "_path", lambda: flags)
+    monkeypatch.setattr(runtime_state, "_read_path", lambda: flags)
+    return flags
+
+
+@pytest.fixture(autouse=True)
 def _isolate_inter_agent_depth(monkeypatch):
     """No test may inherit this process's inter-agent call depth.
 
