@@ -8,16 +8,148 @@ Three layers, all alert-only (never block):
 Alerts go to audit log and optionally to a Discord channel.
 """
 
+import html
 import logging
 import re
 import time
 import unicodedata
 from collections import deque
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
 
 # === Layer 1: Sanitization ===
+
+#: The categories a sanitize pass can remove, in the order the pass applies
+#: them. Split out because the total was never a usable signal: on any real web
+#: page `markup` and `whitespace` dominate by orders of magnitude, so a single
+#: "chars removed" figure says "this was HTML" and nothing else. The two that
+#: carry security signal are `invisible` and `base64`; a reader who is told only
+#: the total cannot tell 1,656 chars of ordinary markup from a payload, and will
+#: reasonably assume the worst about a number that is only ever large.
+SANITIZE_CATEGORIES = ("invisible", "script_style", "markup", "base64", "whitespace")
+
+#: Categories that indicate deliberately concealed content rather than the
+#: ordinary shape of a web page. Zero-width and bidi characters are how text is
+#: hidden from a human reader while staying in the model's context; an oversized
+#: base64 blob is how a payload is smuggled past a pattern scan.
+SANITIZE_SIGNAL_CATEGORIES = ("invisible", "base64")
+
+
+@dataclass
+class SanitizeReport:
+    """What a sanitize pass removed, by category, with samples.
+
+    `text` is the sanitized output, so a caller never needs to run the pass
+    twice, and `sanitize()` itself is defined in terms of this — the count and
+    the content it describes cannot drift apart.
+    """
+
+    text: str
+    removed: dict[str, int] = field(default_factory=dict)
+    samples: dict[str, list[str]] = field(default_factory=dict)
+
+    @property
+    def total_removed(self) -> int:
+        return sum(self.removed.values())
+
+    @property
+    def signal_removed(self) -> int:
+        """Chars removed by the categories that indicate concealment."""
+        return sum(self.removed.get(c, 0) for c in SANITIZE_SIGNAL_CATEGORIES)
+
+    def summary(self) -> str:
+        """One line, largest category first, only what was actually removed."""
+        parts = [f"{n} {c}" for c, n in
+                 sorted(self.removed.items(), key=lambda kv: -kv[1]) if n]
+        return ", ".join(parts) if parts else "nothing"
+
+
+def _invisible_chars(text: str) -> str:
+    """The Cf/Cc/Co characters a pass strips, minus the whitespace it keeps."""
+    return "".join(
+        c for c in text
+        if unicodedata.category(c) in ("Cf", "Cc", "Co") and c not in ("\n", "\r", "\t")
+    )
+
+
+def sanitize_report(text: str, max_samples: int = 12,
+                    sample_chars: int = 200) -> SanitizeReport:
+    """Sanitize, and account for what each step removed.
+
+    Samples are collected only for the categories that carry signal. Markup and
+    whitespace are counted but never retained: they are the bulk of the volume,
+    they are of no interest to a reader, and holding megabytes of stripped HTML
+    to answer a reaction nobody will send is a cost with no return.
+    """
+    if not text:
+        return SanitizeReport(text=text or "")
+
+    removed: dict[str, int] = {}
+    samples: dict[str, list[str]] = {}
+
+    def _note(category: str, count: int) -> None:
+        if count > 0:
+            removed[category] = removed.get(category, 0) + count
+
+    # Invisible Unicode (zero-width joiners, bidi overrides, BOM). Sampled as
+    # code points: the characters are by definition unreadable, so the only
+    # useful rendering of them is their names.
+    hidden = _invisible_chars(text)
+    if hidden:
+        _note("invisible", len(hidden))
+        seen: list[str] = []
+        for ch in hidden:
+            label = f"U+{ord(ch):04X} {unicodedata.name(ch, 'unnamed')}"
+            if label not in seen:
+                seen.append(label)
+            if len(seen) >= max_samples:
+                break
+        samples["invisible"] = seen
+    text = "".join(
+        c for c in text
+        if unicodedata.category(c) not in ("Cf", "Cc", "Co")
+        or c in ("\n", "\r", "\t")
+    )
+
+    # <script>/<style> blocks, counted apart from ordinary tags: a page carrying
+    # far more script than text is worth seeing, and it is invisible inside a
+    # combined markup figure.
+    before = len(text)
+    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    _note("script_style", before - len(text))
+
+    # Remaining HTML tags. On a real page this is the largest category by far
+    # and means only that the fetch returned HTML.
+    before = len(text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    _note("markup", before - len(text))
+
+    # Entity unescaping can shorten or lengthen; either way it is not removal,
+    # so it is deliberately not counted.
+    text = html.unescape(text)
+
+    # Oversized base64 data URIs.
+    before = len(text)
+    blobs = re.findall(r"data:[a-zA-Z/+]+;base64,[A-Za-z0-9+/=]{200,}", text)
+    text = re.sub(r"data:[a-zA-Z/+]+;base64,[A-Za-z0-9+/=]{200,}", "[base64-removed]", text)
+    _note("base64", max(0, before - len(text)))
+    if blobs:
+        samples["base64"] = [b[:sample_chars] + "…" for b in blobs[:max_samples]]
+
+    # NFC normalisation and whitespace collapsing, together: both are
+    # reformatting, and neither is evidence of anything.
+    before = len(text)
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+    _note("whitespace", max(0, before - len(text)))
+
+    return SanitizeReport(text=text, removed=removed, samples=samples)
+
 
 def sanitize(text: str) -> str:
     """Sanitize external content before it enters LLM context.
@@ -27,34 +159,31 @@ def sanitize(text: str) -> str:
     """
     if not text:
         return text
+    return sanitize_report(text).text
 
-    # Strip invisible Unicode (zero-width joiners, bidi overrides, BOM)
-    text = "".join(
-        c for c in text
-        if unicodedata.category(c) not in ("Cf", "Cc", "Co")
-        or c in ("\n", "\r", "\t")
-    )
 
-    # Remove HTML tags
-    text = re.sub(r"<script[^>]*>.*?</script>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", " ", text)
+def format_sanitize_detail(report: SanitizeReport) -> str:
+    """The stripped content, written out for a human to judge.
 
-    # Unescape HTML entities
-    import html
-    text = html.unescape(text)
-
-    # Remove data URIs and base64 blocks >200 chars
-    text = re.sub(r"data:[a-zA-Z/+]+;base64,[A-Za-z0-9+/=]{200,}", "[base64-removed]", text)
-
-    # Unicode normalization (NFC)
-    text = unicodedata.normalize("NFC", text)
-
-    # Whitespace collapsing
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-
-    return text.strip()
+    Every category is listed with its count so the proportions are visible, but
+    only the concealment categories get their content shown. Invisible
+    characters are rendered as code points and names: they have no appearance
+    by definition, so printing them would show an empty line and prove nothing.
+    """
+    lines = [f"Removed: {report.summary()}", ""]
+    for category in SANITIZE_SIGNAL_CATEGORIES:
+        count = report.removed.get(category, 0)
+        if not count:
+            continue
+        lines.append(f"[{category}] {count} chars")
+        for sample in report.samples.get(category, []):
+            lines.append(f"  {sample}")
+        lines.append("")
+    bulk = [f"{c}={report.removed[c]}" for c in SANITIZE_CATEGORIES
+            if c not in SANITIZE_SIGNAL_CATEGORIES and report.removed.get(c)]
+    if bulk:
+        lines.append("Not shown (ordinary page structure): " + ", ".join(bulk))
+    return "\n".join(lines).strip()
 
 
 # === Layer 2: Injection Scoring ===

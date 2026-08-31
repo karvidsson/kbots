@@ -144,6 +144,22 @@ fi
 # Post-gate migration check (fresh pull that brought the rename lands here)
 maybe_migrate_kbots
 
+# Ship unit changes too. Without this the pull updates config/kbots.service and
+# nothing else: the live unit is whatever the setup wizard generated, possibly
+# years ago, so a sandbox fix lands in the history and on no machine. Runs
+# after the gate (the code it renders through was just tested) and before the
+# restart (so the restart is what picks it up). A no-op when nothing changed.
+if [ -f "$SCRIPT_DIR/refresh_units.py" ]; then
+    uv run --no-sync python "$SCRIPT_DIR/refresh_units.py" --reload
+    # 10 = a unit changed, which is a success here: the restart below is what
+    # picks it up. Only a genuine failure (unit written, manager not reloaded)
+    # rolls back, because that leaves disk and process disagreeing.
+    rc=$?
+    if [ "$rc" -ne 0 ] && [ "$rc" -ne 10 ]; then
+        log "unit refresh failed — see above"; rollback; exit 1
+    fi
+fi
+
 LINES_BEFORE=0
 [ -f "$LOG" ] && LINES_BEFORE=$(wc -l < "$LOG")
 log "restarting service"
