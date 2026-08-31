@@ -62,13 +62,15 @@ scripts/full-control.sh status         # show current state
 ### `scripts/update.sh` — One-Command Update
 Updates a running install: pulls, syncs deps across layers, then hot-reloads (tools/skills/codex-only changes) or restarts the service (core changes — systemd on Linux, launchd on macOS). Also available from Discord as `/admin update`.
 
-If the pulled range touched a unit template (`config/*.service`, `config/timers/*`), it first re-renders `<overlay>/systemd/` with `setup.py --rerender-units` and relinks + `daemon-reload`s via `install-systemd.sh` — a restart alone re-execs the *installed* unit, not the template. That step needs passwordless sudo; without it the script prints the manual commands loudly instead of reporting a false success.
+Before the restart it runs `scripts/refresh_units.py --reload`, which re-renders `<overlay>/systemd/` from the current templates and reloads the service manager. A restart alone re-execs the *installed* unit, not the template. A refreshed unit forces the restart even when the pulled diff was skills-only, since a unit the process never restarted into is not installed. If the refresh writes a unit it cannot make live, the update stops rather than reporting a false success.
 ```bash
 cd "$KBOTS_HOME" && scripts/update.sh
 ```
 
 ### `scripts/self-deploy.sh` — Safe Deploy (test-gated, auto-rollback)
 Like `update.sh` but with safety rails, for letting an agent (or you) ship changes to the live service. Pulls, syncs, then **gates on `ruff` + full `pytest`** before restarting; after restart it **health-checks the boot** and **auto-rolls-back to the previous commit** if tests fail or the service doesn't come up cleanly. Deterministic — the safety is in the script, not an agent's judgement. The box is never left on broken code.
+
+It refreshes the service unit too, after the gate and before the restart, so a pulled sandbox fix reaches the machine instead of only the history. A unit written but not made live rolls the deploy back, since that is the one state where the file on disk and the running process disagree.
 ```bash
 cd "$KBOTS_HOME" && scripts/self-deploy.sh
 ```
@@ -237,6 +239,15 @@ Links the generated units — timers plus the service — into `/etc/systemd/sys
 ```bash
 # Called by setup.py, or run manually:
 sudo bash scripts/install-systemd.sh <overlay-dir> [--enable-service]
+```
+
+### `scripts/refresh_units.py` — Re-render the Installed Unit
+Answers "what unit would `setup.py` generate on this machine today", and installs it only if that differs from what is there. Both deploy scripts call it, because a pulled change to `config/kbots.service` otherwise reaches no running machine: the service re-execs the unit the setup wizard rendered, and nobody re-runs the wizard on a working box. Works on systemd and on launchd, where it does a real `bootout`+`bootstrap` (`kickstart -k` re-runs the *loaded* job, so a plist edit it appears to apply is not applied) and restores the previous plist if the new one fails to load.
+
+Exit `0` nothing changed, `10` a unit was updated, `1` a unit was written but could not be made live. It will not overwrite a `/etc/systemd/system/kbots.service` that a hand-edit turned from a symlink into a regular file, and it refuses to run from a checkout other than the one the installed unit runs from.
+```bash
+uv run --no-sync python scripts/refresh_units.py --dry-run
+uv run --no-sync python scripts/refresh_units.py --reload
 ```
 
 ### `scripts/vendor-mermaid.sh` — Vendor mermaid.js for Offline Diagrams

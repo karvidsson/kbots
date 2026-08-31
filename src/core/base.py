@@ -274,10 +274,31 @@ def install_write_root() -> Path:
     return Path(overlay) if overlay else PROJECT_ROOT
 
 
+# The overlay subdirectories the SERVICE must be able to write into, and the
+# one state lives in. setup.py builds the unit's ReadWritePaths from this list
+# (service_writable_dirs) and overlay_state_path resolves against the same
+# constant, so the sandbox and the code cannot hold different opinions about
+# where state goes.
+#
+# They used to be two independent lists, and every difference between them was
+# a runtime-only failure: the code wrote somewhere the unit had not granted, it
+# failed with EROFS days after install, never in tests, and never on the
+# developer's Mac, which has no sandbox at all. Four separate bugs were that
+# one bug. Adding a new state file must not be able to reintroduce it, so there
+# is one list and a test that holds the two ends together.
 OVERLAY_STATE_DIR = "data"
-"""Where shared state lives under the overlay. setup.py derives the unit's
-ReadWritePaths from this same name, so the writable list and the write path
-cannot drift apart."""
+OVERLAY_WRITABLE_SUBDIRS = ("agents", "config", OVERLAY_STATE_DIR, "tmp",
+                            "tools", "skills")
+
+
+def overlay_writable_dirs(overlay: str | Path) -> list[Path]:
+    """Every overlay directory the running service writes into.
+
+    The source the unit's ReadWritePaths is generated from. Anything the engine
+    writes at runtime belongs under one of these; if it does not, the answer is
+    to put it under one, not to widen the grant.
+    """
+    return [Path(overlay) / d for d in OVERLAY_WRITABLE_SUBDIRS]
 
 
 def overlay_state_path(name: str) -> Path | None:
