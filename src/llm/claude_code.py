@@ -32,6 +32,29 @@ logger = logging.getLogger(__name__)
 # screenshots from chrome_browser). Raise it so readline() doesn't raise LimitOverrunError.
 _STREAM_LIMIT = 16 * 1024 * 1024  # 16MB
 
+# How long a resumed session may take to produce its FIRST stream event, i.e. to
+# load the transcript, connect the MCP servers and reach `{"type":"system",
+# "subtype":"init"}`. This is a liveness deadline, not a work deadline: once the
+# CLI has proved it is running, the turn gets the full configured timeout.
+#
+# It used to be a cap on the whole turn, which meant a resumed turn that merely
+# took a long time was killed and logged as a hang. It was not a hang. A session
+# that this cap had given up on resumed by hand in 50s, and a fresh session in
+# the same directory with the same MCP servers starts in 6s; the turns being
+# killed were doing real work past the ten-minute mark. Fresh sessions never had
+# the cap and do not get one here, so no call that used to succeed can now fail.
+_RESUME_STARTUP_TIMEOUT = 600
+
+
+class _StartupTimeoutError(Exception):
+    """A resumed session produced no stream event before the liveness deadline.
+
+    Distinct from `asyncio.TimeoutError` because the two mean opposite things
+    and want opposite responses: this one says the CLI never came up, so the
+    session is worth abandoning. A plain timeout says the turn ran long, which
+    is not evidence of anything being wrong with the session.
+    """
+
 
 def session_transcript_path(cwd: "Path | str", session_id: str) -> Path:
     """Path to the Claude Code per-session transcript JSONL.
@@ -268,6 +291,8 @@ class ClaudeCodeProvider(LLMProvider):
         self._claude_bin = config.get("claude_bin", "claude")
         self._default_model = config.get("model", "sonnet")
         self._timeout = config.get("timeout", 3600)
+        self._startup_timeout = config.get(
+            "resume_startup_timeout", _RESUME_STARTUP_TIMEOUT)
 
     async def complete(
         self,
@@ -396,20 +421,31 @@ class ClaudeCodeProvider(LLMProvider):
                 if proc_callback:
                     proc_callback(proc)
 
-                # Cap resume attempts at 10 min to catch hang-on-stale-resume without
-                # killing legitimate long-running turns. Opus high-effort with several
-                # tool calls can exceed 5 min of wall-clock. Fresh sessions keep the
-                # full configured timeout.
+                # Two deadlines, because they answer different questions.
+                # `startup` asks whether the CLI came up at all, and only a
+                # resumed session can fail that way. `timeout` asks how long the
+                # turn may run, and is the same whether we resumed or not.
                 timeout = kwargs.get("timeout", self._timeout)
-                if "--resume" in args:
-                    timeout = min(timeout, 600)
+                startup = self._startup_timeout if "--resume" in args else None
                 # Stream stdout events (reporting tool progress); stdout_text is
                 # the final 'result' event JSON for the parsing/error paths below.
-                stdout_text, stderr_text = await asyncio.wait_for(
+                started = asyncio.Event()
+                run_task = asyncio.ensure_future(
                     self._stream_run(proc, prompt, kwargs.get("progress_callback"),
-                                     denial_sink=denials),
-                    timeout=timeout,
-                )
+                                     denial_sink=denials, started=started))
+                try:
+                    if startup is not None:
+                        await self._await_startup(started, run_task, startup)
+                    stdout_text, stderr_text = await asyncio.wait_for(
+                        run_task, timeout=timeout)
+                finally:
+                    # wait_for already cancels on its own timeout; this covers
+                    # the startup deadline and any cancellation from above, so
+                    # the reader task cannot outlive the process it is reading.
+                    if not run_task.done():
+                        run_task.cancel()
+                        with contextlib.suppress(BaseException):
+                            await run_task
                 if denials:
                     from src.core.permission_watch import notify
                     notify("tool_denied", agent_id=agent_id or "",
@@ -571,28 +607,38 @@ class ClaudeCodeProvider(LLMProvider):
                     content="I can't start up right now — there's a system issue. Tell an admin.",
                     stop_reason="error",
                 )
+            except _StartupTimeoutError as e:
+                # The CLI never emitted a first event, so it never came up. This
+                # is the genuine stale-resume hang the old cap was aiming at, and
+                # now it is the only thing that reaches this branch. Drop the
+                # session and retry fresh rather than looping on doomed args;
+                # rebuild the prompt with resuming=False so SQLite history is
+                # injected into the fresh session, otherwise the transcript is
+                # lost every time a resume hangs.
+                if proc:
+                    proc.kill()
+                resume_idx = args.index("--resume")
+                hung_id = args[resume_idx + 1] if resume_idx + 1 < len(args) else "unknown"
+                args = [a for i, a in enumerate(args)
+                        if i != resume_idx and i != resume_idx + 1]
+                prompt = self._build_prompt(messages, resuming=False)
+                logger.warning(
+                    f"{tag}Session --resume {hung_id} produced no output in {e}s "
+                    f"(attempt {attempt}/{max_attempts}) — dropping, retrying fresh "
+                    f"with history replay"
+                )
+                continue
             except asyncio.TimeoutError:
                 if proc:
                     proc.kill()
+                # Reaching here means the CLI was alive and streaming and the
+                # turn still ran past the full timeout. That is a long turn, not
+                # a broken session, so say so: calling it a hang is what sent
+                # people looking at session files instead of at the work.
                 logger.error(
-                    f"{tag}Claude Code timed out (attempt {attempt}/{max_attempts}) "
-                    f"after {timeout}s"
+                    f"{tag}Claude Code turn exceeded {timeout}s "
+                    f"(attempt {attempt}/{max_attempts})"
                 )
-                # Hang on --resume is the usual cause. Drop the stale session and retry
-                # fresh rather than looping on the same doomed args. Rebuild the prompt
-                # with resuming=False so SQLite history is injected into the fresh session
-                # — otherwise the transcript is lost every time --resume hangs.
-                if "--resume" in args:
-                    resume_idx = args.index("--resume")
-                    hung_id = args[resume_idx + 1] if resume_idx + 1 < len(args) else "unknown"
-                    args = [a for i, a in enumerate(args)
-                            if i != resume_idx and i != resume_idx + 1]
-                    prompt = self._build_prompt(messages, resuming=False)
-                    logger.warning(
-                        f"{tag}Session --resume {hung_id} hung — dropping, retrying fresh "
-                        f"with history replay"
-                    )
-                    continue
                 if attempt < max_attempts:
                     continue
                 return LLMResponse(
@@ -633,8 +679,29 @@ class ClaudeCodeProvider(LLMProvider):
         """Build a prompt string from messages (see build_cli_prompt)."""
         return build_cli_prompt(messages, resuming=resuming)
 
+    @staticmethod
+    async def _await_startup(started: asyncio.Event, run_task, timeout: float) -> None:
+        """Wait until the CLI proves it is alive, or give up on the session.
+
+        Returns as soon as the first stream event lands. Also returns if the run
+        finishes first: a process that exits before emitting anything (a dead
+        session, an auth failure) has already answered the liveness question,
+        and must not be held here for the full deadline while the caller's own
+        error handling waits on it.
+        """
+        waiter = asyncio.ensure_future(started.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {waiter, run_task}, timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            waiter.cancel()
+        if not done:
+            raise _StartupTimeoutError(int(timeout))
+
     async def _stream_run(self, proc, prompt: str, progress_cb,
-                          denial_sink: list[str] | None = None) -> tuple[str, str]:
+                          denial_sink: list[str] | None = None,
+                          started: asyncio.Event | None = None) -> tuple[str, str]:
         """Feed the prompt, stream stdout events, report tool progress.
 
         Returns (result_json, stderr) where result_json is the final 'result'
@@ -673,6 +740,12 @@ class ClaudeCodeProvider(LLMProvider):
             s = line.decode(errors="replace").strip()
             if not s:
                 continue
+            # Any line at all means the CLI is up: the transcript loaded and the
+            # MCP servers connected. Signalled before parsing, so a line we can't
+            # read still counts as liveness — the alternative is killing a
+            # working session over an unrecognised event type.
+            if started is not None and not started.is_set():
+                started.set()
             try:
                 event = json.loads(s)
             except json.JSONDecodeError:
