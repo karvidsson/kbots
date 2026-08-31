@@ -26,10 +26,16 @@ from typing import get_type_hints
 import aiohttp
 from mcp.server.fastmcp import FastMCP
 
-from src.core.alerts import WEB_FACING_TOOLS, AlertSender
+from src.core.alert_details import AlertDetailStore
+from src.core.alerts import WEB_FACING_TOOLS, AlertSender, describe_target
 from src.core.audit import AuditLog, redact_secrets, scrub_value
 from src.core.base import PROJECT_ROOT, ToolContext, ToolDef, read_vault_key_file, resolve_vault_key_file
-from src.core.content_safety import sanitize, score_injection
+from src.core.content_safety import (
+    SANITIZE_SIGNAL_CATEGORIES,
+    format_sanitize_detail,
+    sanitize_report,
+    score_injection,
+)
 from src.core.rate_limiter import RateLimiter
 from src.core.registry import Registry
 from src.core.storage import resolve_db_path
@@ -67,6 +73,11 @@ def _resolve_agent_id() -> str:
 
 
 MCP_AGENT_ID = _resolve_agent_id()
+
+#: Detail this process could not fit in an alert, for the connector process to
+#: hand over on a reaction. The two run separately, so the handover is a file
+#: on disk rather than anything in memory.
+alert_details = AlertDetailStore()
 
 
 # --- HITL via Discord API (MCP server can't use connector directly) ---
@@ -525,11 +536,21 @@ def _make_middleware_handler(
             # --- Content safety scan for web-facing tools ---
             result_str = str(result) if result is not None else "(no output)"
             if _name in WEB_FACING_TOOLS and result_str:
+                # An alert that names only the tool cannot be acted on: it does
+                # not say whether the content came from a news site or from
+                # somewhere nothing should have been fetching, and those need
+                # opposite responses. Every alert here now carries the target
+                # and the agent that asked for it.
+                target = describe_target(_name, kwargs)
+                source_line = f"Source: {target}\n" if target else ""
+                agent_line = f"Agent: `{MCP_AGENT_ID}`\n"
+
                 score, matched = score_injection(result_str)
                 if score >= 3:
                     alert_msg = (
                         f"\u26a0\ufe0f **Content Safety Alert**\n"
                         f"Tool: `{_name}`\n"
+                        f"{agent_line}{source_line}"
                         f"Injection score: **{score}/10**\n"
                         f"Patterns: {', '.join(matched[:5])}"
                     )
@@ -539,19 +560,40 @@ def _make_middleware_handler(
                     if alerter:
                         alerter.send_bg(alert_msg)
 
-                # Sanitization — log-only mode: alert on what would be stripped
+                # Sanitization - log-only mode: report what would be stripped
                 # but pass original content through to the LLM unchanged.
                 # Flip to active stripping later once false-positive rate is known.
-                sanitized = sanitize(result_str)
-                chars_removed = len(result_str) - len(sanitized)
-                if chars_removed > 50:
-                    logger.info(f"Sanitize check on {_name}: {chars_removed} chars would be removed")
-                    if alerter:
-                        alerter.send_bg(
-                            f"\U0001f9f9 **Sanitize Check (log-only)**\n"
-                            f"Tool: `{_name}`\n"
-                            f"Would remove: **{chars_removed}** chars (hidden/invisible content)"
-                        )
+                #
+                # The alert fires on the categories that mean CONCEALMENT
+                # (invisible Unicode, oversized base64), not on total volume.
+                # A total is dominated by stripped markup and collapsed
+                # whitespace on every ordinary page, so a threshold on it fired
+                # constantly, said only "this was HTML", and buried the two
+                # categories anyone would act on. It also left the
+                # false-positive question above unanswerable, because one
+                # number conflated "the page had tags" with "the page had
+                # hidden characters".
+                report = sanitize_report(result_str)
+                if report.total_removed:
+                    logger.info(f"Sanitize check on {_name}: {report.summary()}")
+                if report.signal_removed > 0 and alerter:
+                    signal = ", ".join(
+                        f"{n} {c}" for c, n in report.removed.items()
+                        if c in SANITIZE_SIGNAL_CATEGORIES and n)
+                    detail = format_sanitize_detail(report)
+                    alerter.send_bg(
+                        f"\U0001f9f9 **Sanitize Check (log-only)**\n"
+                        f"Tool: `{_name}`\n"
+                        f"{agent_line}{source_line}"
+                        f"Concealed: **{report.signal_removed}** chars ({signal})\n"
+                        f"Also normalized: "
+                        f"{report.total_removed - report.signal_removed} chars "
+                        f"of markup and whitespace\n"
+                        f"React \U0001f50d to see what was concealed.",
+                        on_sent=lambda mid: alert_details.put(
+                            mid, "Sanitize detail", detail,
+                            {"tool": _name, "agent": MCP_AGENT_ID, "target": target}),
+                    )
 
             return result_str
 

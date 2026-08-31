@@ -17,6 +17,11 @@ from src.core.reply_shorten import ReplyShortener, wants_more
 
 logger = logging.getLogger(__name__)
 
+#: The "show me the rest" reaction. Shared deliberately with the reply
+#: shortener: one gesture for one meaning is worth more than one emoji per
+#: feature, and the handler resolves which one applies by what is stored.
+REVEAL_EMOJI = "\U0001f50d"
+
 # Bot-to-bot loop detection settings
 _BOT_LOOP_WINDOW = 60       # seconds to track interactions
 _BOT_LOOP_MAX_HITS = 5      # max substantive bot-to-bot exchanges in window
@@ -1281,6 +1286,12 @@ class DiscordBot:
 
         # Expand a shortened reply. Checked first and cheap: it is a read of
         # one file and it must never be shadowed by another handler.
+        #
+        # It falls THROUGH when it has nothing stored rather than returning.
+        # Returning made the shortener's emoji its private property: any 🔍 on
+        # any message it had not shortened was swallowed silently, so a second
+        # feature reusing the same emoji could never fire and would look broken
+        # with nothing in the logs to say why.
         shortener = getattr(self.connector, "_shortener", None)
         if shortener and emoji == shortener.emoji:
             rest = shortener.store.take(str(payload.message_id))
@@ -1288,7 +1299,14 @@ class DiscordBot:
                 await self.connector.send(str(payload.channel_id), rest,
                                           bot_account=self.account_name,
                                           no_shorten=True)
-            return
+                return
+
+        # Reveal what a sanitize alert would have stripped. Same emoji as the
+        # reply expander and the same idea: the summary is posted, the content
+        # is held, and it arrives when someone asks.
+        if emoji == REVEAL_EMOJI:
+            if await self._handle_alert_reveal(payload):
+                return
 
         # Lesson feedback: 👍/👎 on a reply nudges the lessons it used.
         if emoji in ("👍", "👎"):
@@ -1395,6 +1413,29 @@ class DiscordBot:
             tc.record_reward(message_id, agent, "up" if emoji == "👍" else "down", user_id)
         except Exception as e:
             logger.debug(f"training reward record failed: {e}")
+
+    async def _handle_alert_reveal(self, payload) -> bool:
+        """🔍 on an alert → post what the alert summarised. True if handled.
+
+        Admin only. The detail is content the sanitizer flagged, so revealing it
+        prints attacker-controlled text into a channel; that is worth doing for
+        whoever is investigating and is not worth doing for everyone who can see
+        the alert channel. A non-admin reaction is left unhandled rather than
+        refused, so it falls through to whatever else claims that emoji.
+        """
+        from src.core.alert_details import AlertDetailStore, render_detail
+
+        record = AlertDetailStore().get(str(payload.message_id))
+        if not record:
+            return False
+        if not self._is_admin(payload.user_id):
+            logger.info(
+                f"Alert reveal refused for non-admin {payload.user_id} "
+                f"on message {payload.message_id}")
+            return False
+        await self.connector.send(str(payload.channel_id), render_detail(record),
+                                  bot_account=self.account_name, no_shorten=True)
+        return True
 
     async def _handle_lesson_feedback(self, message_id: str, emoji: str) -> None:
         """👍/👎 on a reply → nudge the confidence of the lessons that reply used."""
