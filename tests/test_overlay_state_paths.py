@@ -20,6 +20,19 @@ from src.core.base import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_runtime_flags():
+    """Opt out of conftest's runtime-flag isolation.
+
+    That fixture redirects runtime_state's path resolvers at a tmp file so no
+    test reads the deployment's live flags. These tests ARE the path resolvers,
+    so they need the real ones. Shadowing the fixture by name is pytest's
+    supported way to say that, and it keeps the exception next to the reason
+    rather than as a list of names in conftest.
+    """
+    return None
+
+
 @pytest.fixture
 def overlay(tmp_path, monkeypatch):
     monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
