@@ -9,6 +9,13 @@ from src.core import identity_boot as ib
 
 REPO = Path(__file__).resolve().parent.parent
 
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_flags():
+    """Opt out of conftest's runtime-flag isolation: the flag-file location is
+    part of what these tests assert. See tests/test_overlay_state_paths.py."""
+    return None
+
 CONFIGS = {
     "botson": {"display_name": "Botson",
                "routing": {"discord": {"account": "botson"}}},
