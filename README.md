@@ -4,6 +4,10 @@
 [![License: MIT](https://img.shields.io/github/license/karvidsson/kbots?color=blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12%2B-blue)](https://github.com/karvidsson/kbots/blob/main/pyproject.toml)
 
+[![commits](https://contrib.run/shield/karvidsson/kbots/contributions.svg)](https://contrib.run/drive/karvidsson/kbots)
+[![track difficulty](https://contrib.run/shield/karvidsson/kbots/difficulty.svg)](https://contrib.run/drive/karvidsson/kbots)
+[![race this repo](https://contrib.run/shield/karvidsson/kbots/race.svg)](https://contrib.run/drive/karvidsson/kbots)
+
 kbots turns a chat server into a team of persistent AI agents. Each agent lives in its own project directory, thinks with the LLM you give it, remembers across sessions, and does real work through tools — all from a single Python process with SQLite underneath. Nothing else to run: no containers, no external databases, no queue.
 
 ```
