@@ -336,6 +336,24 @@ def show_invite_link(state: dict, bot_name: str, token: str,
 # Steps
 # ==========================================================================
 
+_LINUX_PKG_MANAGERS = (
+    ("apt-get", ["sudo", "apt-get", "install", "-y"]),
+    ("dnf", ["sudo", "dnf", "install", "-y"]),
+    ("yum", ["sudo", "yum", "install", "-y"]),
+    ("pacman", ["sudo", "pacman", "-S", "--noconfirm"]),
+    ("zypper", ["sudo", "zypper", "install", "-y"]),
+    ("apk", ["sudo", "apk", "add"]),
+)
+
+
+def _linux_pkg_install_cmd(package: str) -> list[str] | None:
+    """The install command for `package` on this Linux, or None if unknown."""
+    for binary, prefix in _LINUX_PKG_MANAGERS:
+        if shutil.which(binary):
+            return prefix + [package]
+    return None
+
+
 def step_dependencies(state: dict):
     header("Step 1: Dependencies")
 
@@ -385,11 +403,18 @@ def step_dependencies(state: dict):
                 else:
                     warn("Homebrew not found — install jq manually: https://jqlang.org/download/")
             else:
-                try:
-                    subprocess.run(["sudo", "apt-get", "install", "-y", "jq"], check=True)
-                    ok("jq installed")
-                except subprocess.CalledProcessError:
-                    warn("Failed to install jq — install manually: sudo apt install jq")
+                # Not every Linux is Debian: pick the package manager that is
+                # actually on PATH rather than assuming apt-get.
+                cmd = _linux_pkg_install_cmd("jq")
+                if cmd is None:
+                    warn("No known package manager found — install jq manually: "
+                         "https://jqlang.org/download/")
+                else:
+                    try:
+                        subprocess.run(cmd, check=True)
+                        ok("jq installed")
+                    except subprocess.CalledProcessError:
+                        warn(f"Failed to install jq — install manually: {' '.join(cmd)}")
 
     # pkgx (optional): zero-install CLI provider — media tools (ffmpeg), tmux,
     # and agents' Bash can then run CLI deps on demand, cached, no sudo.
@@ -491,9 +516,15 @@ def step_install(state: dict):
         if install_dir.exists() and any(install_dir.iterdir()):
             err(f"{install_dir} exists and is not an engine clone — choose another directory.")
             sys.exit(1)
-        # Create the parent (may need sudo for /opt on Linux)
+        # Create the parent (may need sudo for /opt on Linux). A target that
+        # already exists (empty) and is writable needs nothing from its parent:
+        # `sudo mkdir /opt/kbots && sudo chown $USER /opt/kbots` is the
+        # documented no-passwordless-sudo path, and it must not be rejected
+        # because /opt itself is root-owned.
         parent = install_dir.parent
-        if not os.access(parent if parent.exists() else parent.parent, os.W_OK):
+        if install_dir.is_dir() and os.access(install_dir, os.W_OK):
+            pass
+        elif not os.access(parent if parent.exists() else parent.parent, os.W_OK):
             if _check_sudo():
                 subprocess.run(["sudo", "-n", "mkdir", "-p", str(parent)], check=True)
                 subprocess.run(
@@ -501,7 +532,8 @@ def step_install(state: dict):
                 )
             else:
                 err(f"No write access to {parent} and no passwordless sudo.")
-                info(f"Create it manually (sudo mkdir -p {parent} && sudo chown $USER {parent}) and re-run.")
+                info(f"Create it manually (sudo mkdir -p {install_dir} && "
+                     f"sudo chown $USER {install_dir}) and re-run.")
                 sys.exit(1)
         info(f"Cloning engine to {install_dir} ...")
         try:
@@ -706,8 +738,18 @@ def step_modules(state: dict):
     # Default to 2-layer unless extension modules are present on disk
     default_pattern = "1" if modules_root is None else "2"
     print()
-    pattern = ask("Deployment pattern [1=2-layer, 2=3-layer]", default_pattern)
-    state["deployment_pattern"] = "2-layer" if pattern.strip() in ("1", "2-layer") else "3-layer"
+    # Validate rather than treating anything that isn't "1" as 3-layer: a typo
+    # here used to silently pick the advanced pattern and then ask for a
+    # modules path nobody has.
+    while True:
+        pattern = ask("Deployment pattern [1=2-layer, 2=3-layer]", default_pattern).strip()
+        if pattern in ("1", "2-layer"):
+            state["deployment_pattern"] = "2-layer"
+            break
+        if pattern in ("2", "3-layer"):
+            state["deployment_pattern"] = "3-layer"
+            break
+        err("Please enter 1 (2-layer) or 2 (3-layer).")
 
     if state["deployment_pattern"] == "2-layer":
         print()
@@ -1036,7 +1078,13 @@ def step_team(state: dict):
     info("Set up your profile so the system knows who you are.")
     print()
 
-    name = ask("Your name")
+    # The name doubles as the owner's team.json id — a blank one produces
+    # an entry with id "" that nothing can address.
+    while True:
+        name = ask("Your name")
+        if name:
+            break
+        err("Required — a name is needed for the owner profile.")
     role = ask("Your role", "Founder")
     timezone = ask("Timezone (e.g. Europe/Stockholm, America/New_York, or UTC)", "UTC")
     context = ask("Short context (what you do)")
