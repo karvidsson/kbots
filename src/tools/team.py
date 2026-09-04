@@ -112,8 +112,9 @@ def reconcile_roster(config: dict) -> None:
             agents.append(e)
         team["agents"] = agents   # replaces the list → prunes anything not in config
         _save_team(team)
+        pruned = set(existing) - {a.get("id") for a in agents}
         logger.info(f"roster reconciled: {len(agents)} agents from config "
-                    f"(pruned {len(existing) - len(agents)} stale)")
+                    f"(pruned {len(pruned)} stale)")
 
 TEAM_FILE = resolve_config_file("team.json")
 
