@@ -8,11 +8,13 @@
 [![track difficulty](https://contrib.run/shield/karvidsson/kbots/difficulty.svg)](https://contrib.run/drive/karvidsson/kbots)
 [![race this repo](https://contrib.run/shield/karvidsson/kbots/race.svg)](https://contrib.run/drive/karvidsson/kbots)
 
-kbots turns a chat server into a team of persistent AI agents. Each agent lives in its own project directory, thinks with the LLM you give it, remembers across sessions, and does real work through tools — all from a single Python process with SQLite underneath. Nothing else to run: no containers, no external databases, no queue.
+kbots is a harness of harnesses and local LLM models. It runs a team of persistent AI agents on top of the coding harnesses you already have (the **Claude Code CLI**, the **Codex CLI**) or on **local models** through Ollama and LM Studio, from a chat server you already use. Each agent lives in its own project directory, remembers across sessions, and does real work through tools — all from a single Python process with SQLite underneath. Nothing else to run: no containers, no external databases, no queue.
 
 ```
 Discord message → Router → Agent (project context + memory) → LLM → tools → reply
 ```
+
+**What survives an engine swap.** The agent belongs to kbots, not to the thing that runs the turn: its identity, memory, tool loadout, permissions and schedule all live here. `provider:` is set per agent, so the same agent moves between a harness and a local model and keeps every one of those. See [LLM engine](#llm-engine) for what changes and what does not.
 
 **First time here?** Jump to [Quickstart](#quickstart--zero-to-agent) — four steps, ~10 minutes, ends with an agent answering you in Discord. Hacking on the engine? See [Dev loop](#dev-loop).
 
@@ -22,7 +24,7 @@ Discord message → Router → Agent (project context + memory) → LLM → tool
 - **Trainable** — opt-in, captures every turn (prompt → full tool trace → response → 👍/👎 outcome) and exports to nanoGPT / MLX-LM / OpenAI / DPO-KTO to fine-tune a **local model** on the agents' own work
 - **A real team, not one bot** — any number of agents, each with its own Discord identity, personality, permissions, and tool loadout
 - **Memory that persists and improves** — SQLite FTS5 + semantic embeddings for recall, plus a lessons layer: agents record what worked, outcomes (👍/👎, corrections) adjust confidence, and a cheap-model reflector distills each agent's `LESSONS.md`, loaded at session start
-- **Local models** — run agents on Ollama / LM Studio models (auto-detected), or enable the quality-first **tier router**: a tiny local model answers simple requests locally, Claude handles the rest
+- **Any engine, one agent** — set `provider:` per agent: the **Claude Code CLI**, the **Codex CLI**, or a **local model** via Ollama / LM Studio (auto-detected). Identity, tools, memory and the approval gate are enforced by kbots either way, so changing engine does not rebuild the agent. Optional quality-first **tier router**: a tiny local model answers simple requests locally, Claude handles the rest
 - **Create-then-operate** — Claude builds a tool + a scoped skill from a chat request (one HITL code review); from then on a **local model operates it** on demand/cron/webhook — or zero-LLM tool-direct — at zero subscription cost. See [docs/CREATE_THEN_OPERATE.md](docs/CREATE_THEN_OPERATE.md)
 - **Automation built in** — agents schedule their own cron/interval/one-off tasks, and external systems (smart-home hubs, webhooks, CI) can fire agent actions through per-registration secrets
 - **Self-healing deploys** — updates are test-gated with automatic rollback, and an independent watchdog restarts and rolls back the service if anything ever crash-loops it
@@ -528,6 +530,20 @@ Full control makes the main agent a **privileged** agent (`Bash(*)`, no builtin 
 
 ## LLM engine
 
+An agent runs in one of two shapes, and the difference is who drives the turn:
+
+```
+provider        agent loop           tool execution
+──────────────────────────────────────────────────────────
+claude_code     Claude Code CLI      kbots, over MCP
+codex_cli       Codex CLI            kbots, over MCP
+local           kbots itself         kbots, directly
+```
+
+With `claude_code` or `codex_cli`, kbots is a harness of harnesses: the CLI drives the turn and calls back into kbots' MCP server for every tool. With `local` there is no inner harness at all, and kbots' own loop drives the model.
+
+The agent is the same one in both shapes. `AGENTS.md` is the single identity file (Codex reads it natively, Claude Code reaches it through a `CLAUDE.md` stub), the tool surface is identical, and rate limits, access control and the approval gate are enforced by the engine rather than by whatever is running the turn. That is what makes the engine a per-agent setting instead of a rewrite.
+
 The primary engine is the **Claude Code CLI**, authenticated with your Claude subscription (**Pro or Max** — no per-token API costs) or with pay-as-you-go API/Console billing. Max is recommended for multi-agent setups thanks to higher usage limits. Each agent runs as its own Claude Code subprocess that:
 
 - reaches the whole toolset over MCP (Model Context Protocol)
@@ -541,7 +557,7 @@ The primary engine is the **Claude Code CLI**, authenticated with your Claude su
 
 **Zero-install CLI deps (pkgx).** External binaries the media/system tools need (ffmpeg, tmux, …) resolve at call time: PATH first, then — if the optional [pkgx](https://pkgx.sh) (4MiB) is installed — via `pkgx -q <tool>`, fetched and cached on first use with no sudo and nothing installed system-wide. Agents' Bash sessions can likewise `pkgx <tool>` for one-off CLIs instead of brew/apt installs. Without pkgx, missing binaries return a clean install hint instead of raw errors.
 
-**Local models.** Agents can also run on local models via **Ollama or LM Studio** (`llm: {provider: local, model: qwen3.5:9b}`) — both speak the same OpenAI-compatible API and are auto-detected. Local agents get the full toolset (rate-limits, access control, and HITL enforced by the engine). An optional **tier router** puts a tiny local model in front of Claude: clearly-simple requests are answered by a local workhorse model, everything uncertain escalates to Claude (quality-first) — cutting subscription usage without giving up Claude-level answers. The setup wizard detects your RAM and picks matching models. See [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md).
+**Local models.** An agent runs fully locally via **Ollama or LM Studio** (`llm: {provider: local, model: qwen3.5:9b}`) — both speak the same OpenAI-compatible API and are auto-detected. Local agents get the full toolset (rate-limits, access control, and HITL enforced by the engine). An optional **tier router** puts a tiny local model in front of Claude: clearly-simple requests are answered by a local workhorse model, everything uncertain escalates to Claude (quality-first) — cutting subscription usage without giving up Claude-level answers. The setup wizard detects your RAM and picks matching models. See [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md).
 
 ## Memory
 
