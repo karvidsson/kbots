@@ -8,13 +8,13 @@
 [![track difficulty](https://contrib.run/shield/karvidsson/kbots/difficulty.svg)](https://contrib.run/drive/karvidsson/kbots)
 [![race this repo](https://contrib.run/shield/karvidsson/kbots/race.svg)](https://contrib.run/drive/karvidsson/kbots)
 
-kbots turns a chat server into a team of persistent AI agents. Each agent lives in its own project directory, thinks with the LLM you give it, remembers across sessions, and does real work through tools — all from a single Python process with SQLite underneath. Nothing else to run: no containers, no external databases, no queue.
+kbots is a harness of harnesses and local LLM models. It runs a team of persistent AI agents on top of the coding harnesses you already have (the **Claude Code CLI**, the **Codex CLI**) or on **local models** through Ollama and LM Studio, from a chat server you already use. Each agent lives in its own project directory, remembers across sessions, and does real work through tools — all from a single Python process with SQLite underneath. Nothing else to run: no containers, no external databases, no queue.
 
 ```
 Discord message → Router → Agent (project context + memory) → LLM → tools → reply
 ```
 
-**Your agents, any engine.** The agent belongs to kbots, not to the model that runs the turn: its identity, memory, tool loadout, permissions and schedule all live here. `provider:` is set per agent, so the same agent can run on the Claude Code CLI, on the Codex CLI, or on a local model in Ollama or LM Studio, and keep every one of those things when you switch. See [LLM engine](#llm-engine) for what changes and what does not.
+**What survives an engine swap.** The agent belongs to kbots, not to the thing that runs the turn: its identity, memory, tool loadout, permissions and schedule all live here. `provider:` is set per agent, so the same agent moves between a harness and a local model and keeps every one of those. See [LLM engine](#llm-engine) for what changes and what does not.
 
 **First time here?** Jump to [Quickstart](#quickstart--zero-to-agent) — four steps, ~10 minutes, ends with an agent answering you in Discord. Hacking on the engine? See [Dev loop](#dev-loop).
 
