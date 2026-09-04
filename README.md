@@ -44,10 +44,10 @@ From clone to a Discord agent that answers you, in four steps. The wizard does t
 
 - [ ] **A machine** — Linux VPS (2 CPU, 4GB RAM) for production, or a Mac for local use
 - [ ] **Python 3.12+** (the wizard installs `uv` and everything else itself)
-- [ ] **An LLM engine** — kbots is engine-agnostic; agents pick a provider per agent:
-  - **Claude Code CLI** (recommended, and what the setup wizard assumes for your first agent): a **Claude Pro or Max** subscription, no API key needed — Max has the higher usage limits if you'll run several agents. Pay-as-you-go **API/Console billing** also works (`claude auth login --console`).
-  - **OpenAI Codex CLI**: a ChatGPT plan, `codex login` — set `llm.provider: codex_cli` on any agent.
-  - **Any OpenAI-compatible endpoint**, including fully local models via Ollama / LM Studio ([docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md)) — usable per agent or as the tier router that keeps simple turns off your paid plan.
+- [ ] **A harness, or a local LLM** — at least one of these, already installed and signed in. Each agent picks one with `provider:`, so you can start with a single engine and add others later:
+  - **Claude Code CLI** — `claude`, already authenticated. What the setup wizard assumes for your first agent.
+  - **OpenAI Codex CLI** — `codex`, already authenticated. Set `llm.provider: codex_cli` on an agent.
+  - **A local model** — Ollama or LM Studio running with a model pulled, auto-detected on its default port. Usable as an agent's own engine, or as the tier router in front of a harness. See [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md).
 - [ ] **A Discord account** and a server where you have admin rights
 - [ ] ~10 minutes
 
