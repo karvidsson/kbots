@@ -239,6 +239,10 @@ security:
     channel: "YOUR_OPS_CHANNEL_ID"
     approvers: ["YOUR_DISCORD_USER_ID"]
     timeout: 1800
+    # Approvers are DM'd when a request is posted, again if it is still
+    # unanswered after remind_after seconds, and once more if it times out.
+    # Default is half the timeout. Set to 0 to send no reminder.
+    remind_after: 900
     fail_mode: closed
     poll_interval: 3
     gated_tools:

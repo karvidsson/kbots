@@ -277,7 +277,9 @@ async def main() -> None:
     # no channel is configured (previously a missing channel meant no gate at all).
     hitl_cfg = security_cfg.get("hitl", {})
     admin_discord = (config.get("admin_users", {}) or {}).get("discord", [])
-    hitl = HITLGate(hitl_cfg, storage._db, admin_users=admin_discord)
+    # vault: only so the gate can DM approvers that something is waiting on
+    # them. Without it the gate still gates, it just waits silently.
+    hitl = HITLGate(hitl_cfg, storage._db, admin_users=admin_discord, vault=vault)
     await hitl.init_schema()
     await hitl.load_enabled()
     if not hitl_cfg.get("channel"):

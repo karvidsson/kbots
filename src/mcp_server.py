@@ -98,6 +98,9 @@ class MCPHitlGate:
         self.poll_interval = config.get("poll_interval", 3)
         self.fail_mode = config.get("fail_mode", "closed")
         self.gated_tools = set(config.get("gated_tools", []))
+        self.remind_after = config.get("remind_after")
+        self._notifier = None
+        self._guild_id: str | None = None
 
     @property
     def channel_id(self):
@@ -114,6 +117,22 @@ class MCPHitlGate:
             if pattern.endswith("*") and tool_name.startswith(pattern[:-1]):
                 return True
         return False
+
+    async def _get_notifier(self, token: str):
+        """DM notifier, built once. Never raises: a DM failure must not decide
+        whether a tool runs."""
+        if self._notifier is not None:
+            return self._notifier or None
+        if not token or not self.approvers:
+            self._notifier = False
+            return None
+        from src.core.hitl_notify import HitlNotifier, resolve_guild_id
+        if self._guild_id is None:
+            self._guild_id = await resolve_guild_id(token, self.channel_id or "")
+        self._notifier = HitlNotifier(
+            token, self.approvers, timeout=self.timeout,
+            remind_after=self.remind_after, guild_id=self._guild_id or "")
+        return self._notifier
 
     async def request_approval(self, tool_name: str, args: dict) -> dict:
         # HITL always uses the main kbots bot token (ops channel on production server)
@@ -148,11 +167,21 @@ class MCPHitlGate:
 
         try:
             return await asyncio.wait_for(
-                self._poll_approval(api, headers, msg_text, tool_name, hitl_id),
+                self._poll_approval(api, headers, msg_text, tool_name, hitl_id,
+                                    token=token, args_display=args_display),
                 timeout=self.timeout,
             )
         except asyncio.TimeoutError:
             logger.warning(f"HITL {hitl_id}: timeout after {self.timeout}s")
+            # Close the loop. A silent timeout is how an approval nobody saw
+            # becomes a denial nobody remembers refusing.
+            try:
+                notifier = await self._get_notifier(token)
+                if notifier:
+                    await notifier.resolved(agent_id=MCP_AGENT_ID, tool_name=tool_name,
+                                            hitl_id=hitl_id, status="timeout")
+            except Exception as e:
+                logger.warning(f"HITL timeout notice failed for {hitl_id}: {e}")
             if self.fail_mode == "open":
                 logger.warning(f"HITL {hitl_id}: fail_mode=open — auto-approving on timeout")
                 return {"status": "approved", "reason": "timeout, fail_mode=open", "hitl_id": hitl_id}
@@ -164,57 +193,105 @@ class MCPHitlGate:
             return {"status": "approved", "reason": f"error, fail_mode=open: {e}"}
 
     async def _poll_approval(self, api: str, headers: dict, msg_text: str,
-                             tool_name: str, hitl_id: str) -> dict:
+                             tool_name: str, hitl_id: str, token: str = "",
+                             args_display: str = "") -> dict:
         """Post HITL message and poll for reactions. Called within wait_for timeout."""
-        async with aiohttp.ClientSession() as session:
-            # Post message
-            async with session.post(
-                f"{api}/channels/{self.channel_id}/messages",
-                headers=headers,
-                json={"content": msg_text},
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"HITL post failed: {resp.status}")
-                    if self.fail_mode == "closed":
-                        return {"status": "denied", "reason": "failed to post"}
-                    return {"status": "approved", "reason": "post failed, fail_mode=open"}
-                msg_data = await resp.json()
-                message_id = msg_data["id"]
-
-            # Add reactions
-            for emoji in ["\u2705", "\u274c"]:
-                emoji_encoded = urllib.parse.quote(emoji)
-                r = await session.put(
-                    f"{api}/channels/{self.channel_id}/messages/{message_id}/reactions/{emoji_encoded}/@me",
+        reminder = None
+        # A one-element list rather than a bool, so the reminder's closure reads
+        # the value at fire time instead of the value at arming time.
+        answered = [False]
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Post message
+                async with session.post(
+                    f"{api}/channels/{self.channel_id}/messages",
                     headers=headers,
-                )
-                if r.status not in (200, 204):
-                    logger.warning(f"HITL add reaction failed: {r.status} {emoji}")
+                    json={"content": msg_text},
+                ) as resp:
+                    if resp.status != 200:
+                        logger.error(f"HITL post failed: {resp.status}")
+                        if self.fail_mode == "closed":
+                            return {"status": "denied", "reason": "failed to post"}
+                        return {"status": "approved", "reason": "post failed, fail_mode=open"}
+                    msg_data = await resp.json()
+                    message_id = msg_data["id"]
 
-            # Poll for reactions (timeout handled by asyncio.wait_for in caller)
-            while True:
-                await asyncio.sleep(self.poll_interval)
-
-                for emoji, status in [("\u2705", "approved"), ("\u274c", "denied")]:
+                # Add reactions
+                for emoji in ["\u2705", "\u274c"]:
                     emoji_encoded = urllib.parse.quote(emoji)
-                    react_url = f"{api}/channels/{self.channel_id}/messages/{message_id}/reactions/{emoji_encoded}"
-                    async with session.get(react_url, headers=headers) as resp:
-                        if resp.status != 200:
-                            continue
-                        reactors = await resp.json()
-                        for reactor in reactors:
-                            if reactor.get("bot"):
+                    r = await session.put(
+                        f"{api}/channels/{self.channel_id}/messages/{message_id}/reactions/{emoji_encoded}/@me",
+                        headers=headers,
+                    )
+                    if r.status not in (200, 204):
+                        logger.warning(f"HITL add reaction failed: {r.status} {emoji}")
+
+                # DM the approvers. The requesting agent is blocked inside this
+                # call and cannot say "I am waiting" for itself, so silence in
+                # its own channel reads as a failure until someone happens to
+                # look at the approvals channel.
+                reminder = await self._notify_waiting(
+                    token, tool_name, hitl_id, args_display, message_id, answered)
+
+                # Poll for reactions (timeout handled by wait_for in the caller)
+                while True:
+                    await asyncio.sleep(self.poll_interval)
+
+                    for emoji, status in [("\u2705", "approved"), ("\u274c", "denied")]:
+                        emoji_encoded = urllib.parse.quote(emoji)
+                        react_url = f"{api}/channels/{self.channel_id}/messages/{message_id}/reactions/{emoji_encoded}"
+                        async with session.get(react_url, headers=headers) as resp:
+                            if resp.status != 200:
                                 continue
-                            reactor_id = str(reactor["id"])
-                            if reactor_id in self.approvers:
-                                logger.info(f"HITL {hitl_id}: {status} by {reactor_id}")
-                                result_icon = "Approved" if status == "approved" else "Denied"
-                                await session.post(
-                                    f"{api}/channels/{self.channel_id}/messages",
-                                    headers=headers,
-                                    json={"content": f"{result_icon}: `{tool_name}` {status} by <@{reactor_id}>"},
-                                )
-                                return {"status": status, "approver": reactor_id, "hitl_id": hitl_id}
+                            reactors = await resp.json()
+                            for reactor in reactors:
+                                if reactor.get("bot"):
+                                    continue
+                                reactor_id = str(reactor["id"])
+                                if reactor_id in self.approvers:
+                                    logger.info(f"HITL {hitl_id}: {status} by {reactor_id}")
+                                    answered[0] = True
+                                    result_icon = "Approved" if status == "approved" else "Denied"
+                                    await session.post(
+                                        f"{api}/channels/{self.channel_id}/messages",
+                                        headers=headers,
+                                        json={"content": f"{result_icon}: `{tool_name}` {status} by <@{reactor_id}>"},
+                                    )
+                                    return {"status": status, "approver": reactor_id, "hitl_id": hitl_id}
+        finally:
+            # Runs on the caller's timeout cancellation too, so an expired
+            # request never leaves a timer that DMs about it minutes later.
+            if reminder:
+                reminder.cancel()
+
+    async def _notify_waiting(self, token: str, tool_name: str, hitl_id: str,
+                              description: str, message_id: str,
+                              answered: list) -> "asyncio.Task | None":
+        """Announce the pending request by DM and arm the reminder.
+
+        Returns the reminder task, or None. Never raises: notification is not
+        allowed to decide whether a tool runs.
+        """
+        try:
+            notifier = await self._get_notifier(token)
+            if not notifier:
+                return None
+            channel = str(self.channel_id or "")
+            await notifier.announced(
+                agent_id=MCP_AGENT_ID, tool_name=tool_name, hitl_id=hitl_id,
+                description=description, channel_id=channel,
+                message_id=str(message_id))
+
+            async def _still_pending() -> bool:
+                return not answered[0]
+
+            return notifier.start_reminder(
+                agent_id=MCP_AGENT_ID, tool_name=tool_name, hitl_id=hitl_id,
+                still_pending=_still_pending, channel_id=channel,
+                message_id=str(message_id))
+        except Exception as e:
+            logger.warning(f"HITL notify failed for {hitl_id}: {e}")
+            return None
 
 
 def _redact_for_display(args: dict) -> str:
