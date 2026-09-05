@@ -205,8 +205,9 @@ def _clear_wake(goal: dict) -> None:
         "collaborate on it. You become the owner (facilitator): you advance "
         "phases (brainstorm → strategy → executing), assign tasks, and close "
         "decisions. participants is a comma-separated list of agent ids. If "
-        "your tier can't create goals it is parked as 'proposed' until a "
-        "coordinator or human advances it."
+        "your tier can't create goals it is parked as 'proposed' in the current "
+        "channel, and gets its own channel when a coordinator or human advances "
+        "it."
     ),
     category="goals",
 )
@@ -232,7 +233,8 @@ async def goal_create(ctx: ToolContext, title: str, description: str,
     goal = store.create_goal(
         title, description, ctx.agent_id, channel_id,
         ctx.user_id or ctx.agent_id,
-        turn_budget=int(turn_budget) or int(cfg["default_turn_budget"]))
+        turn_budget=int(turn_budget) or int(cfg["default_turn_budget"]),
+        anchored=anchored_here)
     for pid in [p.strip() for p in participants.split(",") if p.strip()]:
         if pid != ctx.agent_id:
             store.add_participant(goal["id"], pid)
@@ -310,6 +312,7 @@ async def goal_status(ctx: ToolContext, goal_id: str = "") -> str:
     category="goals",
 )
 async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> str:
+    cfg = _cfg()
     goal = store.get_goal(goal_id.strip())
     if not goal:
         return f"ERROR: unknown goal '{goal_id}'."
@@ -320,14 +323,46 @@ async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> st
     if not _is_owner_or_coordinator(goal, ctx.agent_id):
         return (f"ERROR: only the owner ({goal['owner_agent']}) or a "
                 f"coordinator-tier agent can change this goal.")
+    leaving_proposed = (field == "status" and goal["status"] == "proposed"
+                        and value.strip() != "proposed")
     try:
         kwargs = {field: int(value) if field == "turn_budget" else value.strip()}
         goal = store.update_goal(goal["id"], ctx.agent_id, **kwargs)
     except ValueError as e:
         return f"ERROR: {e}"
+
+    # The goal only becomes real work here, so this is where it earns a channel.
+    # Creating it at proposal time was impossible for an assistant-tier
+    # proposer, which is most of the fleet, and nothing else ever created one
+    # afterwards: such a goal kept the proposer's home channel forever and the
+    # participants were routed into a private channel instead of a shared one.
+    chan_note = ""
+    if leaving_proposed and goal.get("anchored"):
+        goal, chan_note = await _acquire_channel(ctx, goal, cfg)
+
     await _update_card(ctx, goal)
     return (f"✅ `{goal['id']}` {field} → {kwargs[field]}. Status: "
-            f"{goal['status']}.")
+            f"{goal['status']}." + (f" {chan_note}" if chan_note else ""))
+
+
+async def _acquire_channel(ctx: ToolContext, goal: dict, cfg: dict) -> tuple[dict, str]:
+    """Move an anchored goal into a channel of its own. Best effort.
+
+    A failure here must not undo the advance: the status change is the thing
+    the caller asked for, and a goal running in a borrowed channel is exactly
+    what it was doing a second ago. So this reports and leaves it anchored.
+    """
+    channel_id, err = await _create_goal_channel(ctx, goal["title"], cfg)
+    if not channel_id:
+        return goal, f"(still in this channel: {err or 'channel creation failed'})"
+    try:
+        goal = store.attach_channel(goal["id"], ctx.agent_id, channel_id)
+    except ValueError as e:
+        return goal, f"(channel created but not attached: {e})"
+    card_id = await _post_to_channel(ctx, channel_id, _card_text(goal))
+    if card_id:
+        goal = store.update_goal(goal["id"], ctx.agent_id, card_message_id=card_id)
+    return goal, f"Workstream moved to <#{channel_id}>."
 
 
 @tool(

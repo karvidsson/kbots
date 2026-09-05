@@ -144,6 +144,16 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_events_goal ON goal_events(goal_id, ts);
     """)
+    # `anchored` = the goal is borrowing the proposer's home channel because
+    # its proposer's tier could not create one. It is a fact about the channel,
+    # not about the tier, so it cannot be re-derived later: the proposer may be
+    # promoted, and a coordinator can also anchor when guild_id is unset.
+    # Existing rows are anchored by definition — until this column existed,
+    # nothing could give a goal a channel after creation.
+    cols = {r[1] for r in db.execute("PRAGMA table_info(goals)")}
+    if "anchored" not in cols:
+        db.execute("ALTER TABLE goals ADD COLUMN anchored INTEGER NOT NULL DEFAULT 0")
+        db.execute("UPDATE goals SET anchored = 1 WHERE status = 'proposed'")
     db.commit()
 
 
@@ -181,7 +191,8 @@ def log_event(goal_id: str, agent_id: str, kind: str, payload: str = "") -> None
 
 def create_goal(title: str, description: str, owner_agent: str, channel_id: str,
                 created_by: str, *, connector: str = "discord",
-                turn_budget: int = 30, status: str = "proposed") -> dict:
+                turn_budget: int = 30, status: str = "proposed",
+                anchored: bool = False) -> dict:
     db = _get_db()
     base = f"g-{_slugify(title)}"
     goal_id = base
@@ -192,10 +203,12 @@ def create_goal(title: str, description: str, owner_agent: str, channel_id: str,
     now = time.time()
     db.execute(
         """INSERT INTO goals (id, title, description, status, owner_agent, connector,
-           channel_id, created_by, turn_budget, created_at, updated_at, last_activity_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+           channel_id, created_by, turn_budget, anchored, created_at, updated_at,
+           last_activity_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (goal_id, title.strip(), description.strip(), status, owner_agent,
-         connector, str(channel_id), created_by, int(turn_budget), now, now, now))
+         connector, str(channel_id), created_by, int(turn_budget),
+         int(bool(anchored)), now, now, now))
     db.execute(
         "INSERT OR REPLACE INTO goal_participants (goal_id, agent_id, role, joined_at) "
         "VALUES (?,?,?,?)", (goal_id, owner_agent, "owner", now))
@@ -229,6 +242,32 @@ def list_goals(statuses: tuple | None = None) -> list[dict]:
     else:
         rows = db.execute("SELECT * FROM goals ORDER BY updated_at DESC").fetchall()
     return [dict(r) for r in rows]
+
+
+def attach_channel(goal_id: str, actor: str, channel_id: str) -> dict:
+    """Give an anchored goal its own channel, once.
+
+    Deliberately not a field on update_goal: that is reachable from goal_set,
+    and moving a live goal's channel by setting a field would strand every
+    message and task already posted in the old one. This only ever fires on the
+    move from borrowed to owned, and refuses afterwards.
+    """
+    goal = get_goal(goal_id)
+    if not goal:
+        raise ValueError(f"unknown goal '{goal_id}'")
+    if not goal.get("anchored"):
+        raise ValueError(f"goal '{goal_id}' already has its own channel")
+    if not str(channel_id).strip():
+        raise ValueError("channel_id is empty")
+    now = time.time()
+    db = _get_db()
+    db.execute("UPDATE goals SET channel_id=?, anchored=0, card_message_id='', "
+               "updated_at=?, last_activity_at=? WHERE id=?",
+               (str(channel_id).strip(), now, now, goal_id))
+    db.commit()
+    _invalidate_cache()
+    log_event(goal_id, actor, "channel", f"{goal['channel_id']} → {channel_id}")
+    return get_goal(goal_id)  # type: ignore[return-value]
 
 
 def update_goal(goal_id: str, actor: str, **fields) -> dict:
