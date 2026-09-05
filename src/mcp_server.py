@@ -383,6 +383,16 @@ def _log_tool_to_db(conn, agent_id: str, tool_name: str, input_data: dict | None
             return
 
 
+# --- Lockdown set (KBOTS_MCP_RESTRICT) ---
+# Module level so a test can assert membership: the risk here is a NEW tool that
+# executes host commands being added without anyone remembering this list, which
+# silently widens the restricted surface rather than breaking anything.
+
+DANGEROUS_TOOL_PREFIXES = ("tmux_", "job_")
+DANGEROUS_TOOL_NAMES = {"run_command", "computer", "create_tool", "create_skill",
+                        "promote_tool", "set_hitl", "install_mcp"}
+
+
 # --- Build the MCP server ---
 
 def build_server(vault: FernetVault, config: dict) -> FastMCP:
@@ -476,6 +486,11 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     from src.core import version as _version
     _version.set_data_dir(data_dir)
 
+    # Same reason, for the job store: job_start runs HERE and writes rows that
+    # the engine's watcher reads, so both processes must resolve one path.
+    from src.core import jobs as _jobs
+    _jobs.set_data_dir(data_dir)
+
     # Security alerts — send to configured Discord channel
     alerter = AlertSender(config, vault)
     if alerter.enabled:
@@ -489,9 +504,8 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     # agent tools normally gated per-sender by access control; the flag is for
     # deployments that never want them reachable over stdio at all.
     restrict = os.environ.get("KBOTS_MCP_RESTRICT", "").strip().lower() in ("1", "true", "yes")
-    dangerous_prefixes = ("tmux_",)
-    dangerous_names = {"run_command", "computer", "create_tool", "create_skill",
-                       "promote_tool", "set_hitl", "install_mcp"}
+    dangerous_prefixes = DANGEROUS_TOOL_PREFIXES
+    dangerous_names = DANGEROUS_TOOL_NAMES
 
     # Register each kbots tool as an MCP tool with middleware wrapping
     skipped = []
