@@ -57,6 +57,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -65,6 +66,72 @@ import setup  # noqa: E402  (needs the path above)
 
 ENGINE_ROOT = setup.ENGINE_ROOT
 LAUNCHD_LABEL = "com.kbots.agent"
+
+#: `launchctl bootout` RETURNS BEFORE THE JOB IS GONE. The engine drains
+#: in-flight agent turns on SIGTERM (shutdown_drain_seconds, 60 by default) and
+#: launchd allows ExitTimeOut on top, so the label stays in the domain for up to
+#: a couple of minutes. `bootstrap` against a label that is still unloading
+#: fails with EIO, "Input/output error", which reads exactly like a malformed
+#: plist and is not.
+#:
+#: This was not theoretical. On the first real run of this script the deploy
+#: booted out a service with two in-flight turns, bootstrapped one second later,
+#: got EIO, failed the same way restoring the previous plist, reported "the
+#: service is DOWN" while it was merely still stopping, and rolled back two good
+#: merges. The single change it wanted to make was a comment line.
+#:
+#: So: wait for the label to actually leave the domain, and treat EIO as "not
+#: yet" rather than as a verdict.
+UNLOAD_TIMEOUT = 180.0
+UNLOAD_POLL = 2.0
+BOOTSTRAP_RETRY_ERRORS = ("input/output error", "service already loaded",
+                          "operation already in progress", "busy")
+
+
+def is_loaded(domain: str, label: str = LAUNCHD_LABEL) -> bool:
+    """Is the label still present in the domain? `print` is the precise probe:
+    it exits non-zero once the job is really gone."""
+    return subprocess.run(["launchctl", "print", f"{domain}/{label}"],
+                          capture_output=True).returncode == 0
+
+
+def wait_until_unloaded(domain: str, timeout: float = UNLOAD_TIMEOUT) -> bool:
+    """Block until the job has finished draining. Returns False on timeout."""
+    deadline = time.monotonic() + timeout
+    announced = False
+    while time.monotonic() < deadline:
+        if not is_loaded(domain):
+            return True
+        if not announced:
+            log(f"waiting for {LAUNCHD_LABEL} to finish stopping "
+                f"(drains in-flight turns, up to {timeout:.0f}s)")
+            announced = True
+        time.sleep(UNLOAD_POLL)
+    log(f"WARNING: {LAUNCHD_LABEL} still loaded after {timeout:.0f}s — "
+        "trying to bootstrap anyway")
+    return False
+
+
+def bootstrap(domain: str, plist: Path,
+              timeout: float = UNLOAD_TIMEOUT) -> tuple[bool, str]:
+    """Load the plist, retrying while launchd says the old job is still going.
+
+    Retrying only on the "still busy" errors keeps a genuinely broken plist
+    fast to diagnose: that fails once and returns immediately.
+    """
+    deadline = time.monotonic() + timeout
+    err = ""
+    while True:
+        res = subprocess.run(["launchctl", "bootstrap", domain, str(plist)],
+                             capture_output=True, text=True)
+        if res.returncode == 0:
+            return True, ""
+        err = (res.stderr or res.stdout or "").strip()
+        if not any(m in err.lower() for m in BOOTSTRAP_RETRY_ERRORS):
+            return False, err
+        if time.monotonic() >= deadline:
+            return False, f"{err} (still busy after {timeout:.0f}s)"
+        time.sleep(UNLOAD_POLL)
 
 #: exit status meaning "a unit was updated" — see the module docstring.
 CHANGED = 10
@@ -315,24 +382,32 @@ def refresh_launchd(dry_run: bool, reload: bool) -> int:
     # bootout+bootstrap. That means the service is genuinely down in between:
     # if the new plist fails to load, put the old one back and load that,
     # rather than leaving the box with nothing running.
-    uid = os.getuid()
-    domain = f"gui/{uid}"
+    return reload_plist(f"gui/{os.getuid()}", installed, previous)
+
+
+def reload_plist(domain: str, installed: Path, previous: str) -> int:
+    """bootout, wait for the job to really go, then load the new plist.
+
+    Split out of refresh_launchd so the ordering is testable: the bug that made
+    this necessary was entirely a matter of what happens between the bootout and
+    the bootstrap.
+    """
     subprocess.run(["launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
                    capture_output=True)
-    res = subprocess.run(["launchctl", "bootstrap", domain, str(installed)],
-                         capture_output=True, text=True)
-    if res.returncode == 0:
+    wait_until_unloaded(domain)
+    ok, err = bootstrap(domain, installed)
+    if ok:
         log("plist reloaded")
         return CHANGED
 
-    log(f"ERROR: the new plist failed to load: {res.stderr.strip()}")
+    log(f"ERROR: the new plist failed to load: {err}")
     installed.write_text(previous)
-    back = subprocess.run(["launchctl", "bootstrap", domain, str(installed)],
-                          capture_output=True, text=True)
-    if back.returncode == 0:
+    back_ok, back_err = bootstrap(domain, installed)
+    if back_ok:
         log("restored and reloaded the previous plist — the service is up on the old unit")
     else:
-        log("CRITICAL: the previous plist did not load either — the service is DOWN.")
+        log(f"CRITICAL: the previous plist did not load either ({back_err}) — "
+            "the service is DOWN.")
         log(f"    launchctl bootstrap {domain} {installed}")
     return 1
 
