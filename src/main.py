@@ -557,6 +557,16 @@ async def main() -> None:
     scheduler = Scheduler(agent_manager, schedules_channel=sched_channel,
                           schedules_bot=sched_bot)
     asyncio.create_task(scheduler.run(), name="scheduler")
+
+    # --- Durable background jobs ---
+    # Started alongside the scheduler because it is the same kind of component:
+    # something has to notice that time passed. Its first tick reconciles jobs
+    # that ended while the process was down, which is the case that used to look
+    # like "still building" forever.
+    from src.core.jobs import JobWatcher
+    from src.core.jobs import set_data_dir as _jobs_set_data_dir
+    _jobs_set_data_dir(data_dir)
+    asyncio.create_task(JobWatcher(agent_manager).run(), name="job-watcher")
     # Let the Discord connector's ❌-reaction handler cancel schedule cards
     if sched_channel and "discord" in active_connectors:
         active_connectors["discord"]._schedules_channel = sched_channel
