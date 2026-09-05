@@ -39,7 +39,7 @@ def _settle(job_id: str, timeout: float = 10.0) -> dict:
 # --- the basics -------------------------------------------------------------
 
 def test_success_records_exit_zero(tmp_path):
-    job = jobs.start("engineer", "echo hello", label="Smoke Test")
+    job = jobs.start("atlas", "echo hello", label="Smoke Test")
     assert job["status"] == jobs.RUNNING
     assert job["label"] == "Smoke Test"
     assert job["id"].startswith("smoke-test-")
@@ -55,14 +55,14 @@ def test_failure_is_failed_not_crashed():
     """A command that ran and returned non-zero is `failed`. `crashed` is
     reserved for one that never got to report, and conflating them would hide
     which of the two happened."""
-    job = jobs.start("engineer", "exit 3", label="boom")
+    job = jobs.start("atlas", "exit 3", label="boom")
     settled = _settle(job["id"])
     assert settled["status"] == jobs.FAILED
     assert settled["exit_code"] == 3
 
 
 def test_stderr_lands_in_the_log():
-    job = jobs.start("engineer", "echo oops >&2", label="stderr")
+    job = jobs.start("atlas", "echo oops >&2", label="stderr")
     _settle(job["id"])
     assert "oops" in jobs.tail_log(job["id"])
 
@@ -71,7 +71,7 @@ def test_explicit_exit_still_writes_the_status():
     """`exit 4` inside a brace group exits the wrapper shell before it can
     record anything, so the job reports `crashed` and the real exit code is
     lost. The wrapper uses a subshell for exactly this."""
-    job = jobs.start("engineer", "exit 4", label="explicit exit")
+    job = jobs.start("atlas", "exit 4", label="explicit exit")
     settled = _settle(job["id"])
     assert settled["status"] == jobs.FAILED
     assert settled["exit_code"] == 4
@@ -81,9 +81,9 @@ def test_pipeline_status_follows_shell_semantics():
     """Documenting the real behaviour rather than claiming to fix it: bash
     reports the LAST element of a pipeline, so `false | true` is a success.
     A caller who needs otherwise sets `pipefail` in its own command."""
-    job = jobs.start("engineer", "false | true", label="pipeline")
+    job = jobs.start("atlas", "false | true", label="pipeline")
     assert _settle(job["id"])["status"] == jobs.DONE
-    strict = jobs.start("engineer", "set -o pipefail; false | true", label="pipefail")
+    strict = jobs.start("atlas", "set -o pipefail; false | true", label="pipefail")
     assert _settle(strict["id"])["status"] == jobs.FAILED
 
 
@@ -92,7 +92,7 @@ def test_pipeline_status_follows_shell_semantics():
 def test_job_is_detached_from_this_process():
     """The child must not be in our process group, or a signal to the launcher's
     group takes the build with it. This is failure 1 from the field report."""
-    job = jobs.start("engineer", "sleep 5", label="detached")
+    job = jobs.start("atlas", "sleep 5", label="detached")
     try:
         assert os.getpgid(job["pid"]) != os.getpgid(os.getpid())
     finally:
@@ -105,7 +105,7 @@ def test_completion_is_recognised_with_nobody_watching():
     This is the restart case: the process that was waiting is gone, and the
     outcome still has to be recoverable from disk.
     """
-    job = jobs.start("engineer", "echo done", label="unwatched")
+    job = jobs.start("atlas", "echo done", label="unwatched")
     time.sleep(1.0)  # finishes with no reconcile in between
     settled = jobs.reconcile()
     assert [j["id"] for j in settled] == [job["id"]]
@@ -115,7 +115,7 @@ def test_completion_is_recognised_with_nobody_watching():
 def test_killed_job_is_crashed_not_running():
     """SIGKILL leaves no exit file. Without the pid fallback this row would say
     running forever, which is exactly the lie the module exists to stop."""
-    job = jobs.start("engineer", "sleep 30", label="killed")
+    job = jobs.start("atlas", "sleep 30", label="killed")
     os.killpg(os.getpgid(job["pid"]), 9)
     settled = _settle(job["id"])
     assert settled["status"] == jobs.CRASHED
@@ -125,7 +125,7 @@ def test_killed_job_is_crashed_not_running():
 def test_reconcile_returns_each_job_once():
     """The watcher delivers what reconcile returns, so a job reported twice is a
     duplicate notification."""
-    job = jobs.start("engineer", "true", label="once")
+    job = jobs.start("atlas", "true", label="once")
     _settle(job["id"])
     assert jobs.reconcile() == []
 
@@ -133,7 +133,7 @@ def test_reconcile_returns_each_job_once():
 def test_exit_file_beats_a_dead_pid():
     """Order of authority: a job that completed and whose pid is long gone must
     report its real exit code, not `crashed`."""
-    job = jobs.start("engineer", "exit 7", label="authority")
+    job = jobs.start("atlas", "exit 7", label="authority")
     _settle(job["id"])
     # Re-open the case as if the watcher had never seen it.
     jobs._write("UPDATE jobs SET status = ?, exit_code = NULL WHERE id = ?",
@@ -150,7 +150,7 @@ def test_cancel_kills_the_child_not_just_the_shell():
     only the shell leaves the encode running and holding the output file."""
     marker = jobs.jobs_dir() / "child-still-running"
     job = jobs.start(
-        "engineer",
+        "atlas",
         f"bash -c 'sleep 30; touch {marker}' & wait",
         label="group kill")
     time.sleep(0.5)
@@ -166,7 +166,7 @@ def test_cancel_on_unknown_job_is_a_message_not_an_exception():
 
 
 def test_cancel_twice_is_idempotent():
-    job = jobs.start("engineer", "sleep 30", label="twice")
+    job = jobs.start("atlas", "sleep 30", label="twice")
     jobs.cancel(job["id"])
     assert "already" in jobs.cancel(job["id"])
 
@@ -174,26 +174,26 @@ def test_cancel_twice_is_idempotent():
 # --- querying ---------------------------------------------------------------
 
 def test_list_is_scoped_to_the_agent():
-    jobs.start("engineer", "true", label="mine")
-    jobs.start("redline", "true", label="theirs")
-    mine = jobs.list_jobs("engineer")
+    jobs.start("atlas", "true", label="mine")
+    jobs.start("beacon", "true", label="theirs")
+    mine = jobs.list_jobs("atlas")
     assert [j["label"] for j in mine] == ["mine"]
     assert len(jobs.list_jobs("")) == 2
 
 
 def test_running_only_filter():
-    slow = jobs.start("engineer", "sleep 30", label="slow")
-    quick = jobs.start("engineer", "true", label="quick")
+    slow = jobs.start("atlas", "sleep 30", label="slow")
+    quick = jobs.start("atlas", "true", label="quick")
     _settle(quick["id"])
     try:
-        running = jobs.list_jobs("engineer", running_only=True)
+        running = jobs.list_jobs("atlas", running_only=True)
         assert [j["id"] for j in running] == [slow["id"]]
     finally:
         jobs.cancel(slow["id"])
 
 
 def test_tail_log_is_bounded():
-    job = jobs.start("engineer", "seq 1 500", label="tail")
+    job = jobs.start("atlas", "seq 1 500", label="tail")
     _settle(job["id"])
     assert len(jobs.tail_log(job["id"], 10).splitlines()) == 10
     # Asking for more than the cap must not return the whole file.
@@ -205,7 +205,7 @@ def test_tail_log_on_unknown_job_is_empty_not_an_error():
 
 
 def test_summarise_names_the_outcome():
-    job = jobs.start("engineer", "exit 2", label="summary")
+    job = jobs.start("atlas", "exit 2", label="summary")
     settled = _settle(job["id"])
     line = jobs.summarise(settled)
     assert job["id"] in line
@@ -215,7 +215,7 @@ def test_summarise_names_the_outcome():
 
 def test_cwd_is_honoured(tmp_path):
     (tmp_path / "here.txt").write_text("x")
-    job = jobs.start("engineer", "ls", label="cwd", cwd=str(tmp_path))
+    job = jobs.start("atlas", "ls", label="cwd", cwd=str(tmp_path))
     _settle(job["id"])
     assert "here.txt" in jobs.tail_log(job["id"])
 
@@ -223,19 +223,19 @@ def test_cwd_is_honoured(tmp_path):
 def test_notify_defaults_to_agent():
     """The default has to be the mode that removes the human from the loop;
     anything else leaves failure 4 in place."""
-    job = jobs.start("engineer", "true", label="notify")
+    job = jobs.start("atlas", "true", label="notify")
     assert jobs.get(job["id"])["notify"] == "agent"
     assert jobs.get(job["id"])["notified"] == 0
 
 
 def test_ids_are_unique_for_the_same_label():
-    a = jobs.start("engineer", "true", label="same")
-    b = jobs.start("engineer", "true", label="same")
+    a = jobs.start("atlas", "true", label="same")
+    b = jobs.start("atlas", "true", label="same")
     assert a["id"] != b["id"]
 
 
 def test_label_with_no_usable_characters_still_produces_an_id():
-    job = jobs.start("engineer", "true", label="///")
+    job = jobs.start("atlas", "true", label="///")
     assert job["id"].startswith("job-")
 
 
@@ -261,7 +261,7 @@ async def test_job_start_refuses_credential_paths():
     from src.core.base import ToolContext
     from src.tools.jobs import job_start
 
-    ctx = ToolContext(agent_id="engineer", user_id="u", channel_id="c")
+    ctx = ToolContext(agent_id="atlas", user_id="u", channel_id="c")
     out = await job_start(ctx, "cat ~/.claude/settings.json", label="sneaky")
     assert "Blocked" in out
-    assert jobs.list_jobs("engineer") == []
+    assert jobs.list_jobs("atlas") == []
