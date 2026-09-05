@@ -44,10 +44,15 @@ class HITLGate:
     """Human-in-the-loop approval system for sensitive tool calls."""
 
     def __init__(self, config: dict, db: aiosqlite.Connection, connector=None,
-                 admin_users: list | None = None):
+                 admin_users: list | None = None, vault=None):
         self.config = config
         self.db = db
         self.connector = connector
+        # Used only to build the DM notifier. A gate with no vault still gates;
+        # it just cannot tell anyone it is waiting.
+        self.vault = vault
+        self._notifier = None
+        self._guild_id: str | None = None
 
         # Config
         self._config_channel = config.get("channel")
@@ -65,6 +70,35 @@ class HITLGate:
         # can flip it and the engine picks it up on the next message.
         self._config_default = config.get("enabled", True)
         self.enabled = self._config_default
+        # How long an unanswered request waits before the approvers get a
+        # nudge. None means half the timeout; 0 disables reminders.
+        self.remind_after = config.get("remind_after")
+
+    async def _get_notifier(self):
+        """Build the DM notifier lazily, once, and never let it raise.
+
+        Lazy because the guild lookup is a network call, and doing it at boot
+        would put an approval-channel outage on the startup path of an engine
+        that otherwise runs fine without DMs.
+        """
+        if self._notifier is not None:
+            return self._notifier or None
+        from src.core.hitl_notify import HitlNotifier, resolve_guild_id
+        token = ""
+        try:
+            if self.vault:
+                token = self.vault.get("discord-token") or ""
+        except Exception as e:
+            logger.debug(f"HITL notifier: no token ({e})")
+        if not token or not self.approvers:
+            self._notifier = False  # decided, and not worth re-deciding
+            return None
+        if self._guild_id is None:
+            self._guild_id = await resolve_guild_id(token, self.channel_id or "")
+        self._notifier = HitlNotifier(
+            token, self.approvers, timeout=self.timeout,
+            remind_after=self.remind_after, guild_id=self._guild_id or "")
+        return self._notifier
 
     @property
     def channel_id(self):
@@ -131,6 +165,7 @@ class HITLGate:
         await self.db.commit()
 
         # Post approval message to Discord
+        message_id = ""
         if self.connector and self.channel_id:
             try:
                 msg_text = (
@@ -163,16 +198,45 @@ class HITLGate:
                     await self._resolve(hitl_id, "denied", None)
                     return {"status": "denied", "approver": None, "reason": "channel unreachable"}
 
-        # Poll for resolution
-        deadline = now + self.timeout
-        while time.time() < deadline:
-            status = await self._check_status(hitl_id)
-            if status["status"] != "pending":
-                return status
-            await asyncio.sleep(self.poll_interval)
+        # Tell the approvers directly. The card alone is missable, and this
+        # agent cannot say "I am waiting" itself: its turn is stuck right here.
+        notifier = await self._get_notifier()
+        reminder = None
+        if notifier:
+            try:
+                await notifier.announced(
+                    agent_id=agent_id, tool_name=tool_name, hitl_id=hitl_id,
+                    description=description, channel_id=self.channel_id or "",
+                    message_id=message_id)
+                reminder = notifier.start_reminder(
+                    agent_id=agent_id, tool_name=tool_name, hitl_id=hitl_id,
+                    still_pending=lambda: self._is_pending(hitl_id),
+                    channel_id=self.channel_id or "", message_id=message_id)
+            except Exception as e:
+                logger.warning(f"HITL notify failed for {hitl_id}: {e}")
+
+        try:
+            # Poll for resolution
+            deadline = now + self.timeout
+            while time.time() < deadline:
+                status = await self._check_status(hitl_id)
+                if status["status"] != "pending":
+                    return status
+                await asyncio.sleep(self.poll_interval)
+        finally:
+            # Whatever the outcome, do not leave a timer that would DM about a
+            # request that was answered minutes ago.
+            if reminder:
+                reminder.cancel()
 
         # Timeout
         await self._resolve(hitl_id, "timeout", None)
+        if notifier:
+            try:
+                await notifier.resolved(agent_id=agent_id, tool_name=tool_name,
+                                        hitl_id=hitl_id, status="timeout")
+            except Exception as e:
+                logger.warning(f"HITL timeout notice failed for {hitl_id}: {e}")
         if self.fail_mode == "open":
             logger.warning(f"HITL timeout for {hitl_id} — fail_mode=open, allowing")
             return {"status": "approved", "approver": None, "reason": "timeout_open"}
@@ -216,6 +280,15 @@ class HITLGate:
         if not row:
             return {"status": "denied", "approver": None, "reason": "not_found"}
         return {"status": row[0], "approver": row[1]}
+
+    async def _is_pending(self, hitl_id: str) -> bool:
+        """Re-read the row. A reaction may have resolved it from elsewhere."""
+        try:
+            return (await self._check_status(hitl_id))["status"] == "pending"
+        except Exception:
+            # Cannot tell, so do not nag. A missed reminder is cheaper than a
+            # DM about something the approver already handled.
+            return False
 
     async def recover_pending(self) -> int:
         """On startup, resolve expired pending requests. Returns count resolved."""
