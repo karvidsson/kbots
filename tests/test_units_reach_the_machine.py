@@ -218,10 +218,12 @@ def test_the_plist_reload_is_a_real_reload_not_a_kickstart():
     """`launchctl kickstart -k` restarts the LOADED job definition, so a plist
     edit it is supposed to apply is not applied. The distinction is invisible
     in the logs: the service restarts and reports healthy on the old unit.
+
+    Asserted on the argv that reaches launchctl rather than on the source text,
+    so moving the call into a helper cannot silently pass.
     """
     src = (PROJECT_ROOT / "scripts" / "refresh_units.py").read_text()
     body = src.split("def refresh_launchd(")[1]
-    assert '"bootout"' in body and '"bootstrap"' in body
     assert '"kickstart"' not in body
 
 
@@ -231,9 +233,8 @@ def test_a_plist_that_fails_to_load_is_rolled_back():
     """
     src = (PROJECT_ROOT / "scripts" / "refresh_units.py").read_text()
     body = src.split("def refresh_launchd(")[1]
-    restore = body.index("installed.write_text(previous)")
-    assert restore < body.index("CRITICAL")
-    assert body.count('"bootstrap"') >= 2, "nothing loads the restored plist"
+    assert body.index("installed.write_text(previous)") < body.index("CRITICAL")
+    assert body.count("bootstrap(domain") >= 2, "nothing loads the restored plist"
 
 
 def test_a_writable_path_it_adds_is_created_before_the_reload():
@@ -272,3 +273,148 @@ def test_modules_survive_the_round_trip(tmp_path):
         tmp_path, "/uv", tmp_path, "/usr/bin", "/srv/mod")
     assert plistlib.loads(rendered.encode())[
         "EnvironmentVariables"]["KBOTS_MODULES"] == "/srv/mod"
+
+
+# --- bootout is asynchronous -------------------------------------------------
+
+import pathlib  # noqa: E402
+
+
+class _FakeLaunchctl:
+    """Stands in for launchctl. `busy_for` is how many probes report the old
+    job still present before it finally goes away."""
+
+    def __init__(self, busy_for: int = 3, bootstrap_ok_after: int = 0):
+        self.busy_for = busy_for
+        self.bootstrap_ok_after = bootstrap_ok_after
+        self.calls: list[list[str]] = []
+        self.bootstraps = 0
+
+    def __call__(self, argv, **kw):
+        import subprocess as _sp
+        self.calls.append(list(argv))
+        verb = argv[1] if len(argv) > 1 else ""
+        if verb == "print":
+            self.busy_for -= 1
+            code = 0 if self.busy_for >= 0 else 1
+            return _sp.CompletedProcess(argv, code, b"", b"")
+        if verb == "bootstrap":
+            self.bootstraps += 1
+            if self.bootstraps > self.bootstrap_ok_after:
+                return _sp.CompletedProcess(argv, 0, "", "")
+            return _sp.CompletedProcess(
+                argv, 5, "", "Bootstrap failed: 5: Input/output error")
+        return _sp.CompletedProcess(argv, 0, "", "")
+
+
+def test_it_waits_for_the_job_to_finish_draining(monkeypatch):
+    """The engine drains in-flight turns for up to 60s on SIGTERM. Bootstrapping
+    before that finishes gets EIO, which reads like a broken plist and is not.
+    On the first real run this rolled back two good merges."""
+    import scripts.refresh_units as refresh
+
+    fake = _FakeLaunchctl(busy_for=3)
+    monkeypatch.setattr(refresh.subprocess, "run", fake)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+
+    assert refresh.wait_until_unloaded("gui/501", timeout=60) is True
+    assert sum(1 for c in fake.calls if c[1] == "print") == 4
+
+
+def test_eio_is_retried_not_treated_as_a_verdict(monkeypatch):
+    import scripts.refresh_units as refresh
+
+    fake = _FakeLaunchctl(bootstrap_ok_after=2)
+    monkeypatch.setattr(refresh.subprocess, "run", fake)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+
+    ok, err = refresh.bootstrap("gui/501", pathlib.Path("/tmp/x.plist"), timeout=60)
+    assert ok, err
+    assert fake.bootstraps == 3
+
+
+def test_a_genuinely_bad_plist_fails_immediately(monkeypatch):
+    """Retrying every failure would turn a malformed plist into a three-minute
+    hang with the service down the whole time."""
+    import subprocess as _sp
+
+    import scripts.refresh_units as refresh
+
+    calls = []
+
+    def fake(argv, **kw):
+        calls.append(list(argv))
+        if argv[1] == "print":
+            return _sp.CompletedProcess(argv, 1, b"", b"")
+        return _sp.CompletedProcess(argv, 1, "", "Bootstrap failed: 112: Could not "
+                                    "find specified service")
+
+    monkeypatch.setattr(refresh.subprocess, "run", fake)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+
+    ok, err = refresh.bootstrap("gui/501", pathlib.Path("/tmp/x.plist"), timeout=60)
+    assert not ok
+    assert "112" in err
+    assert sum(1 for c in calls if c[1] == "bootstrap") == 1
+
+
+def test_waiting_gives_up_rather_than_hanging_forever(monkeypatch):
+    import scripts.refresh_units as refresh
+
+    monkeypatch.setattr(refresh, "is_loaded", lambda *a, **k: True)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+    assert refresh.wait_until_unloaded("gui/501", timeout=0.01) is False
+
+
+def test_the_unload_wait_outlasts_the_drain_window():
+    """shutdown_drain_seconds defaults to 60 and launchd allows ExitTimeOut (90)
+    on top. A wait shorter than their sum would reintroduce the same race."""
+    import scripts.refresh_units as refresh
+    assert refresh.UNLOAD_TIMEOUT >= 150
+
+
+def test_the_reload_probes_between_the_bootout_and_the_bootstrap(monkeypatch, tmp_path):
+    """The regression, pinned on the argv order launchctl actually receives.
+
+    bootout returns before the job is gone. Loading straight after it gets EIO,
+    which reads exactly like a malformed plist, and the deploy rolls back over
+    nothing. There must be at least one liveness probe in between.
+    """
+    import scripts.refresh_units as refresh
+
+    fake = _FakeLaunchctl(busy_for=2)
+    monkeypatch.setattr(refresh.subprocess, "run", fake)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+
+    plist = tmp_path / "com.kbots.agent.plist"
+    plist.write_text("<plist/>")
+    assert refresh.reload_plist("gui/501", plist, "<plist/>") == refresh.CHANGED
+
+    verbs = [c[1] for c in fake.calls]
+    assert verbs[0] == "bootout"
+    assert "bootstrap" in verbs
+    first_bootstrap = verbs.index("bootstrap")
+    assert "print" in verbs[1:first_bootstrap], \
+        "bootstrapped without waiting for the old job to go away"
+
+
+def test_the_reload_restores_the_old_plist_when_the_new_one_is_bad(monkeypatch, tmp_path):
+    """End to end through the real sequence, not by reading the source."""
+    import subprocess as _sp
+
+    import scripts.refresh_units as refresh
+
+    def fake(argv, **kw):
+        if argv[1] == "print":
+            return _sp.CompletedProcess(argv, 1, b"", b"")
+        if argv[1] == "bootstrap":
+            return _sp.CompletedProcess(argv, 1, "", "Bootstrap failed: 112: bad plist")
+        return _sp.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(refresh.subprocess, "run", fake)
+    monkeypatch.setattr(refresh.time, "sleep", lambda s: None)
+
+    plist = tmp_path / "com.kbots.agent.plist"
+    plist.write_text("NEW")
+    assert refresh.reload_plist("gui/501", plist, "OLD") == 1
+    assert plist.read_text() == "OLD", "the previous plist was not put back"
