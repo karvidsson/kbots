@@ -140,3 +140,58 @@ def test_mcp_config_missing_or_broken(tmp_path):
     assert mcp_config_args(tmp_path) == []
     (tmp_path / ".mcp.json").write_text("{not json")
     assert mcp_config_args(tmp_path) == []
+
+
+def _write_mcp(tmp_path, env):
+    (tmp_path / ".mcp.json").write_text(json.dumps({
+        "mcpServers": {"kbots-tools": {"command": "/x/py", "env": env}}
+    }))
+
+
+def test_mcp_env_carries_loopback_api(tmp_path):
+    """Codex builds each server's env from this table alone — it does not
+    forward its own. Without the loopback vars every inter-agent tool inside
+    the MCP server reports 'no agent manager available'."""
+    _write_mcp(tmp_path, {"KBOTS_AGENT_ID": "atlas"})
+    joined = " ".join(mcp_config_args(tmp_path, {
+        "KBOTS_INTERNAL_API": "http://127.0.0.1:5151",
+        "KBOTS_INTERNAL_TOKEN": "tok-abc",
+        "GH_TOKEN": "ghp_secret",
+    }))
+    assert 'KBOTS_INTERNAL_API = "http://127.0.0.1:5151"' in joined
+    assert 'KBOTS_INTERNAL_TOKEN = "tok-abc"' in joined
+    assert 'KBOTS_AGENT_ID = "atlas"' in joined
+    # Only the loopback pair is copied through — not every secret codex holds.
+    assert "ghp_secret" not in joined
+
+
+def test_mcp_env_expands_variable_refs(tmp_path):
+    """Claude Code expands ${VAR} in .mcp.json; codex does not, so an
+    unexpanded ref would reach the server as its own literal text and fail as
+    a bad credential rather than a missing one."""
+    _write_mcp(tmp_path, {"TOKEN": "${HOSTINGER_API_TOKEN}",
+                          "PROFILE": "${KBOTS_PROFILE:-none}"})
+    joined = " ".join(mcp_config_args(
+        tmp_path, {"HOSTINGER_API_TOKEN": "hpk-1"}))
+    assert 'TOKEN = "hpk-1"' in joined
+    assert 'PROFILE = "none"' in joined   # unset -> fallback
+    assert "${" not in joined
+
+
+def test_mcp_env_omitted_when_nothing_to_set(tmp_path):
+    _write_mcp(tmp_path, {})
+    assert "env" not in " ".join(mcp_config_args(tmp_path, {}))
+
+
+async def test_run_passes_loopback_env_to_mcp_servers(fake_codex, tmp_path):
+    """End to end through complete(): extra_env reaches the server table."""
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    _write_mcp(agent_dir, {"KBOTS_AGENT_ID": "atlas"})
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir),
+        extra_env={"KBOTS_INTERNAL_API": "http://127.0.0.1:9", "KBOTS_INTERNAL_TOKEN": "t"},
+    )
+    assert 'KBOTS_INTERNAL_TOKEN = "t"' in " ".join(_argv(log)[0])

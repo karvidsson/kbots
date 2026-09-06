@@ -10,6 +10,14 @@ The agent's scaffolded .mcp.json is translated to `-c mcp_servers.*` config
 overrides per invocation, so kbots-tools and mcp.yaml servers work without
 touching the user's global codex config.
 
+That translation carries the whole environment of each MCP server, because
+codex builds it from the config table alone and does not forward its own env
+the way the Claude Code CLI does. Two things therefore have to be added here
+rather than assumed: `${VAR}` references in .mcp.json (codex does no
+expansion), and the loopback API address/token the engine mints at boot.
+Without the latter, every inter-agent tool inside the MCP server answers "no
+agent manager available" while looking, from the outside, like a refusal.
+
 Config (under the agent's llm block or defaults.llm):
   provider: codex_cli
   model: gpt-5-codex          # optional — omitted -> codex default
@@ -25,6 +33,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 from src.core.base import LLMProvider, LLMResponse, Message
@@ -47,12 +56,36 @@ def _toml_inline_table(d: dict) -> str:
     return "{" + ", ".join(f"{k} = {_toml_str(str(v))}" for k, v in d.items()) + "}"
 
 
-def mcp_config_args(project_dir: Path) -> list[str]:
+# ${VAR} / ${VAR:-fallback} — the shell-style refs the scaffolder writes into
+# .mcp.json for vault-backed secrets. Claude Code expands them; codex does not.
+_ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
+
+# Vars every kbots MCP server needs and .mcp.json cannot carry, because the
+# engine mints them per boot: the loopback internal API. Tools run in the MCP
+# subprocess with no handle on the AgentManager and reach it over this address
+# (src/tools/builtin.py), so an MCP server that starts without them can read
+# and write files all day but cannot talk to another agent.
+_LOOPBACK_ENV = ("KBOTS_INTERNAL_API", "KBOTS_INTERNAL_TOKEN")
+
+
+def _expand_env_refs(value: str, env: dict) -> str:
+    """Substitute ${VAR} / ${VAR:-fallback} from env. Unset and empty both
+    take the fallback, matching shell semantics and Claude Code's behaviour."""
+    return _ENV_REF.sub(
+        lambda m: env.get(m.group(1)) or (m.group(2) or ""), str(value))
+
+
+def mcp_config_args(project_dir: Path, env: dict | None = None) -> list[str]:
     """Translate the agent's .mcp.json into codex `-c mcp_servers.*` overrides.
 
     Codex stdio servers take command/args/env but no cwd — when .mcp.json
     pins one (kbots-tools runs from the engine root), wrap through /bin/sh.
+
+    `env` is the environment codex itself will run with: ${VAR} refs resolve
+    against it and the loopback vars are copied out of it, so each server
+    starts with what it needs instead of a bare table.
     """
+    env = env or {}
     mcp_file = Path(project_dir) / ".mcp.json"
     if not mcp_file.exists():
         return []
@@ -62,6 +95,7 @@ def mcp_config_args(project_dir: Path) -> list[str]:
         logger.warning(f"Unreadable .mcp.json in {project_dir}: {e}")
         return []
 
+    loopback = {k: env[k] for k in _LOOPBACK_ENV if env.get(k)}
     args: list[str] = []
     for name, spec in servers.items():
         command = spec.get("command")
@@ -76,9 +110,14 @@ def mcp_config_args(project_dir: Path) -> list[str]:
         args.extend(["-c", f"mcp_servers.{name}.command = {_toml_str(command)}"])
         if cmd_args:
             args.extend(["-c", f"mcp_servers.{name}.args = {json.dumps(cmd_args)}"])
-        env = spec.get("env")
-        if env:
-            args.extend(["-c", f"mcp_servers.{name}.env = {_toml_inline_table(env)}"])
+        # An unresolved ${VAR} would otherwise reach the server as its own
+        # literal text and fail as a bad credential rather than a missing one.
+        server_env = {k: _expand_env_refs(v, env)
+                      for k, v in (spec.get("env") or {}).items()}
+        server_env.update(loopback)
+        if server_env:
+            args.extend(
+                ["-c", f"mcp_servers.{name}.env = {_toml_inline_table(server_env)}"])
     return args
 
 
@@ -149,7 +188,7 @@ class CodexCLIProvider(LLMProvider):
                 if system:
                     prompt = f"<system>\n{system}\n</system>\n\n{prompt}"
             args = self._build_args(
-                cwd, model, effort, session_id if resuming else None, prompt)
+                cwd, model, effort, session_id if resuming else None, prompt, env)
             logger.debug(f"{tag}codex exec: cwd={cwd} model={model} "
                          f"resume={resuming} prompt_len={len(prompt)}")
             result = await self._run(args, cwd, env, tag)
@@ -160,7 +199,8 @@ class CodexCLIProvider(LLMProvider):
                     f"{tag}codex resume {session_id} failed — starting fresh")
         raise RuntimeError("codex exec failed (see logs for stderr)")
 
-    def _build_args(self, cwd: Path, model, effort, session_id, prompt) -> list[str]:
+    def _build_args(self, cwd: Path, model, effort, session_id, prompt,
+                    env: dict | None = None) -> list[str]:
         args = [self._codex_bin, "exec", "--json", "--skip-git-repo-check",
                 "-s", self._sandbox]
         if model:
@@ -168,7 +208,7 @@ class CodexCLIProvider(LLMProvider):
         mapped = _EFFORT_MAP.get(effort or "")
         if mapped:
             args.extend(["-c", f"model_reasoning_effort = {_toml_str(mapped)}"])
-        args.extend(mcp_config_args(cwd))
+        args.extend(mcp_config_args(cwd, env))
         if session_id:
             args.extend(["resume", session_id])
         args.append(prompt if prompt else "Continue.")

@@ -3,7 +3,7 @@
 import yaml
 
 from src.core.base import ToolContext
-from src.tools.agents_admin import create_agent
+from src.tools.agents_admin import agent_config, create_agent
 
 
 def _write_config(overlay, guild_id="111222333"):
@@ -169,3 +169,71 @@ async def test_privileged_caller_allowed(overlay, monkeypatch):
     )
     assert not result.startswith("ERROR")
     assert "Newbie" in result
+
+
+# --- agent_config: runtime model/effort, self-service ---------------------
+
+
+def _config_with_admin(overlay, admin_id="42"):
+    (overlay / "config" / "config.yaml").write_text(yaml.dump({
+        "kbots": {"data_dir": str(overlay / "data")},
+        "admin_users": {"discord": [admin_id]},
+    }))
+
+
+def _agents_file(overlay, agents):
+    (overlay / "config" / "agents.yaml").write_text(yaml.dump({"agents": agents}))
+
+
+CODEX_AGENT = {"engineer3": {"display_name": "Engineer3", "tier": "privileged",
+                             "llm": {"provider": "codex_cli", "model": "gpt-5.6-sol"}}}
+
+
+async def test_agent_config_reads_own_settings(overlay, monkeypatch):
+    monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
+    _config_with_admin(overlay)
+    _agents_file(overlay, CODEX_AGENT)
+
+    out = await agent_config(ToolContext(agent_id="engineer3", user_id="42"))
+
+    assert "codex_cli" in out and "gpt-5.6-sol" in out
+
+
+async def test_agent_config_sets_model_live(overlay, monkeypatch):
+    monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
+    _config_with_admin(overlay)
+    _agents_file(overlay, CODEX_AGENT)
+    ctx = ToolContext(agent_id="engineer3", user_id="42")
+
+    out = await agent_config(ctx, model="gpt-6-astra", effort="high")
+    assert "no restart" in out
+
+    # Read back through a fresh call — this is what the engine sees next turn.
+    state = await agent_config(ctx)
+    assert "gpt-6-astra" in state and "high" in state
+    assert "agents.yaml says gpt-5.6-sol" in state
+
+    assert "nothing to reset" not in await agent_config(ctx, reset=True)
+    assert "gpt-5.6-sol" in await agent_config(ctx)
+
+
+async def test_agent_config_write_requires_admin(overlay, monkeypatch):
+    """Same posture as set_hitl: an agent must not retune itself on an
+    arbitrary user's say-so. Reading stays open."""
+    monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
+    _config_with_admin(overlay, admin_id="42")
+    _agents_file(overlay, CODEX_AGENT)
+    ctx = ToolContext(agent_id="engineer3", user_id="999")
+
+    assert "only an admin" in await agent_config(ctx, model="gpt-6-astra")
+    assert "gpt-5.6-sol" in await agent_config(ctx)
+
+
+async def test_agent_config_rejects_bad_input(overlay, monkeypatch):
+    monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
+    _config_with_admin(overlay)
+    _agents_file(overlay, CODEX_AGENT)
+    ctx = ToolContext(agent_id="engineer3", user_id="42")
+
+    assert "invalid effort" in await agent_config(ctx, effort="ludicrous")
+    assert "Unknown agent" in await agent_config(ctx, agent="nobody", model="x")
