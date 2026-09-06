@@ -149,12 +149,26 @@ def warn_on_split_store(config: dict) -> list[str]:
     the exact shape of the bug above, so it must never again be silent.
     """
     stale: list[str] = []
-    if resolve_data_dir(config).resolve() == (PROJECT_ROOT / "data").resolve():
+    legacy_dir = PROJECT_ROOT / "data"
+    if resolve_data_dir(config).resolve() == legacy_dir.resolve():
         return stale
-    for rel in ("memory.db", "graph/memory.lbdb"):
-        legacy = PROJECT_ROOT / "data" / rel
+    # Derived, not listed. This was a hardcoded tuple of two filenames, and
+    # goals.db sat outside it for three weeks because nobody thought to add a
+    # third. Once data_dir points elsewhere, ANY non-empty file left here is a
+    # leftover by definition, so ask the directory rather than a list that has
+    # to be maintained by whoever adds the next store.
+    try:
+        entries = sorted(p for p in legacy_dir.rglob("*") if p.is_file())
+    except OSError:
+        return stale
+    for legacy in entries:
+        # -wal/-shm belong to a file already named, and a log is not a store.
+        # Listing either would train people to skim the warning.
+        if (legacy.suffix in (".log", ".jsonl")
+                or legacy.name.endswith(("-wal", "-shm"))):
+            continue
         try:
-            if legacy.is_file() and legacy.stat().st_size > 0:
+            if legacy.stat().st_size > 0:
                 stale.append(str(legacy))
         except OSError:
             continue

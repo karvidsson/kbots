@@ -491,6 +491,12 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     from src.core import jobs as _jobs
     _jobs.set_data_dir(data_dir)
 
+    # And the goal store: the goal_* tools write here while the engine reads
+    # the same rows to route participants into a goal channel. Two paths would
+    # be two goal lists, one of which is always empty.
+    from src.core import goals as _goals
+    _goals.set_data_dir(data_dir)
+
     # Security alerts — send to configured Discord channel
     alerter = AlertSender(config, vault)
     if alerter.enabled:
