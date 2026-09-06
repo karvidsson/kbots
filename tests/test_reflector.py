@@ -27,8 +27,8 @@ class FakeLLM:
 
 
 class FakeMgr:
-    def __init__(self, mem, project_dir, llm):
-        self.agent_configs = {"a": {}}
+    def __init__(self, mem, project_dir, llm, agent_cfg=None):
+        self.agent_configs = {"a": agent_cfg or {}}
         self._mem, self._pd, self._llm = mem, project_dir, llm
 
     def _get_agent_memory(self, aid):
@@ -64,20 +64,37 @@ def _lessons(n=4):
             for i in range(n)]
 
 
-async def test_reflect_model_is_per_provider(overlay, tmp_path):
-    """'haiku' is a Claude alias — codex 400s on it. A provider with no
-    configured model reflects on its own default instead of a foreign name."""
+CODEX_CFG = {"llm": {"provider": "codex_cli", "model": "gpt-5.6-sol"}}
+
+
+async def test_reflect_falls_back_to_the_agents_own_model(overlay, tmp_path):
+    """'haiku' is a Claude alias and codex 400s on it. Falling through to the
+    provider is not a fix either: providers are shared singletons built from
+    defaults.llm, so a codex agent inherited the fleet's 'opus' and 400'd on
+    that instead. The agent's own model is the one name known to work."""
     llm = FakeLLM(name="codex_cli")
-    r = Reflector(FakeMgr(FakeMemory(_lessons()), tmp_path, llm),
+    r = Reflector(FakeMgr(FakeMemory(_lessons()), tmp_path, llm, CODEX_CFG),
                   {"model": "haiku", "min_lessons": 3})
     assert await r._reflect("a") is True
-    assert llm.calls[0]["model"] is None
-
-    llm = FakeLLM(name="codex_cli")
-    r = Reflector(FakeMgr(FakeMemory(_lessons()), tmp_path, llm),
-                  {"models": {"codex_cli": "gpt-5.6-sol"}, "min_lessons": 3})
-    assert await r._reflect("a") is True
     assert llm.calls[0]["model"] == "gpt-5.6-sol"
+
+
+async def test_reflect_prefers_a_configured_cheap_model(overlay, tmp_path):
+    llm = FakeLLM(name="codex_cli")
+    r = Reflector(FakeMgr(FakeMemory(_lessons()), tmp_path, llm, CODEX_CFG),
+                  {"models": {"codex_cli": "gpt-5-mini"}, "min_lessons": 3})
+    assert await r._reflect("a") is True
+    assert llm.calls[0]["model"] == "gpt-5-mini"
+
+
+async def test_reflect_uses_provider_default_when_agent_has_no_model(overlay, tmp_path):
+    """No model anywhere for this agent, so the provider's own default is
+    correct — it is the same fleet default the agent runs on."""
+    llm = FakeLLM(name="codex_cli")
+    r = Reflector(FakeMgr(FakeMemory(_lessons()), tmp_path, llm, {}),
+                  {"min_lessons": 3})
+    assert await r._reflect("a") is True
+    assert llm.calls[0]["model"] is None
 
 
 @pytest.mark.parametrize("stop_reason", ["error", "usage_limit"])
