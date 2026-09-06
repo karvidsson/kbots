@@ -56,6 +56,8 @@ async def test_fresh_run_parses_events(fake_codex, tmp_path):
     argv = _argv(log)[0]
     assert argv[:2] == ["exec", "--json"]
     assert "resume" not in argv
+    assert 'approval_policy = "on-request"' in argv
+    assert 'approvals_reviewer = "auto_review"' in argv
     assert argv[-1] == "hi"
 
 
@@ -112,9 +114,55 @@ async def test_effort_and_model_flags(fake_codex, tmp_path):
     assert 'model_reasoning_effort = "xhigh"' in argv
 
 
+async def test_per_agent_execution_policy_and_directories(fake_codex, tmp_path,
+                                                          monkeypatch):
+    bin_path, log = fake_codex
+    shared = tmp_path / "shared"
+    repo = tmp_path / "repo"
+    shared.mkdir()
+    repo.mkdir()
+    monkeypatch.setenv("KBOTS_TMP", str(shared))
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+
+    await _provider(bin_path, sandbox="read-only").complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(tmp_path / "agent"),
+        sandbox="danger-full-access",
+        approval_policy="never",
+        approvals_reviewer="user",
+        extra_dirs=[str(repo)],
+        sandbox_dirs=[str(repo)],
+    )
+
+    argv = _argv(log)[0]
+    assert argv[argv.index("-s") + 1] == "danger-full-access"
+    assert 'approval_policy = "never"' in argv
+    assert 'approvals_reviewer = "user"' in argv
+    assert argv.count("--add-dir") == 2
+    assert str(shared) in argv
+    assert str(repo) in argv
+
+
 def test_invalid_sandbox_rejected(tmp_path):
     with pytest.raises(ValueError, match="sandbox"):
         CodexCLIProvider({"sandbox": "yolo"})
+
+
+@pytest.mark.parametrize("key,value,match", [
+    ("approval_policy", "sometimes", "approval policy"),
+    ("approvals_reviewer", "nobody", "approvals reviewer"),
+])
+def test_invalid_approval_config_rejected(key, value, match):
+    with pytest.raises(ValueError, match=match):
+        CodexCLIProvider({key: value})
+
+
+async def test_invalid_per_agent_sandbox_rejected(fake_codex, tmp_path):
+    bin_path, _ = fake_codex
+    with pytest.raises(ValueError, match="sandbox"):
+        await _provider(bin_path).complete(
+            [Message(role=MessageRole.USER, content="hi")],
+            project_dir=str(tmp_path / "agent"), sandbox="yolo")
 
 
 def test_mcp_config_translation(tmp_path):

@@ -23,6 +23,8 @@ Config (under the agent's llm block or defaults.llm):
   model: gpt-5-codex          # optional — omitted -> codex default
   codex_bin: codex            # optional
   sandbox: workspace-write    # read-only | workspace-write | danger-full-access
+  approval_policy: on-request # on-request | never
+  approvals_reviewer: auto_review  # user | auto_review
   timeout: 600                # seconds per turn
 
 Limitations (v1): per-tool allow/deny lists are not mapped — MCP exposure is
@@ -36,12 +38,14 @@ import os
 import re
 from pathlib import Path
 
-from src.core.base import LLMProvider, LLMResponse, Message
+from src.core.base import LLMProvider, LLMResponse, Message, agent_session_dirs
 from src.llm.claude_code import build_cli_prompt
 
 logger = logging.getLogger(__name__)
 
 _SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
+_APPROVAL_POLICIES = ("on-request", "never")
+_APPROVAL_REVIEWERS = ("user", "auto_review")
 # kbots effort levels -> codex model_reasoning_effort
 _EFFORT_MAP = {"low": "low", "medium": "medium", "high": "high",
                "xhigh": "xhigh", "max": "xhigh"}
@@ -153,7 +157,26 @@ class CodexCLIProvider(LLMProvider):
         self._sandbox = config.get("sandbox", "workspace-write")
         if self._sandbox not in _SANDBOX_MODES:
             raise ValueError(f"Invalid codex sandbox mode: {self._sandbox}")
+        # `codex exec` is headless, so an ordinary user approval prompt cannot
+        # be answered. Automatic review lets eligible requests proceed while
+        # kbots' own tool allowlists, access control and HITL gates remain the
+        # authority for what an agent may do.
+        self._approval_policy = config.get("approval_policy", "on-request")
+        self._approvals_reviewer = config.get(
+            "approvals_reviewer", "auto_review")
+        self._validate_execution_policy(
+            self._sandbox, self._approval_policy, self._approvals_reviewer)
         self._timeout = float(config.get("timeout", 600))
+
+    @staticmethod
+    def _validate_execution_policy(sandbox, approval_policy, approvals_reviewer) -> None:
+        if sandbox not in _SANDBOX_MODES:
+            raise ValueError(f"Invalid codex sandbox mode: {sandbox}")
+        if approval_policy not in _APPROVAL_POLICIES:
+            raise ValueError(f"Invalid codex approval policy: {approval_policy}")
+        if approvals_reviewer not in _APPROVAL_REVIEWERS:
+            raise ValueError(
+                f"Invalid codex approvals reviewer: {approvals_reviewer}")
 
     async def complete(
         self,
@@ -168,6 +191,15 @@ class CodexCLIProvider(LLMProvider):
         effort = kwargs.get("effort")
         agent_id = kwargs.get("agent_id")
         tag = f"[{agent_id}] " if agent_id else ""
+        sandbox = kwargs.get("sandbox") or self._sandbox
+        approval_policy = (
+            kwargs.get("approval_policy") or self._approval_policy)
+        approvals_reviewer = (
+            kwargs.get("approvals_reviewer") or self._approvals_reviewer)
+        self._validate_execution_policy(
+            sandbox, approval_policy, approvals_reviewer)
+        additional_dirs = agent_session_dirs(
+            kwargs.get("extra_dirs"), kwargs.get("sandbox_dirs"))
 
         cwd = Path(project_dir).resolve()
         cwd.mkdir(parents=True, exist_ok=True)
@@ -188,7 +220,13 @@ class CodexCLIProvider(LLMProvider):
                 if system:
                     prompt = f"<system>\n{system}\n</system>\n\n{prompt}"
             args = self._build_args(
-                cwd, model, effort, session_id if resuming else None, prompt, env)
+                cwd, model, effort, session_id if resuming else None, prompt,
+                env=env,
+                sandbox=sandbox,
+                approval_policy=approval_policy,
+                approvals_reviewer=approvals_reviewer,
+                additional_dirs=additional_dirs,
+            )
             logger.debug(f"{tag}codex exec: cwd={cwd} model={model} "
                          f"resume={resuming} prompt_len={len(prompt)}")
             result = await self._run(args, cwd, env, tag)
@@ -199,10 +237,26 @@ class CodexCLIProvider(LLMProvider):
                     f"{tag}codex resume {session_id} failed — starting fresh")
         raise RuntimeError("codex exec failed (see logs for stderr)")
 
-    def _build_args(self, cwd: Path, model, effort, session_id, prompt,
-                    env: dict | None = None) -> list[str]:
+    def _build_args(
+        self,
+        cwd: Path,
+        model,
+        effort,
+        session_id,
+        prompt,
+        *,
+        env: dict | None = None,
+        sandbox,
+        approval_policy,
+        approvals_reviewer,
+        additional_dirs,
+    ) -> list[str]:
         args = [self._codex_bin, "exec", "--json", "--skip-git-repo-check",
-                "-s", self._sandbox]
+                "-s", sandbox,
+                "-c", f"approval_policy = {_toml_str(approval_policy)}",
+                "-c", f"approvals_reviewer = {_toml_str(approvals_reviewer)}"]
+        for directory in additional_dirs:
+            args.extend(["--add-dir", directory])
         if model:
             args.extend(["-m", str(model)])
         mapped = _EFFORT_MAP.get(effort or "")

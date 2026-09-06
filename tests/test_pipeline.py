@@ -80,6 +80,53 @@ async def test_message_flows_end_to_end(pipeline):
     assert content.startswith("[mock] echo:")
 
 
+async def test_agent_execution_settings_reach_provider(tmp_path):
+    captured = {}
+
+    class RecordingMock(MockProvider):
+        async def complete(self, messages, tools=None, stream=False, **kwargs):
+            captured.update(kwargs)
+            return await super().complete(
+                messages, tools=tools, stream=stream, **kwargs)
+
+    agent_dir = tmp_path / "agents" / "codexbot"
+    repo_dir = tmp_path / "repo"
+    shared_dir = tmp_path / "shared"
+    agent_dir.mkdir(parents=True)
+    repo_dir.mkdir()
+    shared_dir.mkdir()
+    connector = StubConnector()
+    manager = AgentManager(
+        agent_configs={
+            "codexbot": {
+                "display_name": "CODEXBOT",
+                "project_dir": str(agent_dir),
+                "extra_dirs": [str(repo_dir)],
+                "llm": {
+                    "provider": "mock",
+                    "sandbox": "danger-full-access",
+                    "approval_policy": "on-request",
+                    "approvals_reviewer": "auto_review",
+                },
+                "tools": [],
+                "routing": {"stub": {"channels": []}},
+            }
+        },
+        connectors={"stub": connector},
+        llm_providers={"mock": RecordingMock(config={})},
+        memory_backends={},
+        defaults={"sandbox": {"additional_dirs": [str(shared_dir)]}},
+    )
+
+    await Router(manager).route(_msg("configure", channel="settings"))
+
+    assert captured["sandbox"] == "danger-full-access"
+    assert captured["approval_policy"] == "on-request"
+    assert captured["approvals_reviewer"] == "auto_review"
+    assert captured["extra_dirs"] == [str(repo_dir)]
+    assert captured["sandbox_dirs"] == [str(shared_dir)]
+
+
 async def test_unrouted_connector_gets_no_reply(pipeline):
     router, connector = pipeline
     msg = _msg("hello")

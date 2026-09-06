@@ -544,6 +544,27 @@ With `claude_code` or `codex_cli`, kbots is a harness of harnesses: the CLI driv
 
 The agent is the same one in both shapes. `AGENTS.md` is the single identity file (Codex reads it natively, Claude Code reaches it through a `CLAUDE.md` stub), the tool surface is identical, and rate limits, access control and the approval gate are enforced by the engine rather than by whatever is running the turn. That is what makes the engine a per-agent setting instead of a rewrite.
 
+Codex CLI turns are headless. They default to `approval_policy: on-request`
+with `approvals_reviewer: auto_review`, allowing the inner harness to review
+eligible tool requests while kbots keeps authority through its tool allowlists,
+access control and HITL gate. The Codex sandbox and review policy can be set per
+agent:
+
+```yaml
+llm:
+  provider: codex_cli
+  model: gpt-5-codex
+  sandbox: workspace-write
+  approval_policy: on-request
+  approvals_reviewer: auto_review
+extra_dirs:
+  - /path/to/a/project
+```
+
+Set `approval_policy: never` to reject operations that require an inner-harness
+approval. Kbots passes `extra_dirs` and global `sandbox.additional_dirs` to
+Codex as additional workspace roots.
+
 The primary engine is the **Claude Code CLI**, authenticated with your Claude subscription (**Pro or Max** — no per-token API costs) or with pay-as-you-go API/Console billing. Max is recommended for multi-agent setups thanks to higher usage limits. Each agent runs as its own Claude Code subprocess that:
 
 - reaches the whole toolset over MCP (Model Context Protocol)
