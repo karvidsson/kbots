@@ -14,9 +14,13 @@ That translation carries the whole environment of each MCP server, because
 codex builds it from the config table alone and does not forward its own env
 the way the Claude Code CLI does. Two things therefore have to be added here
 rather than assumed: `${VAR}` references in .mcp.json (codex does no
-expansion), and the loopback API address/token the engine mints at boot.
-Without the latter, every inter-agent tool inside the MCP server answers "no
-agent manager available" while looking, from the outside, like a refusal.
+expansion), the loopback API address/token the engine mints at boot, and the
+identity of the turn (who is asking, and where).
+
+Each omission fails silently in its own way. Without the loopback pair, every
+inter-agent tool answers "no agent manager available" and looks like a
+refusal. Without the identity pair, every admin gate fails closed and the
+owner asking in their own channel is indistinguishable from nobody.
 
 Config (under the agent's llm block or defaults.llm):
   provider: codex_cli
@@ -64,12 +68,19 @@ def _toml_inline_table(d: dict) -> str:
 # .mcp.json for vault-backed secrets. Claude Code expands them; codex does not.
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 
-# Vars every kbots MCP server needs and .mcp.json cannot carry, because the
-# engine mints them per boot: the loopback internal API. Tools run in the MCP
-# subprocess with no handle on the AgentManager and reach it over this address
-# (src/tools/builtin.py), so an MCP server that starts without them can read
-# and write files all day but cannot talk to another agent.
-_LOOPBACK_ENV = ("KBOTS_INTERNAL_API", "KBOTS_INTERNAL_TOKEN")
+# Vars every kbots MCP server needs and .mcp.json cannot carry. Two kinds:
+#
+# Per boot — the loopback internal API. Tools run in the MCP subprocess with no
+# handle on the AgentManager and reach it over this address
+# (src/tools/builtin.py), so a server that starts without them can read and
+# write files all day but cannot talk to another agent.
+#
+# Per turn — WHO is talking and WHERE. Every admin gate in src/tools reads
+# ctx.user_id, which mcp_server builds from KBOTS_USER_ID. Without it the gate
+# does not merely misidentify the sender, it fails closed on every codex turn:
+# the owner asking in their own channel is indistinguishable from nobody.
+_MCP_PASSTHROUGH_ENV = ("KBOTS_INTERNAL_API", "KBOTS_INTERNAL_TOKEN",
+                        "KBOTS_USER_ID", "KBOTS_CHANNEL_ID")
 
 
 def _expand_env_refs(value: str, env: dict) -> str:
@@ -86,7 +97,7 @@ def mcp_config_args(project_dir: Path, env: dict | None = None) -> list[str]:
     pins one (kbots-tools runs from the engine root), wrap through /bin/sh.
 
     `env` is the environment codex itself will run with: ${VAR} refs resolve
-    against it and the loopback vars are copied out of it, so each server
+    against it and the kbots passthrough vars are copied out of it, so each server
     starts with what it needs instead of a bare table.
     """
     env = env or {}
@@ -99,7 +110,7 @@ def mcp_config_args(project_dir: Path, env: dict | None = None) -> list[str]:
         logger.warning(f"Unreadable .mcp.json in {project_dir}: {e}")
         return []
 
-    loopback = {k: env[k] for k in _LOOPBACK_ENV if env.get(k)}
+    passthrough = {k: env[k] for k in _MCP_PASSTHROUGH_ENV if env.get(k)}
     args: list[str] = []
     for name, spec in servers.items():
         command = spec.get("command")
@@ -118,7 +129,7 @@ def mcp_config_args(project_dir: Path, env: dict | None = None) -> list[str]:
         # literal text and fail as a bad credential rather than a missing one.
         server_env = {k: _expand_env_refs(v, env)
                       for k, v in (spec.get("env") or {}).items()}
-        server_env.update(loopback)
+        server_env.update(passthrough)
         if server_env:
             args.extend(
                 ["-c", f"mcp_servers.{name}.env = {_toml_inline_table(server_env)}"])
@@ -206,6 +217,13 @@ class CodexCLIProvider(LLMProvider):
 
         env = {k: v for k, v in os.environ.items() if k in self._ENV_ALLOWLIST}
         env.update(kwargs.get("extra_env") or {})
+        # Who this turn is from, in the same vars claude_code sets, because
+        # mcp_server reads exactly these to build ToolContext. Set per call:
+        # extra_env is per launch and carries no notion of a sender.
+        for var, value in (("KBOTS_USER_ID", kwargs.get("user_id")),
+                           ("KBOTS_CHANNEL_ID", kwargs.get("channel_id"))):
+            if value:
+                env[var] = str(value)
 
         # One retry: a stale/unknown session id drops resume and starts fresh.
         for resuming in ([True, False] if session_id else [False]):

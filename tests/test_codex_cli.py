@@ -243,3 +243,34 @@ async def test_run_passes_loopback_env_to_mcp_servers(fake_codex, tmp_path):
         extra_env={"KBOTS_INTERNAL_API": "http://127.0.0.1:9", "KBOTS_INTERNAL_TOKEN": "t"},
     )
     assert 'KBOTS_INTERNAL_TOKEN = "t"' in " ".join(_argv(log)[0])
+
+
+async def test_run_passes_turn_identity_to_mcp_servers(fake_codex, tmp_path):
+    """Every admin gate in src/tools reads ctx.user_id, which mcp_server builds
+    from KBOTS_USER_ID. Dropping it does not misidentify the sender, it fails
+    the gate closed: the owner asking becomes indistinguishable from nobody."""
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    _write_mcp(agent_dir, {"KBOTS_AGENT_ID": "atlas"})
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir),
+        user_id="1000000000000000001", channel_id="42",
+    )
+    joined = " ".join(_argv(log)[0])
+    assert 'KBOTS_USER_ID = "1000000000000000001"' in joined
+    assert 'KBOTS_CHANNEL_ID = "42"' in joined
+
+
+async def test_anonymous_turn_sets_no_identity_vars(fake_codex, tmp_path):
+    """A turn with no sender must leave the vars absent rather than empty, so
+    the gate still fails closed instead of matching an admin id of ''."""
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    _write_mcp(agent_dir, {"KBOTS_AGENT_ID": "atlas"})
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir), user_id="", channel_id="")
+    assert "KBOTS_USER_ID" not in " ".join(_argv(log)[0])
