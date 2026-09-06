@@ -872,6 +872,9 @@ class AgentManager:
                         allowed_tools=allowed_tools,
                         disallowed_tools=disallowed_tools,
                         mcp_config=mcp_config,
+                        sandbox=llm_cfg.get("sandbox"),
+                        approval_policy=llm_cfg.get("approval_policy"),
+                        approvals_reviewer=llm_cfg.get("approvals_reviewer"),
                         extra_dirs=agent_cfg.get("extra_dirs"),
                         sandbox_dirs=(self.defaults.get("sandbox", {}) or {}
                                       ).get("additional_dirs"),
