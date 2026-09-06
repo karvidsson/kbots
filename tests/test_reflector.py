@@ -16,12 +16,14 @@ class FakeMemory:
 
 
 class FakeLLM:
-    def __init__(self):
+    def __init__(self, name="claude_code", response=None):
+        self.name = name
         self.calls = []
+        self._response = response
 
     async def complete(self, messages, tools=None, **kw):
         self.calls.append(kw)
-        return LLMResponse(content="## Preferred\n- alpha works")
+        return self._response or LLMResponse(content="## Preferred\n- alpha works")
 
 
 class FakeMgr:
@@ -55,6 +57,39 @@ async def test_reflect_writes_lessons_md(overlay, tmp_path):
     assert "# LESSONS" in out and "alpha works" in out
     # cheap: single call on the configured cheap model, no tools
     assert llm.calls[0]["model"] == "haiku"
+
+
+def _lessons(n=4):
+    return [{"category": "lesson", "content": f"lesson {i}", "confidence": 0.7}
+            for i in range(n)]
+
+
+async def test_reflect_model_is_per_provider(overlay, tmp_path):
+    """'haiku' is a Claude alias — codex 400s on it. A provider with no
+    configured model reflects on its own default instead of a foreign name."""
+    llm = FakeLLM(name="codex_cli")
+    r = Reflector(FakeMgr(FakeMemory(_lessons()), tmp_path, llm),
+                  {"model": "haiku", "min_lessons": 3})
+    assert await r._reflect("a") is True
+    assert llm.calls[0]["model"] is None
+
+    llm = FakeLLM(name="codex_cli")
+    r = Reflector(FakeMgr(FakeMemory(_lessons()), tmp_path, llm),
+                  {"models": {"codex_cli": "gpt-5.6-sol"}, "min_lessons": 3})
+    assert await r._reflect("a") is True
+    assert llm.calls[0]["model"] == "gpt-5.6-sol"
+
+
+@pytest.mark.parametrize("stop_reason", ["error", "usage_limit"])
+async def test_failed_response_does_not_overwrite_lessons(overlay, tmp_path, stop_reason):
+    """A provider that could not answer returns its apology as content. Writing
+    it replaced whole lessons files with an error string."""
+    (tmp_path / "LESSONS.md").write_text("# LESSONS\n\n- the real ones")
+    llm = FakeLLM(response=LLMResponse(
+        content="Sorry, something went wrong on my end.", stop_reason=stop_reason))
+    r = Reflector(FakeMgr(FakeMemory(_lessons()), tmp_path, llm), {"min_lessons": 3})
+    assert await r._reflect("a") is False
+    assert (tmp_path / "LESSONS.md").read_text() == "# LESSONS\n\n- the real ones"
 
 
 async def test_reflect_skips_below_min(overlay, tmp_path):

@@ -14,6 +14,7 @@ the token. The config accounts entry is written automatically.
 
 import logging
 import os
+import sqlite3
 from pathlib import Path
 
 import yaml
@@ -24,7 +25,7 @@ from src.core.agent_scaffold import (
     agent_is_privileged_or_coordinator,
     scaffold_agent,
 )
-from src.core.base import ToolContext, resolve_config_file
+from src.core.base import ToolContext, resolve_config_file, resolve_data_dir
 from src.core.tools import tool
 
 logger = logging.getLogger(__name__)
@@ -244,6 +245,185 @@ async def create_agent(
         )
 
     return result
+
+
+_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+# Deliberately narrow. Tier, tools, privileged and routing decide what an agent
+# is ALLOWED to do; they stay in agents.yaml where a human edits them. Model and
+# effort only decide how well it thinks, so an agent may retune itself without
+# that being a route to more privilege.
+_SETTABLE = ("model", "effort")
+
+
+def _overrides_db() -> Path:
+    """The engine's database, from the same config the engine reads.
+
+    Opened per call from the MCP process. agent_overrides is re-read by the
+    AgentManager on every turn, so a write here takes effect on the next
+    message with no restart.
+    """
+    from src.core.storage import resolve_db_path
+    cfg_file = resolve_config_file("config.yaml")
+    cfg = {}
+    if cfg_file.exists():
+        try:
+            cfg = yaml.safe_load(cfg_file.read_text()) or {}
+        except yaml.YAMLError:
+            cfg = {}
+    return resolve_db_path(resolve_data_dir(cfg))
+
+
+def _read_overrides(agent_id: str) -> dict[str, str]:
+    try:
+        conn = sqlite3.connect(str(_overrides_db()))
+    except sqlite3.Error:
+        return {}
+    try:
+        rows = conn.execute(
+            "SELECT setting, value FROM agent_overrides WHERE agent_id = ?",
+            (agent_id,)).fetchall()
+        return {r[0]: r[1] for r in rows}
+    except sqlite3.Error:
+        return {}
+    finally:
+        conn.close()
+
+
+def _write_override(agent_id: str, setting: str, value: str | None) -> None:
+    db = _overrides_db()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        # Mirrors storage.py. The engine normally creates it at boot; this
+        # keeps a write from failing on a fresh install where the MCP process
+        # is the first to touch the file.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS agent_overrides ("
+            "agent_id TEXT NOT NULL, setting TEXT NOT NULL, value TEXT NOT NULL, "
+            "updated_at REAL DEFAULT (unixepoch()), PRIMARY KEY (agent_id, setting))")
+        if value is None:
+            conn.execute(
+                "DELETE FROM agent_overrides WHERE agent_id = ? AND setting = ?",
+                (agent_id, setting))
+        else:
+            conn.execute(
+                "INSERT INTO agent_overrides (agent_id, setting, value, updated_at) "
+                "VALUES (?, ?, ?, unixepoch()) "
+                "ON CONFLICT(agent_id, setting) DO UPDATE SET "
+                "value = excluded.value, updated_at = excluded.updated_at",
+                (agent_id, setting, value))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _is_admin(user_id: str) -> bool:
+    """True if the human who sent this turn is a configured admin."""
+    cfg_file = resolve_config_file("config.yaml")
+    if not user_id or not cfg_file.exists():
+        return False
+    try:
+        cfg = yaml.safe_load(cfg_file.read_text()) or {}
+    except yaml.YAMLError:
+        return False
+    admins = (cfg.get("admin_users", {}) or {}).get("discord", []) or []
+    return str(user_id) in [str(a) for a in admins]
+
+
+@tool(
+    name="agent_config",
+    description=(
+        "Read or change an agent's runtime LLM settings — model and effort. "
+        "Call with no arguments to see your own: provider, configured model "
+        "and effort, and any active override. Pass model or effort to change "
+        "them, or reset=true to drop the overrides and go back to agents.yaml. "
+        "Changes persist across restarts and apply from the next message, no "
+        "reboot. Only an admin can change settings; anyone can read them. "
+        "Model names are provider-local (claude_code: opus/sonnet/haiku; "
+        "codex_cli: gpt-* ids; local: an Ollama/LM Studio tag) — a name from "
+        "the wrong vendor is rejected by the backend, not here. Tier, tools "
+        "and privileges are NOT settable here: those live in agents.yaml."
+    ),
+    category="admin",
+)
+async def agent_config(ctx: ToolContext, agent: str = "", model: str = "",
+                       effort: str = "", reset: bool = False) -> str:
+    """Read or set an agent's model/effort runtime overrides.
+
+    agent: which agent to act on. Empty means yourself.
+    model: provider-local model name or alias. Empty leaves it.
+    effort: one of low, medium, high, xhigh, max. Empty leaves it.
+    reset: drop both overrides so agents.yaml governs again.
+    """
+    overlay = os.environ.get("KBOTS_OVERLAY", "")
+    if not overlay:
+        return "ERROR: KBOTS_OVERLAY is not set — cannot locate the deployment overlay."
+
+    agent_id = (agent or ctx.agent_id or "").strip()
+    entries = agent_entries(Path(overlay))
+    if agent_id not in entries:
+        return (f"Unknown agent '{agent_id}'. "
+                f"Known agents: {', '.join(sorted(entries))}")
+
+    cfg = entries[agent_id] or {}
+    llm_cfg = cfg.get("llm", {}) or {}
+    provider = llm_cfg.get("provider", "claude_code")
+    configured_model = llm_cfg.get("model", "(defaults.llm.model)")
+    configured_effort = cfg.get("effort") or "(provider default)"
+    current = _read_overrides(agent_id)
+
+    def _state() -> str:
+        active_model = current.get("model", configured_model)
+        active_effort = current.get("effort", configured_effort)
+        lines = [
+            f"agent:     {agent_id}",
+            f"provider:  {provider}",
+            f"model:     {active_model}"
+            + (f"   (override; agents.yaml says {configured_model})"
+               if "model" in current else ""),
+            f"effort:    {active_effort}"
+            + (f"   (override; agents.yaml says {configured_effort})"
+               if "effort" in current else ""),
+        ]
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    if not model and not effort and not reset:
+        return _state()
+
+    # Same posture as set_hitl: an agent must not be able to retune itself on
+    # an arbitrary user's say-so, so the human driving the turn has to be an
+    # admin. Reading is open.
+    if not _is_admin(ctx.user_id or ""):
+        return ("ERROR: only an admin can change agent settings. "
+                "Ask the owner to make this change, or read the current "
+                "settings by calling this tool with no arguments.")
+
+    changed = []
+    if reset:
+        for setting in _SETTABLE:
+            if setting in current:
+                _write_override(agent_id, setting, None)
+                changed.append(f"{setting} cleared")
+        current = _read_overrides(agent_id)
+        if not changed:
+            return f"No overrides were set for '{agent_id}' — nothing to reset.\n{_state()}"
+    if effort:
+        if effort not in _EFFORT_LEVELS:
+            return (f"ERROR: invalid effort {effort!r} — "
+                    f"one of {', '.join(_EFFORT_LEVELS)}.")
+        _write_override(agent_id, "effort", effort)
+        changed.append(f"effort -> {effort}")
+    if model:
+        _write_override(agent_id, "model", model)
+        changed.append(f"model -> {model}")
+
+    current = _read_overrides(agent_id)
+    logger.warning(f"agent_config: {agent_id} {'; '.join(changed)} "
+                   f"(by agent {ctx.agent_id}, user {ctx.user_id})")
+    return (f"Updated '{agent_id}': {'; '.join(changed)}. "
+            f"Applies from the next message — no restart.\n{_state()}")
 
 
 # Only these key prefixes may be written via the tool — bot tokens and API keys.
