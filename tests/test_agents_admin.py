@@ -185,7 +185,7 @@ def _agents_file(overlay, agents):
     (overlay / "config" / "agents.yaml").write_text(yaml.dump({"agents": agents}))
 
 
-CODEX_AGENT = {"engineer3": {"display_name": "Engineer3", "tier": "privileged",
+CODEX_AGENT = {"atlas": {"display_name": "Atlas", "tier": "privileged",
                              "llm": {"provider": "codex_cli", "model": "gpt-5.6-sol"}}}
 
 
@@ -194,7 +194,7 @@ async def test_agent_config_reads_own_settings(overlay, monkeypatch):
     _config_with_admin(overlay)
     _agents_file(overlay, CODEX_AGENT)
 
-    out = await agent_config(ToolContext(agent_id="engineer3", user_id="42"))
+    out = await agent_config(ToolContext(agent_id="atlas", user_id="42"))
 
     assert "codex_cli" in out and "gpt-5.6-sol" in out
 
@@ -203,7 +203,7 @@ async def test_agent_config_sets_model_live(overlay, monkeypatch):
     monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
     _config_with_admin(overlay)
     _agents_file(overlay, CODEX_AGENT)
-    ctx = ToolContext(agent_id="engineer3", user_id="42")
+    ctx = ToolContext(agent_id="atlas", user_id="42")
 
     out = await agent_config(ctx, model="gpt-6-astra", effort="high")
     assert "no restart" in out
@@ -223,7 +223,7 @@ async def test_agent_config_write_requires_admin(overlay, monkeypatch):
     monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
     _config_with_admin(overlay, admin_id="42")
     _agents_file(overlay, CODEX_AGENT)
-    ctx = ToolContext(agent_id="engineer3", user_id="999")
+    ctx = ToolContext(agent_id="atlas", user_id="999")
 
     assert "only an admin" in await agent_config(ctx, model="gpt-6-astra")
     assert "gpt-5.6-sol" in await agent_config(ctx)
@@ -233,7 +233,7 @@ async def test_agent_config_rejects_bad_input(overlay, monkeypatch):
     monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
     _config_with_admin(overlay)
     _agents_file(overlay, CODEX_AGENT)
-    ctx = ToolContext(agent_id="engineer3", user_id="42")
+    ctx = ToolContext(agent_id="atlas", user_id="42")
 
     assert "invalid effort" in await agent_config(ctx, effort="ludicrous")
     assert "Unknown agent" in await agent_config(ctx, agent="nobody", model="x")
