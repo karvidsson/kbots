@@ -1,6 +1,7 @@
 """Goal workstreams — store lifecycle, decisions, dynamic routing, turn budget."""
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -449,3 +450,58 @@ async def test_a_failed_channel_creation_does_not_undo_the_advance(goal_tools,
     assert fresh["channel_id"] == "home-1"
     assert fresh["anchored"] == 1, "must stay eligible for a later retry"
     assert "no guild_id" in out
+
+
+# --- store location: goals belong in the deployment's data dir ---
+
+def test_db_path_follows_the_pinned_data_dir(tmp_path, monkeypatch):
+    """Until 2026-09-06 this resolved against PROJECT_ROOT, so every goal lived
+    in the engine checkout — the half a re-clone throws away."""
+    monkeypatch.setattr(store, "DB_PATH", "goals.db")
+    store.set_data_dir(tmp_path / "overlay-data")
+    try:
+        assert store.db_path() == tmp_path / "overlay-data" / "goals.db"
+        goal = store.create_goal("t", "d", "maya", "c", "u")
+        assert (tmp_path / "overlay-data" / "goals.db").is_file()
+        assert store.get_goal(goal["id"])["title"] == "t"
+    finally:
+        store.set_data_dir(None)
+
+
+def test_repinning_the_data_dir_drops_the_open_handle(tmp_path, monkeypatch):
+    """A pin arriving after first use must not keep writing to the old file."""
+    monkeypatch.setattr(store, "DB_PATH", "goals.db")
+    store.set_data_dir(tmp_path / "a")
+    try:
+        store.create_goal("first", "d", "maya", "c", "u")
+        store.set_data_dir(tmp_path / "b")
+        assert store.list_goals() == []                     # fresh file
+        assert (tmp_path / "b" / "goals.db").is_file()
+        store.set_data_dir(tmp_path / "a")
+        assert [g["title"] for g in store.list_goals()] == ["first"]
+    finally:
+        store.set_data_dir(None)
+
+
+def test_split_store_warning_names_any_leftover_not_a_fixed_list(tmp_path, monkeypatch):
+    """The old warning listed two filenames by hand and goals.db slipped past
+    it for three weeks. It must be derived from the directory instead."""
+    from src.core import base
+
+    monkeypatch.setattr(base, "PROJECT_ROOT", tmp_path)
+    legacy = tmp_path / "data"
+    (legacy / "graph").mkdir(parents=True)
+    (legacy / "goals.db").write_bytes(b"x")
+    (legacy / "memory.db").write_bytes(b"x")
+    (legacy / "graph" / "memory.lbdb").write_bytes(b"x")
+    (legacy / "brand-new-store.db").write_bytes(b"x")   # never added to any list
+    (legacy / "goals.db-wal").write_bytes(b"x")         # sidecar, not a store
+    (legacy / "audit.jsonl").write_bytes(b"x")          # a log, not a store
+    (legacy / "empty.db").write_bytes(b"")
+
+    stale = base.warn_on_split_store({"kbots": {"data_dir": str(tmp_path / "overlay")}})
+    names = {Path(p).name for p in stale}
+    assert names == {"goals.db", "memory.db", "memory.lbdb", "brand-new-store.db"}
+
+    # Same dir on both sides is not a split at all.
+    assert base.warn_on_split_store({"kbots": {"data_dir": str(legacy)}}) == []

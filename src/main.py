@@ -497,6 +497,11 @@ async def main() -> None:
     from src.core import version as _version
     data_dir = Path(config.get("kbots", {}).get("data_dir", "./data"))
     _version.set_data_dir(data_dir)  # so in-process readers agree with the writer
+    # Pinned here rather than beside the job watcher: the goal store is read by
+    # the connector's routing on the very first message, which arrives well
+    # before that. A late pin would mean the first reads hit the wrong file.
+    from src.core import goals as _goals
+    _goals.set_data_dir(data_dir)
     _prev = _version.read_running_version(data_dir)
     _running = _version.write_running_version(data_dir)
     _run_v = _running.get("version") or _running["short"]

@@ -23,7 +23,39 @@ from src.core.base import PROJECT_ROOT
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = "data/goals.db"
+# Relative to the deployment's data dir. Absolute overrides it (tests do this).
+DB_PATH = "goals.db"
+
+# Pinned at boot by both entrypoints, the same way src/core/jobs.py does it:
+# this module is imported by the engine AND by the separate MCP subprocess, so
+# neither can reach the other's config object and each has to be told.
+_data_dir_override: Path | None = None
+
+
+def set_data_dir(data_dir: Path | str | None) -> None:
+    """Pin where goals.db lives for readers in THIS process."""
+    global _data_dir_override, _db
+    new = Path(data_dir) if data_dir else None
+    if new != _data_dir_override and _db is not None:
+        _db.close()          # a pin after first use must not keep the old handle
+        _db = None
+    _data_dir_override = new
+    _invalidate_cache()
+
+
+def db_path() -> Path:
+    """Absolute path to the goals store.
+
+    Until 2026-09-06 this resolved against PROJECT_ROOT, so every goal on a
+    deployment with a configured data_dir lived in the engine checkout, which
+    is the half that is meant to be disposable: a clean re-clone dropped them.
+    memory.db and kbots.db were moved in the August pass; this one was missed.
+    """
+    path = Path(DB_PATH)
+    if path.is_absolute():
+        return path
+    base = _data_dir_override if _data_dir_override else (PROJECT_ROOT / "data")
+    return base / path
 
 # Statuses in which the goal is actively worked (turn budget applies).
 ACTIVE_STATUSES = ("brainstorm", "strategy", "executing")
@@ -53,9 +85,7 @@ _CACHE_TTL = 10.0
 def _get_db() -> sqlite3.Connection:
     global _db
     if _db is None:
-        path = Path(DB_PATH)
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
+        path = db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         _db = sqlite3.connect(str(path), check_same_thread=False)
         _db.row_factory = sqlite3.Row
