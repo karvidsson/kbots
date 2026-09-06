@@ -483,25 +483,32 @@ def test_repinning_the_data_dir_drops_the_open_handle(tmp_path, monkeypatch):
         store.set_data_dir(None)
 
 
-def test_split_store_warning_names_any_leftover_not_a_fixed_list(tmp_path, monkeypatch):
-    """The old warning listed two filenames by hand and goals.db slipped past
-    it for three weeks. It must be derived from the directory instead."""
+def test_split_store_warning_names_stores_and_ignores_scratch(tmp_path, monkeypatch):
+    """Two failure modes, one test. The old warning listed two filenames by
+    hand and goals.db slipped past it for three weeks. Matching every file
+    instead named eight on this deployment, six of them runtime scratch, and a
+    warning that fires eight times a boot is one nobody reads on the ninth."""
     from src.core import base
 
     monkeypatch.setattr(base, "PROJECT_ROOT", tmp_path)
     legacy = tmp_path / "data"
     (legacy / "graph").mkdir(parents=True)
-    (legacy / "goals.db").write_bytes(b"x")
-    (legacy / "memory.db").write_bytes(b"x")
-    (legacy / "graph" / "memory.lbdb").write_bytes(b"x")
-    (legacy / "brand-new-store.db").write_bytes(b"x")   # never added to any list
-    (legacy / "goals.db-wal").write_bytes(b"x")         # sidecar, not a store
-    (legacy / "audit.jsonl").write_bytes(b"x")          # a log, not a store
+    for name in ("goals.db", "memory.db", "brand-new-store.db", "old.sqlite"):
+        (legacy / name).write_bytes(b"x")
+    (legacy / "graph" / "memory.lbdb").mkdir()          # LadybugDB is a directory
+    (legacy / "graph" / "memory.lbdb" / "0.seg").write_bytes(b"x")
+    for scratch in ("kbots.lock", "heartbeat", "email_watch.json",
+                    "interrupted_turns.json", "audit.jsonl", "kbots.log",
+                    "goals.db-wal", "goals.db-shm"):
+        (legacy / scratch).write_bytes(b"x")
     (legacy / "empty.db").write_bytes(b"")
+    (legacy / "empty.lbdb").mkdir()
 
     stale = base.warn_on_split_store({"kbots": {"data_dir": str(tmp_path / "overlay")}})
     names = {Path(p).name for p in stale}
-    assert names == {"goals.db", "memory.db", "memory.lbdb", "brand-new-store.db"}
+    # every store, including one in no list anywhere and one that is a folder
+    assert names == {"goals.db", "memory.db", "brand-new-store.db",
+                     "old.sqlite", "memory.lbdb"}
 
     # Same dir on both sides is not a split at all.
     assert base.warn_on_split_store({"kbots": {"data_dir": str(legacy)}}) == []
