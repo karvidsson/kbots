@@ -1119,6 +1119,25 @@ class AgentManager:
         session = self._get_or_create_session(agent_id, channel_id, message.user_id)
         session.message_count += 1
 
+        # Write the turn down. ask_agent runs a full LLM + tool loop here and
+        # hands real work back to the caller, but nothing was ever persisted, so
+        # the answering agent could not later recall, quote or check what it had
+        # said. On 2026-09-06 that cost a teammate a false accusation: an agent
+        # published an architecture review it had obtained over ask_agent, the
+        # reviewer found no trace of having reviewed anything, and told the owner
+        # the endorsement was not its own. The tool_log held that same reviewer's
+        # memory_search for that same plan, one minute into the turn.
+        #
+        # deliver_inter_agent_message's docstring already names this hazard for
+        # the fire-and-forget path. It bites harder here, because an ask is
+        # answered in prose that a human then reads as the agent's position.
+        if self.storage:
+            await self.storage.get_or_create_session(
+                session.id, agent_id, channel_id, message.user_id)
+            await self.storage.save_message(
+                session.id, "user", message.content,
+                name=message.user_name or None)
+
         # Build message context
         system_prompt = self._build_system_prompt(agent_id)
         messages = []
@@ -1188,6 +1207,15 @@ class AgentManager:
 
         if response and response.session_id:
             session.cli_session_id = response.session_id
+            if self.storage:
+                await self.storage.save_cli_session_id(
+                    session.id, response.session_id)
+
+        if self.storage and response and response.content:
+            await self.storage.save_message(
+                session.id, "assistant", response.content,
+                tokens_used=response.tokens_used,
+                model=getattr(response, "model", None))
 
         return response.content if response else None
 

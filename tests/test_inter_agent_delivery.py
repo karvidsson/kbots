@@ -176,3 +176,45 @@ async def test_concurrent_asks_serialize_on_internal_session(tmp_path):
         mgr.handle_internal_message("beta", msg),
     )
     assert active["max"] == 1
+
+
+# --- an ask is written down ---
+
+async def test_ask_persists_both_sides_of_the_turn(tmp_path):
+    """An ask_agent turn runs a full LLM + tool loop and hands real work back
+    to the caller. It used to leave no record at all, so the answering agent
+    could not recall, quote or check what it had said — and on 2026-09-06 that
+    cost a teammate a false accusation, because the reviewer looked for its own
+    review, found nothing, and told the owner the endorsement was not its own.
+    """
+    from src.core.storage import Storage
+
+    mgr, _, _ = _mgr(tmp_path)
+    storage = Storage(db_path=tmp_path / "kbots.db")
+    await storage.init()
+    mgr.storage = storage
+    try:
+        msg = IncomingMessage(
+            connector="internal", channel_id="internal:alpha:beta",
+            user_id="alpha", user_name="agent:alpha",
+            content="review this plan please")
+        answer = await mgr.handle_internal_message("beta", msg)
+        assert answer == "on it"
+
+        # load_history returns newest first
+        rows = await storage.load_history("beta:internal:alpha:beta")
+        assert [(m.role.value, m.content) for m in reversed(rows)] == [
+            ("user", "review this plan please"), ("assistant", "on it")]
+    finally:
+        await storage.close()
+
+
+async def test_ask_without_storage_still_answers(tmp_path):
+    """Persistence is a record, not a dependency: no storage must not break
+    inter-agent asks."""
+    mgr, _, _ = _mgr(tmp_path)
+    assert mgr.storage is None
+    msg = IncomingMessage(
+        connector="internal", channel_id="internal:alpha:beta",
+        user_id="alpha", user_name="agent:alpha", content="ping")
+    assert await mgr.handle_internal_message("beta", msg) == "on it"
