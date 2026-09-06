@@ -215,6 +215,29 @@ def _model_family(model: str) -> str | None:
     return None
 
 
+# Phrases the CLI uses when the problem is the login, not the turn. Kept as
+# stems because the wording drifts between CLI versions: "Failed to
+# authenticate: OAuth session expired and could not be refreshed" was retried
+# four times as a generic error and never reached the auth alert, so the fleet
+# sat dead for twelve hours without anyone being told.
+_AUTH_ERROR_MARKERS = (
+    "401",
+    "authenticat",      # authentication / authenticate / unauthenticated
+    "not logged in",
+    "oauth",
+    "session expired",
+    "token expired",
+    "please run /login",
+    "please log in",
+)
+
+
+def _is_auth_error(text: str) -> bool:
+    """True if a failed CLI run's output says the login itself is broken."""
+    t = (text or "").lower()
+    return any(m in t for m in _AUTH_ERROR_MARKERS)
+
+
 def _extract_reset_hint(text: str) -> str | None:
     """Best-effort: pull the 'resets at ...' clause from a usage-limit message."""
     m = re.search(r"reset[^.\n]{0,60}", text, re.IGNORECASE)
@@ -465,7 +488,7 @@ class ClaudeCodeProvider(LLMProvider):
 
                     error_msg = stderr_text or error_detail or f"Exit code {proc.returncode}"
                     combined = f"{stderr_text} {error_detail}".lower()
-                    is_auth_error = "401" in combined or "authentication" in combined or "not logged in" in combined
+                    is_auth_error = _is_auth_error(combined)
                     is_dead_session = "no conversation found" in combined
                     # Usage cap (subscription/rate quota) — distinct from server
                     # overload ("overloaded"/529), which is a transient retry.
