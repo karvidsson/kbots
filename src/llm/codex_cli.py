@@ -71,6 +71,16 @@ _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
 # and write files all day but cannot talk to another agent.
 _LOOPBACK_ENV = ("KBOTS_INTERNAL_API", "KBOTS_INTERNAL_TOKEN")
 
+# Conversation context the engine hands to complete() per call. Claude Code
+# puts these in the CLI's own env and the MCP stdio child inherits them; codex
+# builds each server's env from the config table alone, so they have to be
+# copied in explicitly. Without KBOTS_USER_ID every identity-gated tool
+# (agent_config, set_hitl, set_schedule_board) sees ToolContext.user_id=None
+# and refuses the owner — indistinguishable, from Discord, from a tier denial.
+# Absent by design for scheduler/trigger/agent-to-agent turns: no sender, no
+# admin rights, which is the fail-closed behaviour those gates expect.
+_CONTEXT_ENV = ("KBOTS_USER_ID",)
+
 
 def _expand_env_refs(value: str, env: dict) -> str:
     """Substitute ${VAR} / ${VAR:-fallback} from env. Unset and empty both
@@ -86,8 +96,8 @@ def mcp_config_args(project_dir: Path, env: dict | None = None) -> list[str]:
     pins one (kbots-tools runs from the engine root), wrap through /bin/sh.
 
     `env` is the environment codex itself will run with: ${VAR} refs resolve
-    against it and the loopback vars are copied out of it, so each server
-    starts with what it needs instead of a bare table.
+    against it and the loopback + conversation-context vars are copied out of
+    it, so each server starts with what it needs instead of a bare table.
     """
     env = env or {}
     mcp_file = Path(project_dir) / ".mcp.json"
@@ -99,7 +109,8 @@ def mcp_config_args(project_dir: Path, env: dict | None = None) -> list[str]:
         logger.warning(f"Unreadable .mcp.json in {project_dir}: {e}")
         return []
 
-    loopback = {k: env[k] for k in _LOOPBACK_ENV if env.get(k)}
+    forwarded = {k: env[k] for k in (*_LOOPBACK_ENV, *_CONTEXT_ENV)
+                 if env.get(k)}
     args: list[str] = []
     for name, spec in servers.items():
         command = spec.get("command")
@@ -118,7 +129,7 @@ def mcp_config_args(project_dir: Path, env: dict | None = None) -> list[str]:
         # literal text and fail as a bad credential rather than a missing one.
         server_env = {k: _expand_env_refs(v, env)
                       for k, v in (spec.get("env") or {}).items()}
-        server_env.update(loopback)
+        server_env.update(forwarded)
         if server_env:
             args.extend(
                 ["-c", f"mcp_servers.{name}.env = {_toml_inline_table(server_env)}"])
@@ -206,6 +217,13 @@ class CodexCLIProvider(LLMProvider):
 
         env = {k: v for k, v in os.environ.items() if k in self._ENV_ALLOWLIST}
         env.update(kwargs.get("extra_env") or {})
+        # Sender identity, as resolved by the engine from the inbound message —
+        # never fabricated here. mcp_config_args copies it into each MCP
+        # server's table (_CONTEXT_ENV); os.environ is never mutated, so
+        # concurrent sessions cannot see each other's user.
+        user_id = kwargs.get("user_id") or ""
+        if user_id:
+            env["KBOTS_USER_ID"] = str(user_id)
 
         # One retry: a stale/unknown session id drops resume and starts fresh.
         for resuming in ([True, False] if session_id else [False]):

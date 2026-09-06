@@ -243,3 +243,40 @@ async def test_run_passes_loopback_env_to_mcp_servers(fake_codex, tmp_path):
         extra_env={"KBOTS_INTERNAL_API": "http://127.0.0.1:9", "KBOTS_INTERNAL_TOKEN": "t"},
     )
     assert 'KBOTS_INTERNAL_TOKEN = "t"' in " ".join(_argv(log)[0])
+
+
+def test_mcp_env_carries_sender_identity(tmp_path):
+    """The MCP server derives ToolContext.user_id from this table, and the
+    admin gate on agent_config/set_hitl reads it. Dropped, the owner's own
+    call is refused."""
+    _write_mcp(tmp_path, {"KBOTS_AGENT_ID": "atlas"})
+    joined = " ".join(mcp_config_args(tmp_path, {"KBOTS_USER_ID": "12345"}))
+    assert 'KBOTS_USER_ID = "12345"' in joined
+
+
+async def test_run_passes_user_id_to_mcp_servers(fake_codex, tmp_path):
+    """End to end: the user_id kwarg the engine passes reaches the server."""
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    _write_mcp(agent_dir, {"KBOTS_AGENT_ID": "atlas"})
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir),
+        user_id="99887766",
+    )
+    assert 'KBOTS_USER_ID = "99887766"' in " ".join(_argv(log)[0])
+
+
+async def test_no_user_id_leaves_identity_unset(fake_codex, tmp_path):
+    """Scheduler/trigger/agent-to-agent turns have no sender. The gate must
+    fail closed rather than inherit whoever ran last."""
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    _write_mcp(agent_dir, {"KBOTS_AGENT_ID": "atlas"})
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir),
+    )
+    assert "KBOTS_USER_ID" not in " ".join(_argv(log)[0])
