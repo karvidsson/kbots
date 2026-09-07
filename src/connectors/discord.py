@@ -1329,6 +1329,13 @@ class DiscordBot:
         if emoji not in ("✅", "❌"):
             return
 
+        # Goal staffing: ✅/❌ on a nomination card adds or skips that agent,
+        # ✅ on a kickoff card starts the goal. Looked up by message id, so it
+        # can only fire on a message the goal store itself posted and never
+        # shadows a HITL card that happens to share the emoji.
+        if await self._handle_goal_reaction(payload, emoji):
+            return
+
         # Check if there's a HITL gate with pending requests for this message
         hitl = getattr(self.connector, '_hitl', None)
         if not hitl:
@@ -1360,6 +1367,66 @@ class DiscordBot:
                     logger.info(f"HITL {hitl_id} denied by {user_id}")
         except Exception as e:
             logger.error(f"HITL reaction handling failed: {e}", exc_info=True)
+
+    async def _handle_goal_reaction(self, payload: discord.RawReactionActionEvent,
+                                    emoji: str) -> bool:
+        """✅/❌ on a goal nomination or kickoff card. True if it was ours.
+
+        Returns True only when the message really is a goal card, so an
+        unrelated ✅ falls through to HITL exactly as before.
+        """
+        from src.core import goals as store
+        try:
+            message_id = str(payload.message_id)
+            nom = store.nomination_by_message(message_id)
+            goal = None if nom else store.goal_by_kickoff_message(message_id)
+            if not nom and not goal:
+                return False
+            # Same bar as HITL and schedule cancel: staffing a goal spends other
+            # agents' turns, so it is an admin's call, not any reader's.
+            if not self._is_admin(payload.user_id):
+                return True
+            channel = (self.client.get_channel(payload.channel_id)
+                       or await self.client.fetch_channel(payload.channel_id))
+            user = f"<@{payload.user_id}>"
+
+            if nom:
+                approved = emoji == "✅"
+                if not store.decide_nomination(nom["goal_id"], nom["agent_id"],
+                                               approved, str(payload.user_id)):
+                    return True  # already decided; a second reaction changes nothing
+                verb = "added to" if approved else "kept off"
+                await channel.send(
+                    f"{emoji} **{nom['agent_id']}** {verb} `{nom['goal_id']}` (by {user}).")
+                logger.info(f"Goal {nom['goal_id']}: {nom['agent_id']} "
+                            f"{'approved' if approved else 'declined'} by {payload.user_id}")
+                return True
+
+            if emoji != "✅":
+                return True  # ❌ on a kickoff card is not an abandon; too blunt
+            pending = store.list_nominations(goal["id"], "pending")
+            team = [p["agent_id"] for p in store.list_participants(goal["id"])
+                    if p["agent_id"] != goal["owner_agent"]]
+            note = (f" {len(pending)} nomination(s) still undecided — they stay "
+                    f"off unless you approve them." if pending else "")
+            await channel.send(
+                f"✅ `{goal['id']}` approved by {user}. Team: "
+                f"{', '.join(team) or 'owner only'}.{note}")
+            # The owner starts it, not this handler: advancing out of 'proposed'
+            # is where an anchored goal acquires its own channel, and that lives
+            # in goal_set. Driving it from here would need a second copy.
+            mgr = getattr(self.connector, "_agent_manager", None)
+            if mgr:
+                await mgr.deliver_inter_agent_message(
+                    goal["owner_agent"], "system",
+                    f"Your goal `{goal['id']}` ({goal['title']}) was approved by "
+                    f"the user. Approved team: {', '.join(team) or 'nobody but you'}. "
+                    f"Start it now: goal_set('{goal['id']}', 'status', 'brainstorm'), "
+                    f"then open the brainstorm in the goal channel.", 1)
+            return True
+        except Exception as e:
+            logger.error(f"goal reaction handling failed: {e}", exc_info=True)
+            return False
 
     async def _handle_schedule_cancel(self, payload: discord.RawReactionActionEvent) -> None:
         """❌ on a schedule card → cancel that schedule. Parses the `sN` id from

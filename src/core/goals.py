@@ -173,6 +173,24 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
             payload  TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_events_goal ON goal_events(goal_id, ts);
+
+        -- A proposed participant: the reason they belong on this goal, and the
+        -- message a human reacts to. Kept apart from goal_participants because
+        -- a DECLINED nomination still has to be remembered. Otherwise the owner
+        -- re-nominates the same agent on the next goal, and the record of who
+        -- was considered and turned down is the half worth keeping.
+        CREATE TABLE IF NOT EXISTS goal_nominations (
+            goal_id    TEXT NOT NULL,
+            agent_id   TEXT NOT NULL,
+            reason     TEXT NOT NULL,
+            status     TEXT NOT NULL DEFAULT 'pending',
+            message_id TEXT NOT NULL DEFAULT '',
+            decided_by TEXT NOT NULL DEFAULT '',
+            decided_at REAL,
+            created_at REAL NOT NULL,
+            PRIMARY KEY (goal_id, agent_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_nom_msg ON goal_nominations(message_id);
     """)
     # `anchored` = the goal is borrowing the proposer's home channel because
     # its proposer's tier could not create one. It is a fact about the channel,
@@ -184,6 +202,13 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
     if "anchored" not in cols:
         db.execute("ALTER TABLE goals ADD COLUMN anchored INTEGER NOT NULL DEFAULT 0")
         db.execute("UPDATE goals SET anchored = 1 WHERE status = 'proposed'")
+    # The owner's proposed approach, written before any work starts, and the
+    # message the human reacts to in order to start it. A goal that predates
+    # this has already started, so an empty plan is correct for those rows.
+    if "plan" not in cols:
+        db.execute("ALTER TABLE goals ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
+    if "kickoff_message_id" not in cols:
+        db.execute("ALTER TABLE goals ADD COLUMN kickoff_message_id TEXT NOT NULL DEFAULT ''")
     db.commit()
 
 
@@ -222,7 +247,7 @@ def log_event(goal_id: str, agent_id: str, kind: str, payload: str = "") -> None
 def create_goal(title: str, description: str, owner_agent: str, channel_id: str,
                 created_by: str, *, connector: str = "discord",
                 turn_budget: int = 30, status: str = "proposed",
-                anchored: bool = False) -> dict:
+                anchored: bool = False, plan: str = "") -> dict:
     db = _get_db()
     base = f"g-{_slugify(title)}"
     goal_id = base
@@ -233,12 +258,12 @@ def create_goal(title: str, description: str, owner_agent: str, channel_id: str,
     now = time.time()
     db.execute(
         """INSERT INTO goals (id, title, description, status, owner_agent, connector,
-           channel_id, created_by, turn_budget, anchored, created_at, updated_at,
-           last_activity_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           channel_id, created_by, turn_budget, anchored, plan, created_at,
+           updated_at, last_activity_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (goal_id, title.strip(), description.strip(), status, owner_agent,
          connector, str(channel_id), created_by, int(turn_budget),
-         int(bool(anchored)), now, now, now))
+         int(bool(anchored)), plan.strip(), now, now, now))
     db.execute(
         "INSERT OR REPLACE INTO goal_participants (goal_id, agent_id, role, joined_at) "
         "VALUES (?,?,?,?)", (goal_id, owner_agent, "owner", now))
@@ -327,7 +352,7 @@ def update_goal(goal_id: str, actor: str, **fields) -> dict:
         raise ValueError(f"unknown goal '{goal_id}'")
     allowed = {"status", "strategy", "title", "description", "turn_budget",
                "owner_agent", "pause_reason", "wake_condition", "wake_ref",
-               "blocked_brief", "card_message_id"}
+               "blocked_brief", "card_message_id", "plan", "kickoff_message_id"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"cannot set field(s): {', '.join(sorted(unknown))}")
@@ -366,6 +391,88 @@ def list_participants(goal_id: str) -> list[dict]:
         "SELECT * FROM goal_participants WHERE goal_id=? ORDER BY joined_at",
         (goal_id,)).fetchall()
     return [dict(r) for r in rows]
+
+
+# --- nominations ---
+#
+# A nominated agent is NOT a participant. Nothing routes it into the goal
+# channel and nothing spends its turns until a human reacts ✅. That gap is the
+# whole point: an agent added by another agent's judgement alone is an agent
+# whose time was spent without anyone deciding it was worth spending.
+
+def add_nomination(goal_id: str, agent_id: str, reason: str) -> dict:
+    db = _get_db()
+    db.execute(
+        "INSERT INTO goal_nominations (goal_id, agent_id, reason, created_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(goal_id, agent_id) DO UPDATE SET "
+        "reason=excluded.reason, status='pending', decided_by='', decided_at=NULL",
+        (goal_id, agent_id, reason, time.time()))
+    db.commit()
+    log_event(goal_id, agent_id, "nominated", reason[:200])
+    return get_nomination(goal_id, agent_id)
+
+
+def get_nomination(goal_id: str, agent_id: str) -> dict | None:
+    row = _get_db().execute(
+        "SELECT * FROM goal_nominations WHERE goal_id=? AND agent_id=?",
+        (goal_id, agent_id)).fetchone()
+    return dict(row) if row else None
+
+
+def list_nominations(goal_id: str, status: str = "") -> list[dict]:
+    sql = "SELECT * FROM goal_nominations WHERE goal_id=?"
+    params: list = [goal_id]
+    if status:
+        sql += " AND status=?"
+        params.append(status)
+    rows = _get_db().execute(sql + " ORDER BY created_at", params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def set_nomination_message(goal_id: str, agent_id: str, message_id: str) -> None:
+    db = _get_db()
+    db.execute("UPDATE goal_nominations SET message_id=? WHERE goal_id=? AND agent_id=?",
+               (message_id, goal_id, agent_id))
+    db.commit()
+
+
+def nomination_by_message(message_id: str) -> dict | None:
+    """The pending nomination a reaction landed on, if any."""
+    row = _get_db().execute(
+        "SELECT * FROM goal_nominations WHERE message_id=? AND status='pending'",
+        (message_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def decide_nomination(goal_id: str, agent_id: str, approved: bool,
+                      decided_by: str) -> dict | None:
+    """Resolve one nomination. Approval is what actually adds the participant,
+    so there is exactly one path from 'someone suggested this agent' to 'this
+    agent is now spending turns on it'."""
+    nom = get_nomination(goal_id, agent_id)
+    if not nom or nom["status"] != "pending":
+        return None
+    db = _get_db()
+    db.execute(
+        "UPDATE goal_nominations SET status=?, decided_by=?, decided_at=? "
+        "WHERE goal_id=? AND agent_id=?",
+        ("approved" if approved else "declined", decided_by, time.time(),
+         goal_id, agent_id))
+    db.commit()
+    if approved:
+        add_participant(goal_id, agent_id)
+    else:
+        log_event(goal_id, agent_id, "nomination_declined", decided_by)
+    return get_nomination(goal_id, agent_id)
+
+
+def goal_by_kickoff_message(message_id: str) -> dict | None:
+    """The goal whose kickoff card a reaction landed on, if it is still
+    awaiting approval. Only a 'proposed' goal can be started this way."""
+    row = _get_db().execute(
+        "SELECT * FROM goals WHERE kickoff_message_id=? AND status='proposed'",
+        (message_id,)).fetchone()
+    return dict(row) if row else None
 
 
 # --- tasks ---
@@ -561,7 +668,7 @@ def build_goal_context(agent_id: str, channel_id: str) -> str | None:
     part_ids = {p["agent_id"] for p in participants}
     you = ("owner" if goal["owner_agent"] == agent_id
            else "member" if agent_id in part_ids
-           else "not a participant (join with goal_join)")
+           else "not a participant (ask to join with goal_add_member)")
 
     domains = _team_domains()
     plist = ", ".join(

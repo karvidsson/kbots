@@ -225,6 +225,10 @@ goals:
   escalation_user: ""        # Discord user id mentioned when a goal blocks;
                              # default: first access=owner human in team.json
   alert_on_block: true       # also post blocked goals to security.alert_channel
+  max_participants: 4        # most agents one goal may nominate. Above this,
+                             # goal_create refuses rather than trimming: which
+                             # agent to drop is the owner's call to make, and
+                             # to be seen making
 
 # Loopback API for inter-agent calls (ask_agent / send_to_agent) from tool
 # subprocesses. Zero-config: binds 127.0.0.1 on an ephemeral port with a

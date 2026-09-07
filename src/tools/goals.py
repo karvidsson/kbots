@@ -6,6 +6,14 @@ store — no config edits, no restart. Tool result strings double as the
 visible protocol messages: post them (or a tight summary) in the goal
 channel so the team and the humans can follow along.
 
+Staffing protocol: a goal starts with nobody on it but its owner. The owner
+reads the roster, NOMINATES the few agents whose work the goal actually needs
+and says why for each, then posts a plan. Each nomination is its own message
+carrying ✅/❌, and the goal's kickoff card carries ✅. Nothing is routed and no
+turns are spent until a human reacts. The reason field is mandatory and the
+count is capped, because the failure mode here is not too few participants: it
+is a goal that quietly books five agents' attention on one agent's hunch.
+
 Pause protocol: any participant proposes (goal_propose), others support or
 object with reasons (goal_vote), the owner closes the decision
 (goal_decide) after the objection window. An adopted pause materializes
@@ -16,6 +24,7 @@ short "need to know / need from you" list and the goal waits.
 
 import json
 import logging
+import re
 import time
 from datetime import datetime
 
@@ -36,7 +45,13 @@ _DEFAULTS = {
     "objection_window_hours": 24,
     "escalation_user": "",
     "alert_on_block": True,
+    # Less is more. Above this, goal_create refuses rather than trimming for
+    # you: which agent to drop is the owner's call, and a silent trim would
+    # hide that a decision was made.
+    "max_participants": 4,
 }
+
+APPROVE, DECLINE = "✅", "❌"
 
 
 def _cfg() -> dict:
@@ -116,6 +131,87 @@ async def _post_to_channel(ctx: ToolContext, channel_id: str, content: str) -> s
     return str(result.get("id", ""))
 
 
+def parse_nominations(spec: str) -> tuple[list[tuple[str, str]], list[str]]:
+    """Parse "agent: why; agent: why" into pairs. Returns (pairs, problems).
+
+    A bare agent id with no reason is a problem, not a default. Requiring the
+    reason in the parser is what makes "every participant must justify their
+    seat" a property of the feature rather than a habit the owner may drop.
+    """
+    pairs: list[tuple[str, str]] = []
+    problems: list[str] = []
+    seen: set[str] = set()
+    for chunk in re.split(r"[;\n]+", spec or ""):
+        chunk = chunk.strip().lstrip("-•* ").strip()
+        if not chunk:
+            continue
+        agent, sep, reason = chunk.partition(":")
+        agent = agent.strip().lstrip("@")
+        reason = reason.strip()
+        if not sep or not reason:
+            problems.append(f"'{agent or chunk}' has no reason — use "
+                            f"'{agent or 'agent'}: why they are needed'")
+            continue
+        if agent in seen:
+            problems.append(f"'{agent}' nominated twice")
+            continue
+        seen.add(agent)
+        pairs.append((agent, reason))
+    return pairs, problems
+
+
+def _known_agents() -> set[str]:
+    """Agent ids on the roster. Empty set means 'could not read it', and the
+    caller then skips the membership check rather than refusing everything."""
+    try:
+        from src.tools.team import _load_team
+        return {a["id"] for a in (_load_team() or {}).get("agents", [])
+                if a.get("id")}
+    except Exception as e:
+        logger.debug(f"roster read failed, skipping membership check: {e}")
+        return set()
+
+
+def _nomination_text(goal: dict, agent_id: str, reason: str) -> str:
+    return (f"👤 **{agent_id}** for goal `{goal['id']}`\n"
+            f"> {reason[:400]}\n"
+            f"{APPROVE} add them · {DECLINE} skip them")
+
+
+def _kickoff_text(goal: dict, noms: list[tuple[str, str]]) -> str:
+    team = "\n".join(f"· **{a}** — {r[:160]}" for a, r in noms) or "· nobody yet"
+    parts = [
+        f"🎯 **GOAL: {goal['title']}** (`{goal['id']}`) — awaiting your approval",
+        goal["description"][:500],
+    ]
+    if goal.get("plan"):
+        parts.append(f"**Plan:** {goal['plan'][:800]}")
+    if goal.get("strategy"):
+        parts.append(f"**Strategy:** {goal['strategy'][:300]}")
+    parts += [
+        f"**Proposed team** (owner: {goal['owner_agent']}):\n{team}",
+        f"React {APPROVE} on each agent above to add them, then {APPROVE} here "
+        f"to start. Nothing runs and nobody is routed until you do.",
+    ]
+    return "\n\n".join(p for p in parts if p)
+
+
+async def _add_reactions(ctx: ToolContext, channel_id: str, message_id: str,
+                         emojis: tuple[str, ...]) -> None:
+    """Pre-seed the reactions so the human clicks rather than types. Cosmetic:
+    a failure here still leaves a message someone can react to by hand."""
+    if not ctx.vault or not message_id:
+        return
+    from urllib.parse import quote
+
+    from src.tools.discord_tools import _discord_put
+    for emoji in emojis:
+        await _discord_put(
+            ctx.vault,
+            f"/channels/{channel_id}/messages/{message_id}/reactions/"
+            f"{quote(emoji)}/@me")
+
+
 async def _update_card(ctx: ToolContext, goal: dict) -> None:
     """Best-effort edit of the goal's kickoff card so status stays visible."""
     if not goal.get("card_message_id") or not ctx.vault:
@@ -136,6 +232,11 @@ def _card_text(goal: dict) -> str:
         f"{p['agent_id']}{' (owner)' if p['role'] == 'owner' else ''}"
         for p in store.list_participants(goal["id"]))
     parts.append(f"**Team:** {participants}")
+    # Undecided nominations are the difference between the team that exists and
+    # the team the owner asked for, so they belong on the card, not in a log.
+    pending = [n["agent_id"] for n in store.list_nominations(goal["id"], "pending")]
+    if pending:
+        parts.append(f"**Awaiting your {APPROVE}:** {', '.join(pending)}")
     if goal["status"] == "paused" and goal["pause_reason"]:
         parts.append(f"⏸ {goal['pause_reason'][:200]}")
     return "\n".join(p for p in parts if p)
@@ -201,23 +302,56 @@ def _clear_wake(goal: dict) -> None:
 @tool(
     name="goal_create",
     description=(
-        "Create a team goal with its own Discord channel where the named agents "
-        "collaborate on it. You become the owner (facilitator): you advance "
-        "phases (brainstorm → strategy → executing), assign tasks, and close "
-        "decisions. participants is a comma-separated list of agent ids. If "
-        "your tier can't create goals it is parked as 'proposed' in the current "
-        "channel, and gets its own channel when a coordinator or human advances "
-        "it."
+        "Propose a team goal for the user to approve. You become the owner "
+        "(facilitator): you advance phases (brainstorm → strategy → executing), "
+        "assign tasks, and close decisions.\n"
+        "BEFORE calling this, read the roster with team_list and pick the FEWEST "
+        "agents whose own work the goal actually needs. participants is "
+        "'agent: why they are needed; agent: why', and the reason is required "
+        "for each — a bare agent id is refused. Nominating an agent because it "
+        "might have an opinion is how a goal books five agents' attention and "
+        "returns one agent's worth of work; if you cannot name what only that "
+        "agent can do, leave it out.\n"
+        "plan is your proposed approach in a few lines: what you will do first, "
+        "and what done looks like.\n"
+        "Nothing starts on your say-so. Each nominee gets its own message with "
+        "✅/❌ and the goal gets a kickoff card with ✅; the goal stays 'proposed', "
+        "nobody is routed and no turns are spent until the user reacts."
     ),
     category="goals",
 )
 async def goal_create(ctx: ToolContext, title: str, description: str,
-                      participants: str = "", turn_budget: int = 0) -> str:
+                      participants: str = "", plan: str = "",
+                      turn_budget: int = 0) -> str:
+    """Propose a goal, nominate its team, and wait for the user's reactions.
+
+    participants: "agent: why they are needed; agent: why". Reason required.
+    plan: the approach you propose, summarised for the user to approve.
+    """
     cfg = _cfg()
     if not cfg.get("enabled", True):
         return "ERROR: goals are disabled in config."
     if not title.strip():
         return "ERROR: give the goal a title."
+
+    noms, problems = parse_nominations(participants)
+    if problems:
+        return ("ERROR: every participant needs a reason.\n- "
+                + "\n- ".join(problems)
+                + "\nFormat: participants=\"redline: owns the game repo; "
+                  "rainmaker: owns pricing\"")
+    noms = [(a, r) for a, r in noms if a != ctx.agent_id]
+    cap = int(cfg.get("max_participants", 4))
+    if len(noms) > cap:
+        return (f"ERROR: {len(noms)} participants nominated, limit is {cap}. "
+                f"Drop the ones whose contribution you cannot name, and say in "
+                f"the plan who you would add later if the goal needs them.")
+    known = _known_agents()
+    unknown = [a for a, _ in noms if known and a not in known]
+    if unknown:
+        return (f"ERROR: not on the roster: {', '.join(unknown)}. "
+                f"Call team_list and use the exact agent ids.")
+
     tier = _agent_tier(ctx.agent_id)
     may_create = tier in (cfg.get("create_tiers") or [])
 
@@ -234,30 +368,57 @@ async def goal_create(ctx: ToolContext, title: str, description: str,
         title, description, ctx.agent_id, channel_id,
         ctx.user_id or ctx.agent_id,
         turn_budget=int(turn_budget) or int(cfg["default_turn_budget"]),
-        anchored=anchored_here)
-    for pid in [p.strip() for p in participants.split(",") if p.strip()]:
-        if pid != ctx.agent_id:
-            store.add_participant(goal["id"], pid)
-    if may_create:
-        goal = store.update_goal(goal["id"], ctx.agent_id, status="brainstorm")
+        anchored=anchored_here, plan=plan)
 
-    card_id = await _post_to_channel(ctx, channel_id, _card_text(goal))
-    if card_id:
-        goal = store.update_goal(goal["id"], ctx.agent_id, card_message_id=card_id)
+    # The kickoff card first, so the user reads the plan before deciding who
+    # is on it. Then one message per nominee — a reaction belongs to a
+    # message, so per-agent approval means per-agent message.
+    kickoff_id = await _post_to_channel(ctx, channel_id, _kickoff_text(goal, noms))
+    if kickoff_id:
+        goal = store.update_goal(goal["id"], ctx.agent_id,
+                                 kickoff_message_id=kickoff_id,
+                                 card_message_id=kickoff_id)
+        await _add_reactions(ctx, channel_id, kickoff_id, (APPROVE,))
 
-    lines = [f"🎯 Goal `{goal['id']}` created: **{goal['title']}** — status "
-             f"{goal['status']}, turn budget {goal['turn_budget']}."]
+    posted: list[str] = []
+    unposted: list[str] = []
+    for agent_id, reason in noms:
+        store.add_nomination(goal["id"], agent_id, reason)
+        msg_id = await _post_to_channel(
+            ctx, channel_id, _nomination_text(goal, agent_id, reason))
+        if msg_id:
+            store.set_nomination_message(goal["id"], agent_id, msg_id)
+            await _add_reactions(ctx, channel_id, msg_id, (APPROVE, DECLINE))
+            posted.append(agent_id)
+        else:
+            unposted.append(agent_id)
+
+    lines = [f"🎯 Goal `{goal['id']}` proposed: **{goal['title']}** — "
+             f"awaiting approval, turn budget {goal['turn_budget']}."]
     if anchored_here:
         lines.append(f"Anchored to THIS channel ({chan_note})."
                      if chan_note else "Anchored to this channel.")
     else:
-        lines.append(f"Channel: <#{channel_id}> — collaboration happens there.")
+        lines.append(f"Channel: <#{channel_id}>.")
+    # Name them, do not count them. A count matches whatever the caller sent,
+    # so a malformed participants string reads as success while agents quietly
+    # go missing and their tasks sit unassigned. Echoing the ids back is what
+    # makes the caller notice it parsed something other than what it meant.
+    if posted:
+        lines.append(f"Nominated, awaiting your {APPROVE}: "
+                     f"{', '.join(posted)} ({len(posted)}).")
+    if unposted:
+        lines.append(f"NOT nominated — the card could not be posted for "
+                     f"{', '.join(unposted)}. They cannot be approved by "
+                     f"reaction; name them to the user.")
+    if not noms:
+        lines.append("No participants nominated — you would work this alone. "
+                     "If you meant to name some, check the participants string.")
+    lines.append(f"The goal stays 'proposed' until the user reacts {APPROVE} on "
+                 f"the kickoff card. Do not start work before that.")
     if not may_create:
-        lines.append(f"Your tier ({tier}) can only PROPOSE goals — a coordinator "
-                     f"or human must advance it with goal_set status=brainstorm.")
-    else:
-        lines.append("Kick off brainstorming in the goal channel; when a "
-                     "direction emerges, record it with goal_set strategy=... .")
+        lines.append(f"Your tier ({tier}) cannot create channels, so this is "
+                     f"anchored here and gets its own channel when it starts.")
     return "\n".join(lines)
 
 
@@ -305,9 +466,9 @@ async def goal_status(ctx: ToolContext, goal_id: str = "") -> str:
     description=(
         "Owner-only setter for a goal. field is one of: status (proposed/"
         "brainstorm/strategy/executing/paused/blocked_on_user/done/abandoned — "
-        "transitions are validated), strategy, title, description, turn_budget, "
-        "owner_agent. Coordinator-tier agents and humans may also advance a "
-        "'proposed' goal."
+        "transitions are validated), strategy, plan, title, description, "
+        "turn_budget, owner_agent. Coordinator-tier agents and humans may also "
+        "advance a 'proposed' goal."
     ),
     category="goals",
 )
@@ -317,9 +478,10 @@ async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> st
     if not goal:
         return f"ERROR: unknown goal '{goal_id}'."
     field = field.strip()
-    if field not in ("status", "strategy", "title", "description",
+    if field not in ("status", "strategy", "plan", "title", "description",
                      "turn_budget", "owner_agent"):
-        return "ERROR: field must be one of: status, strategy, title, description, turn_budget, owner_agent."
+        return ("ERROR: field must be one of: status, strategy, plan, title, "
+                "description, turn_budget, owner_agent.")
     if not _is_owner_or_coordinator(goal, ctx.agent_id):
         return (f"ERROR: only the owner ({goal['owner_agent']}) or a "
                 f"coordinator-tier agent can change this goal.")
@@ -366,18 +528,54 @@ async def _acquire_channel(ctx: ToolContext, goal: dict, cfg: dict) -> tuple[dic
 
 
 @tool(
-    name="goal_join",
-    description="Join a goal as a member — you'll hear and speak in its channel.",
+    name="goal_add_member",
+    description=(
+        "Add an agent to a goal already under way. Leave agent_id empty to ask "
+        "for yourself. reason is required and is what the user reads: name what "
+        "this agent will DO on the goal that nobody already on it can, in one "
+        "line. 'Might have useful context' is not a reason.\n"
+        "Requires human approval — the request goes to the approvals channel "
+        "with your reason and waits. A goal that grows by one agent's say-so is "
+        "how three participants become seven and the turn budget goes to "
+        "commentary, so this stays a decision a human makes."
+    ),
     category="goals",
+    hitl=True,
 )
-async def goal_join(ctx: ToolContext, goal_id: str) -> str:
+async def goal_add_member(ctx: ToolContext, goal_id: str, reason: str,
+                          agent_id: str = "") -> str:
+    """Add an agent to a live goal, with human approval.
+
+    goal_id: the goal to staff.
+    reason: what this agent will do that nobody on the goal already can.
+    agent_id: who to add. Empty means you.
+    """
     goal = store.get_goal(goal_id.strip())
     if not goal:
         return f"ERROR: unknown goal '{goal_id}'."
-    store.add_participant(goal["id"], ctx.agent_id)
+    if not reason.strip():
+        return ("ERROR: reason is required — say what this agent will do on the "
+                "goal that nobody already on it can.")
+    target = (agent_id or ctx.agent_id).strip().lstrip("@")
+    known = _known_agents()
+    if known and target not in known:
+        return f"ERROR: '{target}' is not on the roster. Call team_list."
+    if target in [p["agent_id"] for p in store.list_participants(goal["id"])]:
+        return f"`{target}` is already on `{goal['id']}` — nothing to do."
+
+    # Reaching here means the HITL gate already approved: the tool body does not
+    # run otherwise. So the add and the record of why happen together.
+    store.add_nomination(goal["id"], target, reason.strip())
+    store.decide_nomination(goal["id"], target, True,
+                            ctx.user_id or "approver")
     await _update_card(ctx, goal)
-    return (f"✅ Joined `{goal['id']}` — you are now routed into "
-            f"<#{goal['channel_id']}> and will hear every message there.")
+    await _post_to_channel(
+        ctx, goal["channel_id"],
+        f"👤 **{target}** added to `{goal['id']}` (asked by {ctx.agent_id}).\n"
+        f"> {reason.strip()[:400]}")
+    who = "You are" if target == ctx.agent_id else f"`{target}` is"
+    return (f"✅ {who} now on `{goal['id']}` and routed into "
+            f"<#{goal['channel_id']}>, hearing every message there.")
 
 
 @tool(
