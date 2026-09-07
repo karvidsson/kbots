@@ -120,12 +120,19 @@ async def _create_goal_channel(ctx: ToolContext, title: str, cfg: dict) -> tuple
 
 
 async def _post_to_channel(ctx: ToolContext, channel_id: str, content: str) -> str:
-    """Post a message via the Discord REST API. Returns the message id ('' on failure)."""
+    """Post a goal system notice via the Discord REST API.
+
+    Marked as the feature's own post, so participants of the goal do not each
+    spend a turn on a confirmation none of them can act on. Returns the
+    message id ('' on failure).
+    """
     if not ctx.vault or not channel_id:
         return ""
+    from src.core.goal_notice import mark
     from src.tools.discord_tools import _discord_post
     result = await _discord_post(
-        ctx.vault, f"/channels/{channel_id}/messages", {"content": content[:1900]})
+        ctx.vault, f"/channels/{channel_id}/messages",
+        {"content": mark(content)[:1900]})
     if not result or result.get("error"):
         return ""
     return str(result.get("id", ""))

@@ -1232,6 +1232,15 @@ class DiscordBot:
             if not (is_mentioned or is_watched):
                 return
 
+            # The goals feature's own confirmations are posted into the room
+            # the participants are watching, so without this each one woke
+            # every participant and spent a turn on a message none of them
+            # could act on. The marker travels on the message, so this needs
+            # no shared state and cannot lose a race against the gateway.
+            from src.core.goal_notice import is_system_notice
+            if is_system_notice(message.content):
+                return
+
             # Chain breaker — too many bot-triggered turns with no human around.
             if self._bot_chain_check(message.channel.id, from_bot=True, now=now):
                 return
@@ -1382,6 +1391,28 @@ class DiscordBot:
         except Exception as e:
             logger.error(f"HITL reaction handling failed: {e}", exc_info=True)
 
+    def _owns_goal_reaction(self, payload: discord.RawReactionActionEvent,
+                            owner_agent: str) -> bool:
+        """Whether THIS client should act on a reaction every client can see.
+
+        The card's author is the right actor: it is a bot that is demonstrably
+        in the channel, and Discord tells us who it is. `message_author_id` is
+        optional in the gateway payload, though, so when it is missing the
+        clients elect the goal owner's bot instead of racing. Electing beats
+        racing even when the elected bot turns out not to be in the channel:
+        a missing confirmation is visible, a confirmation under the wrong
+        agent's name is misinformation.
+        """
+        me = getattr(self.client.user, "id", None)
+        author_id = getattr(payload, "message_author_id", None)
+        if author_id is not None:
+            return me is not None and author_id == me
+        account = self.connector._find_bot_for_agent(owner_agent)
+        if not account:
+            logger.debug(f"goal reaction: no bot account for owner '{owner_agent}'")
+            return False
+        return account == self.account_name
+
     async def _handle_goal_reaction(self, payload: discord.RawReactionActionEvent,
                                     emoji: str) -> bool:
         """✅/❌ on a goal nomination or kickoff card. True if it was ours.
@@ -1389,6 +1420,7 @@ class DiscordBot:
         Returns True only when the message really is a goal card, so an
         unrelated ✅ falls through to HITL exactly as before.
         """
+        from src.core import goal_notice
         from src.core import goals as store
         try:
             message_id = str(payload.message_id)
@@ -1400,6 +1432,13 @@ class DiscordBot:
             # agents' turns, so it is an admin's call, not any reader's.
             if not self._is_admin(payload.user_id):
                 return True
+            # Every gateway client sees this reaction. Exactly one must act, or
+            # the confirmation goes out under whichever bot won the race to
+            # decide_nomination, which is how a nomination for one agent came
+            # back announced by an unrelated one.
+            owner = (goal or store.get_goal(nom["goal_id"]) or {}).get("owner_agent", "")
+            if not self._owns_goal_reaction(payload, owner):
+                return True  # a goal card, handled by another client
             channel = (self.client.get_channel(payload.channel_id)
                        or await self.client.fetch_channel(payload.channel_id))
             user = f"<@{payload.user_id}>"
@@ -1410,8 +1449,8 @@ class DiscordBot:
                                                approved, str(payload.user_id)):
                     return True  # already decided; a second reaction changes nothing
                 verb = "added to" if approved else "kept off"
-                await channel.send(
-                    f"{emoji} **{nom['agent_id']}** {verb} `{nom['goal_id']}` (by {user}).")
+                await channel.send(goal_notice.mark(
+                    f"{emoji} **{nom['agent_id']}** {verb} `{nom['goal_id']}` (by {user})."))
                 logger.info(f"Goal {nom['goal_id']}: {nom['agent_id']} "
                             f"{'approved' if approved else 'declined'} by {payload.user_id}")
                 return True
@@ -1423,9 +1462,9 @@ class DiscordBot:
                     if p["agent_id"] != goal["owner_agent"]]
             note = (f" {len(pending)} nomination(s) still undecided — they stay "
                     f"off unless you approve them." if pending else "")
-            await channel.send(
+            await channel.send(goal_notice.mark(
                 f"✅ `{goal['id']}` approved by {user}. Team: "
-                f"{', '.join(team) or 'owner only'}.{note}")
+                f"{', '.join(team) or 'owner only'}.{note}"))
             # The owner starts it, not this handler: advancing out of 'proposed'
             # is where an anchored goal acquires its own channel, and that lives
             # in goal_set. Driving it from here would need a second copy.
