@@ -1318,18 +1318,39 @@ class AgentManager:
         return None
 
     async def _latest_session_channel(self, agent_id: str) -> str | None:
-        """The agent's most recently active non-internal channel, if any."""
-        latest: Session | None = None
-        for session in self.sessions.values():
-            if (session.agent_id == agent_id
-                    and not session.channel_id.startswith("internal:")
-                    and (latest is None or session.last_active > latest.last_active)):
-                latest = session
-        if latest:
-            return latest.channel_id
+        """The agent's most recently active eligible non-internal channel.
+
+        "Most recent" is a trailing indicator of where an agent last spoke, so
+        a retired goal's room is the freshest thing on record for exactly the
+        agents who worked hardest in it. Twice now a later message to one of
+        them has landed in a dead room: once in a migration channel, once in an
+        abandoned goal's. Skip channels owned by a goal that is no longer
+        routed and take the next one instead.
+        """
+        live: list[Session] = sorted(
+            (s for s in self.sessions.values()
+             if s.agent_id == agent_id and not s.channel_id.startswith("internal:")),
+            key=lambda s: s.last_active, reverse=True)
+        candidates = [s.channel_id for s in live]
         if self.storage:
-            return await self.storage.latest_channel_for_agent(agent_id)
+            for channel in await self.storage.latest_channels_for_agent(agent_id):
+                if channel not in candidates:
+                    candidates.append(channel)
+        for channel in candidates:
+            if not self._is_retired_goal_channel(channel):
+                return channel
         return None
+
+    @staticmethod
+    def _is_retired_goal_channel(channel_id: str) -> bool:
+        """Best effort: a goals store that cannot be read must not block
+        delivery, so an error here means 'not retired' rather than no route."""
+        try:
+            from src.core import goals as goal_store
+            return goal_store.is_retired_goal_channel(channel_id)
+        except Exception as e:
+            logger.debug(f"goal-channel check failed for {channel_id}: {e}")
+            return False
 
     @staticmethod
     def _log_inter_agent_error(task: asyncio.Task, from_agent: str, target: str) -> None:

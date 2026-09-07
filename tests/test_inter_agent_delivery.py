@@ -178,6 +178,55 @@ async def test_concurrent_asks_serialize_on_internal_session(tmp_path):
     assert active["max"] == 1
 
 
+# --- a retired goal's room is not a home channel ---
+
+async def test_home_channel_skips_a_retired_goal_room(tmp_path, monkeypatch):
+    """"Most recently active" is a trailing indicator, so an abandoned goal's
+    room is the freshest thing on record for exactly the agents who worked
+    hardest in it. Twice a later message to one of them landed in a dead room.
+    """
+    from src.core import goals as store
+
+    monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "goals.db"))
+    monkeypatch.setattr(store, "_db", None)
+    store._cache.clear()
+    try:
+        goal = store.create_goal("Launch", "d", "beta", "goal-chan", "u")
+        store.update_goal(goal["id"], "beta", status="brainstorm")
+
+        mgr, _, _ = _mgr(tmp_path)  # wildcard routing, no home_channel
+        mgr._get_or_create_session("beta", "old-home", "user1")
+        mgr._get_or_create_session("beta", "goal-chan", "user1")  # newest
+
+        # while the goal is live its room IS where the agent lives
+        assert await mgr._resolve_home_channel("beta") == ("stub", "goal-chan", "beta-bot")
+
+        store.update_goal(goal["id"], "beta", status="abandoned")
+        store._cache.clear()
+        assert await mgr._resolve_home_channel("beta") == ("stub", "old-home", "beta-bot")
+    finally:
+        if store._db is not None:
+            store._db.close()
+        store._db = None
+        store._cache.clear()
+
+
+async def test_home_channel_ignores_goals_for_ordinary_channels(tmp_path, monkeypatch):
+    """A channel no goal has ever owned must not be touched by this check."""
+    from src.core import goals as store
+
+    monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "goals.db"))
+    monkeypatch.setattr(store, "_db", None)
+    store._cache.clear()
+    try:
+        mgr, _, _ = _mgr(tmp_path)
+        mgr._get_or_create_session("beta", "555", "user1")
+        assert await mgr._resolve_home_channel("beta") == ("stub", "555", "beta-bot")
+    finally:
+        if store._db is not None:
+            store._db.close()
+        store._db = None
+        store._cache.clear()
 # --- an ask is written down ---
 
 async def test_ask_persists_both_sides_of_the_turn(tmp_path):

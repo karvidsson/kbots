@@ -165,19 +165,24 @@ class Storage:
         )
         await self._db.commit()
 
-    async def latest_channel_for_agent(self, agent_id: str) -> str | None:
-        """The agent's most recently active real (non-internal) channel.
+    async def latest_channels_for_agent(
+        self, agent_id: str, limit: int = 10,
+    ) -> list[str]:
+        """The agent's recent real (non-internal) channels, newest first.
 
         Used to resolve a wildcard-routed agent's home channel for visible
-        inter-agent delivery.
+        inter-agent delivery. A list rather than one row because the newest
+        channel is not always eligible: a retired goal's room is the freshest
+        thing on record for whoever worked hardest in it, and the caller has
+        to be able to skip it and take the next.
         """
         async with self._db.execute(
             "SELECT channel_id FROM sessions WHERE agent_id = ? "
             "AND channel_id IS NOT NULL AND channel_id NOT LIKE 'internal:%' "
-            "ORDER BY last_active DESC LIMIT 1", (agent_id,)
+            "ORDER BY last_active DESC LIMIT ?", (agent_id, int(limit))
         ) as cursor:
-            row = await cursor.fetchone()
-        return row[0] if row and row[0] else None
+            rows = await cursor.fetchall()
+        return [r[0] for r in rows if r and r[0]]
 
     async def prune_stale_sessions(self, max_age_days: int = 30) -> int:
         """Delete sessions (and their messages/tool logs) older than max_age_days.
