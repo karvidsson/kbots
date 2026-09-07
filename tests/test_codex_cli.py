@@ -280,3 +280,96 @@ async def test_no_user_id_leaves_identity_unset(fake_codex, tmp_path):
         project_dir=str(agent_dir),
     )
     assert "KBOTS_USER_ID" not in " ".join(_argv(log)[0])
+
+
+# --- deadlines: same two questions as claude_code, same defaults ---
+
+SLOW_CODEX = """#!/usr/bin/env python3
+import json, os, sys, time
+here = os.path.dirname(os.path.abspath(sys.argv[0]))
+if os.path.exists(os.path.join(here, "SILENT")):
+    time.sleep(3)                       # never emits an event
+else:
+    print(json.dumps({"type": "thread.started", "thread_id": "t-1"}), flush=True)
+    time.sleep(float(open(os.path.join(here, "DELAY")).read())
+               if os.path.exists(os.path.join(here, "DELAY")) else 0)
+    print(json.dumps({"type": "item.completed",
+                      "item": {"type": "agent_message", "text": "done"}}))
+"""
+
+
+@pytest.fixture
+def slow_codex(tmp_path):
+    bin_path = tmp_path / "slow-codex"
+    bin_path.write_text(SLOW_CODEX)
+    bin_path.chmod(bin_path.stat().st_mode | stat.S_IEXEC)
+    return bin_path
+
+
+def test_turn_timeout_defaults_to_an_hour_not_ten_minutes():
+    """600s was a whole-turn cap here. A long turn was killed and reported as
+    a timeout with no partial output, which is what claude_code fixed by
+    splitting liveness from work."""
+    p = CodexCLIProvider({})
+    assert p._timeout == 3600
+    assert p._startup_timeout == 600
+    assert CodexCLIProvider({"timeout": 90})._timeout == 90
+
+
+async def test_per_call_timeout_wins(slow_codex, tmp_path):
+    """The reflector asks for a cheap 180s. That kwarg was ignored on codex."""
+    (tmp_path / "DELAY").write_text("5")
+    with pytest.raises(RuntimeError, match="timed out after 1s"):
+        await _provider(slow_codex, timeout=3600).complete(
+            [Message(role=MessageRole.USER, content="hi")],
+            project_dir=str(tmp_path / "agent"), timeout=1)
+
+
+async def test_a_long_fresh_turn_is_not_killed_by_the_startup_deadline(
+        slow_codex, tmp_path):
+    """A fresh session gets no liveness deadline: nothing about it can fail by
+    never coming up, so a slow turn must simply be allowed to be slow."""
+    (tmp_path / "DELAY").write_text("2")
+    resp = await _provider(slow_codex, resume_startup_timeout=1).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(tmp_path / "agent"))
+    assert resp.content == "done"
+
+
+async def test_a_resume_that_never_starts_falls_back_to_fresh(
+        slow_codex, tmp_path):
+    """Only a resume can fail by never coming up, and the answer is to drop
+    the resume rather than to fail the turn."""
+    (tmp_path / "SILENT").write_text("")
+    provider = _provider(slow_codex, resume_startup_timeout=1)
+    with pytest.raises(RuntimeError, match="codex exec failed"):
+        # both attempts are silent here, so it exhausts the retry — the point
+        # is that it RETRIED rather than raising a timeout after an hour
+        await provider.complete(
+            [Message(role=MessageRole.USER, content="hi")],
+            project_dir=str(tmp_path / "agent"), session_id="old-thread")
+
+
+async def test_subprocess_stdin_is_not_inherited(fake_codex, tmp_path):
+    """`codex exec` reads stdin on every run. An inherited stdin that never
+    reaches EOF blocks the turn until the deadline; it is /dev/null under
+    launchd by luck, not design."""
+    import asyncio as _asyncio
+    seen = {}
+    real = _asyncio.create_subprocess_exec
+
+    async def _spy(*a, **kw):
+        seen.update(kw)
+        return await real(*a, **kw)
+
+    bin_path, _ = fake_codex
+    import src.llm.codex_cli as mod
+    orig = mod.asyncio.create_subprocess_exec
+    mod.asyncio.create_subprocess_exec = _spy
+    try:
+        await _provider(bin_path).complete(
+            [Message(role=MessageRole.USER, content="hi")],
+            project_dir=str(tmp_path / "agent"))
+    finally:
+        mod.asyncio.create_subprocess_exec = orig
+    assert seen["stdin"] == _asyncio.subprocess.DEVNULL
