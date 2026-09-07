@@ -237,3 +237,42 @@ async def test_agent_config_rejects_bad_input(overlay, monkeypatch):
 
     assert "invalid effort" in await agent_config(ctx, effort="ludicrous")
     assert "Unknown agent" in await agent_config(ctx, agent="nobody", model="x")
+
+
+async def test_agent_config_switches_provider_live(overlay, monkeypatch):
+    """Provider is an override like model and effort: applies next turn, no
+    restart. A switch without a model drops any model override, because the
+    old name belongs to the old vendor, and says the new default applies."""
+    monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
+    _config_with_admin(overlay)
+    _agents_file(overlay, CODEX_AGENT)
+    ctx = ToolContext(agent_id="atlas", user_id="42")
+
+    await agent_config(ctx, model="gpt-6-astra")
+    out = await agent_config(ctx, provider="claude_code")
+    assert "provider -> claude_code" in out
+    assert "model override cleared" in out
+    assert "no restart" in out
+
+    state = await agent_config(ctx)
+    assert "claude_code   (override; agents.yaml says codex_cli)" in state
+    assert "(default of claude_code)" in state
+    assert "gpt-6-astra" not in state
+
+    out = await agent_config(ctx, provider="claude_code", model="opus")
+    assert "model -> opus" in out and "cleared" not in out
+
+    await agent_config(ctx, reset=True)
+    state = await agent_config(ctx)
+    assert "codex_cli" in state and "gpt-5.6-sol" in state and "override" not in state
+
+
+async def test_agent_config_rejects_unknown_provider(overlay, monkeypatch):
+    monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
+    _config_with_admin(overlay)
+    _agents_file(overlay, CODEX_AGENT)
+    ctx = ToolContext(agent_id="atlas", user_id="42")
+
+    out = await agent_config(ctx, provider="gpt")
+    assert "unknown provider" in out and "codex_cli" in out and "claude_code" in out
+    assert "override" not in await agent_config(ctx)

@@ -102,6 +102,15 @@ class Storage:
         for col in ("provider", "model"):
             if col not in cols:
                 await self._db.execute(f"ALTER TABLE messages ADD COLUMN {col} TEXT")
+        # Migration: which provider minted the stored CLI session id. A session
+        # id only resumes on the backend that issued it, so when an agent's
+        # provider changes at runtime the engine has to know the stored id is
+        # foreign and start fresh instead of burning a resume attempt on it.
+        async with self._db.execute("PRAGMA table_info(sessions)") as cur:
+            cols = {row[1] for row in await cur.fetchall()}
+        if "cli_session_provider" not in cols:
+            await self._db.execute(
+                "ALTER TABLE sessions ADD COLUMN cli_session_provider TEXT")
         await self._db.commit()
         logger.info(f"Storage initialized: {self._db_path}")
 
@@ -119,7 +128,7 @@ class Storage:
         """Get an existing session or create a new one."""
         async with self._db.execute(
             "SELECT id, agent_id, channel_id, user_id, cli_session_id, "
-            "created_at, last_active, summary "
+            "created_at, last_active, summary, cli_session_provider "
             "FROM sessions WHERE id = ?", (session_id,)
         ) as cursor:
             row = await cursor.fetchone()
@@ -134,6 +143,7 @@ class Storage:
                 "id": row[0], "agent_id": row[1], "channel_id": row[2],
                 "user_id": row[3], "cli_session_id": row[4],
                 "created_at": row[5], "last_active": row[6], "summary": row[7],
+                "cli_session_provider": row[8],
             }
 
         now = time.time()
@@ -147,14 +157,29 @@ class Storage:
             "id": session_id, "agent_id": agent_id, "channel_id": channel_id,
             "user_id": user_id, "cli_session_id": None,
             "created_at": now, "last_active": now, "summary": None,
+            "cli_session_provider": None,
         }
 
-    async def save_cli_session_id(self, session_id: str, cli_session_id: str) -> None:
-        """Persist the Claude Code CLI session ID for --resume across restarts."""
-        await self._db.execute(
-            "UPDATE sessions SET cli_session_id = ? WHERE id = ?",
-            (cli_session_id, session_id)
-        )
+    async def save_cli_session_id(self, session_id: str, cli_session_id: str,
+                                  provider: str | None = None) -> None:
+        """Persist the CLI session ID for --resume across restarts.
+
+        `provider` is the registry name of the backend that issued the id.
+        Clearing the id (empty string) clears the provider with it; saving an
+        id without naming a provider leaves the recorded provider alone.
+        """
+        if not cli_session_id:
+            await self._db.execute(
+                "UPDATE sessions SET cli_session_id = ?, cli_session_provider = NULL "
+                "WHERE id = ?", (cli_session_id, session_id))
+        elif provider:
+            await self._db.execute(
+                "UPDATE sessions SET cli_session_id = ?, cli_session_provider = ? "
+                "WHERE id = ?", (cli_session_id, provider, session_id))
+        else:
+            await self._db.execute(
+                "UPDATE sessions SET cli_session_id = ? WHERE id = ?",
+                (cli_session_id, session_id))
         await self._db.commit()
 
     async def save_summary(self, session_id: str, summary: str) -> None:

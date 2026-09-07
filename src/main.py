@@ -367,6 +367,9 @@ async def main() -> None:
         alerter=alerter,
         training_collector=training_collector,
     )
+    # Provider overrides live in storage; prime the cache so the reflector and
+    # schedules see a switched provider before the agent's first message.
+    await agent_manager.load_provider_overrides()
 
     # --- Internal loopback API: inter-agent calls from tool subprocesses ---
     from src.core.internal_api import InternalAPI
