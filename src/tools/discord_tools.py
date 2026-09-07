@@ -8,7 +8,7 @@ import aiohttp
 
 from src.core.base import ToolContext
 from src.core.tools import tool
-from src.lib.discord_auth import bot_account_for_agent, resolve_bot_token
+from src.lib.discord_auth import resolve_bot_token
 
 logger = logging.getLogger(__name__)
 
@@ -24,13 +24,13 @@ def _discord_headers(vault, bot: str = "", agent_id: str = "") -> dict | None:
         agent_id: Calling agent, so an empty `bot` resolves to that agent's own
             account rather than the shared default.
     """
-    token, err = resolve_bot_token(vault, bot=bot, agent_id=agent_id)
-    if not token:
-        if bot:
-            logger.warning(err)
+    auth = resolve_bot_token(vault, bot=bot, agent_id=agent_id)
+    if not auth.token:
+        if auth.error:
+            logger.warning(auth.error)
         return None
     return {
-        "Authorization": f"Bot {token}",
+        "Authorization": f"Bot {auth.token}",
         "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
     }
 
@@ -267,10 +267,13 @@ async def send_discord_file(
         message: Optional text message to accompany the file.
         bot: Which bot account to send as (e.g. 'main', 'assistant'). Leave empty for default.
     """
-    sender = bot or bot_account_for_agent(ctx.agent_id or "") or "default"
-    token, err = resolve_bot_token(ctx.vault, bot=bot, agent_id=ctx.agent_id or "")
-    if not token:
-        return err
+    auth = resolve_bot_token(ctx.vault, bot=bot, agent_id=ctx.agent_id or "")
+    if not auth.token:
+        return auth.error
+    # The identity actually used, not the one the caller meant. When a shared
+    # token was resolved there is nothing that states whose it is, so say so
+    # rather than name an account the send may not have gone out under.
+    sender = f"bot '{auth.account}'" if auth.account else "the shared default bot"
 
     from src.tools.ingest import validate_file_path
     path_err = validate_file_path(file_path)
@@ -284,7 +287,7 @@ async def send_discord_file(
         return f"Error: file too large ({path.stat().st_size / 1024 / 1024:.1f}MB). Discord limit is 25MB."
 
     headers = {
-        "Authorization": f"Bot {token}",
+        "Authorization": f"Bot {auth.token}",
         "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
     }
 
@@ -307,13 +310,14 @@ async def send_discord_file(
             error = await resp.text()
             hint = ""
             if resp.status in (403, 404):
-                # 403/404 here is almost never the file or the network — it is
-                # this bot not being in that channel. Name the identity used so
-                # the next reader does not have to guess at egress or paths.
+                # Discord returns this for channel access, not for the file or
+                # the network, and it was once read as blocked egress. State
+                # the identity used and what to check; the status alone does
+                # not say who owns the channel or which bot would succeed.
                 hint = (
-                    f" — bot '{sender}' cannot access channel {channel_id}. "
-                    "It is a DM or a private channel belonging to a different "
-                    "bot; retry with bot=<that account>."
+                    f" — the request authenticated as {sender}. Check that this "
+                    f"bot is in channel {channel_id} and may send messages and "
+                    "attach files there."
                 )
             return f"Failed to send file (HTTP {resp.status}): {error[:300]}{hint}"
 
