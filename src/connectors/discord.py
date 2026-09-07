@@ -281,7 +281,11 @@ class DiscordConnector(Connector):
                 first_msg = sent
 
         if rest and first_msg is not None:
-            self._shortener.store.put(str(first_msg.id), rest, channel_id=str(channel_id))
+            # The account is stored with the rest: whichever client wins the
+            # take must speak as the bot that owes the words, not as itself.
+            self._shortener.store.put(str(first_msg.id), rest,
+                                      channel_id=str(channel_id),
+                                      account=getattr(bot, "account_name", None))
             try:
                 # Pre-added by the bot, so expanding is a tap on a control that
                 # is already there rather than something to remember.
@@ -1170,11 +1174,9 @@ class DiscordBot:
         shortener = getattr(self.connector, "_shortener", None)
         if (shortener and shortener.enabled and not message.author.bot
                 and wants_more(message.content)):
-            rest = shortener.store.take_latest_for_channel(str(message.channel.id))
-            if rest:
-                await self.connector.send(str(message.channel.id), rest,
-                                          bot_account=self.account_name,
-                                          no_shorten=True)
+            entry = shortener.store.take_latest_for_channel(str(message.channel.id))
+            if entry:
+                await self._send_overflow(str(message.channel.id), entry, "more")
                 return
         if not is_mentioned and self.client.user:
             # Check role mentions — Discord auto-creates a managed role for
@@ -1317,11 +1319,10 @@ class DiscordBot:
         # with nothing in the logs to say why.
         shortener = getattr(self.connector, "_shortener", None)
         if shortener and emoji == shortener.emoji:
-            rest = shortener.store.take(str(payload.message_id))
-            if rest:
-                await self.connector.send(str(payload.channel_id), rest,
-                                          bot_account=self.account_name,
-                                          no_shorten=True)
+            entry = shortener.store.take(str(payload.message_id))
+            if entry:
+                await self._send_overflow(str(payload.channel_id), entry,
+                                          f"{shortener.emoji} reaction")
                 return
 
         # Reveal what a sanitize alert would have stripped. Same emoji as the
@@ -1390,6 +1391,23 @@ class DiscordBot:
                     logger.info(f"HITL {hitl_id} denied by {user_id}")
         except Exception as e:
             logger.error(f"HITL reaction handling failed: {e}", exc_info=True)
+
+    async def _send_overflow(self, channel_id: str, entry, trigger: str) -> None:
+        """Post a held-back remainder as the bot that owes it.
+
+        Every client sees the 🔍 and the "more", and the take is first-come, so
+        the winner used to emit the rest under its own name. Expansions also
+        logged nothing at all, which is why five misattributed posts left no
+        trace in the log to find them by.
+        """
+        account = entry.account or self.account_name
+        if entry.account and entry.account != self.account_name:
+            logger.debug(f"[{self.account_name}] won the overflow take for "
+                         f"'{entry.account}' — sending as them")
+        logger.info(f"[{account}] reply-shorten: sending {len(entry.rest)} held "
+                    f"chars to {channel_id} ({trigger})")
+        await self.connector.send(channel_id, entry.rest,
+                                  bot_account=account, no_shorten=True)
 
     def _owns_goal_reaction(self, payload: discord.RawReactionActionEvent,
                             owner_agent: str) -> bool:

@@ -19,10 +19,12 @@ Claude Code CLI and pays process startup every time. Five seconds on every
 substantial reply is worse than the problem.
 """
 
+import json
 import logging
 import re
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
 
@@ -133,6 +135,17 @@ def footer(rest: str) -> str:
     return FOOTER.format(chars=len(rest), sections=sections)
 
 
+class Overflow(NamedTuple):
+    """A held-back remainder and the bot account that owes it.
+
+    `account` is None for a remainder written before the account was stored;
+    callers fall back to their own account, which is the old behaviour.
+    """
+
+    rest: str
+    account: str | None = None
+
+
 class OverflowStore:
     """The held-back remainders, on disk.
 
@@ -140,6 +153,12 @@ class OverflowStore:
     restart between the short message and the tap on 🔍 would otherwise strand
     the rest with no way to ask for it again. Keyed by the id of the message
     the reader is looking at.
+
+    The account travels WITH the remainder. Every gateway client sees the 🔍
+    and the "more", and the take is first-come, so a store that recorded only
+    the text let whichever client won emit another agent's words under its own
+    name. That happened five times in one hour, and one of the fabricated
+    attributions was believed and turned into a work item by a third agent.
     """
 
     def __init__(self, directory: str | Path, ttl_hours: float = 72.0,
@@ -152,10 +171,12 @@ class OverflowStore:
         safe = re.sub(r"[^0-9A-Za-z_-]", "", str(message_id))[:64]
         return self.dir / f"{safe}.md"
 
-    def put(self, message_id: str, rest: str, channel_id: str | None = None) -> None:
+    def put(self, message_id: str, rest: str, channel_id: str | None = None,
+            account: str | None = None) -> None:
         try:
             self.dir.mkdir(parents=True, exist_ok=True)
-            self._path(message_id).write_text(rest, encoding="utf-8")
+            self._path(message_id).write_text(
+                json.dumps({"account": account, "rest": rest}), encoding="utf-8")
             if channel_id:
                 # A second key by channel, so "more" works without the reader
                 # having to point at a particular message.
@@ -165,20 +186,26 @@ class OverflowStore:
         except OSError as e:
             logger.warning(f"reply-shorten: could not store the remainder: {e}")
 
-    def take(self, message_id: str) -> str | None:
+    def take(self, message_id: str) -> Overflow | None:
         """Read and remove a remainder. Returns None when there is none."""
         path = self._path(message_id)
         try:
             if not path.is_file():
                 return None
-            text = path.read_text(encoding="utf-8")
+            raw = path.read_text(encoding="utf-8")
             path.unlink(missing_ok=True)
-            return text
         except OSError as e:
             logger.warning(f"reply-shorten: could not read the remainder: {e}")
             return None
+        try:
+            data = json.loads(raw)
+            return Overflow(data["rest"], data.get("account"))
+        except (ValueError, KeyError, TypeError):
+            # Written before the account was stored, or by an older build
+            # mid-deploy. The text is still the text; only the name is lost.
+            return Overflow(raw, None)
 
-    def take_latest_for_channel(self, channel_id: str) -> str | None:
+    def take_latest_for_channel(self, channel_id: str) -> Overflow | None:
         """The remainder of the most recent shortened message in a channel."""
         pointer = self.dir / f"channel-{channel_id}.txt"
         try:
@@ -187,10 +214,10 @@ class OverflowStore:
             message_id = pointer.read_text(encoding="utf-8").strip()
         except OSError:
             return None
-        text = self.take(message_id)
-        if text is not None:
+        entry = self.take(message_id)
+        if entry is not None:
             pointer.unlink(missing_ok=True)
-        return text
+        return entry
 
     def _prune(self) -> None:
         """Drop remainders nobody asked for. Old first, then oldest over the cap."""
