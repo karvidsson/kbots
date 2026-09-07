@@ -107,6 +107,10 @@ class Session:
     last_active: float = field(default_factory=time.time)
     message_count: int = 0
     cli_session_id: str | None = None  # Claude Code CLI session for --resume
+    # Registry name of the provider that issued cli_session_id. A session id
+    # only resumes on the backend that minted it, so a provider switch has to
+    # drop the id rather than hand it to a backend that has never seen it.
+    cli_session_provider: str | None = None
     # Temporary model downgrade after a usage cap — keeps this conversation on
     # a cheaper model until the estimated reset, then reverts to configured.
     model_override: str | None = None
@@ -143,6 +147,12 @@ class AgentManager:
         self.vault = vault
         self.defaults = defaults or {}
         self.storage = storage
+        # Runtime provider overrides (agent_config provider=...), mirrored from
+        # the agent_overrides table. Cached here because _get_agent_llm is
+        # synchronous and has callers (reflector, summariser) with no turn of
+        # their own to read the table in; every turn refreshes its own entry
+        # and load_provider_overrides() primes the lot at boot.
+        self._provider_overrides: dict[str, str] = {}
         self.hitl = hitl
         self.rate_limiter = rate_limiter
         self.audit = audit
@@ -256,10 +266,16 @@ class AgentManager:
         return session
 
     def _get_agent_llm(self, agent_id: str) -> LLMProvider:
-        """Get the LLM provider for an agent."""
+        """Get the LLM provider for an agent.
+
+        A runtime provider override wins over agents.yaml. Every provider the
+        deployment knows is already built at boot, so switching is a lookup,
+        not a restart.
+        """
         agent_cfg = self.agent_configs[agent_id]
         llm_cfg = agent_cfg.get("llm", self.defaults.get("llm", {}))
-        provider_name = llm_cfg.get("provider", "anthropic")
+        provider_name = (self._provider_overrides.get(agent_id)
+                         or llm_cfg.get("provider", "anthropic"))
 
         if provider_name not in self.llm_providers:
             raise ValueError(
@@ -267,6 +283,74 @@ class AgentManager:
                 f"but available: {list(self.llm_providers.keys())}"
             )
         return self.llm_providers[provider_name]
+
+    def _apply_provider_override(self, agent_id: str, overrides: dict) -> bool:
+        """Sync one agent's cached provider override from its override row.
+
+        Returns True when the override is active. An override naming a
+        provider this deployment did not build is ignored with a warning
+        rather than raised: the tool that wrote it validates against the
+        registry, so this only happens when the two disagree, and the agent
+        keeps answering on its configured provider in the meantime.
+        """
+        name = (overrides or {}).get("provider") or ""
+        if name and name in self.llm_providers:
+            self._provider_overrides[agent_id] = name
+            return True
+        if name:
+            logger.warning(f"[{agent_id}] provider override '{name}' is not a "
+                           f"built provider ({list(self.llm_providers)}) — ignored")
+        self._provider_overrides.pop(agent_id, None)
+        return False
+
+    async def load_provider_overrides(self) -> None:
+        """Prime the provider cache from storage for every agent, at boot.
+
+        Without this the reflector or a schedule firing before an agent's
+        first message would run on the agents.yaml provider until that
+        agent's own turn refreshed the cache.
+        """
+        if not self.storage:
+            return
+        for agent_id in list(self.agent_configs):
+            try:
+                overrides = await self.storage.get_agent_overrides(agent_id)
+            except Exception as e:
+                logger.debug(f"provider override preload failed for {agent_id}: {e}")
+                continue
+            self._apply_provider_override(agent_id, overrides)
+
+    def _effective_model(self, overrides: dict, configured: str) -> str:
+        """Model for this turn given the override row.
+
+        Model names are vendor-local, so an agents.yaml model must not follow
+        the agent onto an overridden provider: with a provider override and
+        no model override, the provider's own default is used (empty model).
+        """
+        if "model" in overrides:
+            return overrides["model"]
+        if overrides.get("provider"):
+            return ""
+        return configured
+
+    async def _drop_foreign_cli_session(self, session: "Session", provider_used: str) -> None:
+        """Forget a CLI session id that a different provider minted.
+
+        Handing codex a Claude session id (or the reverse) costs a failed
+        resume before the backend starts fresh anyway. A session with no
+        recorded provider predates this column and is left alone.
+        """
+        if not session.cli_session_id or not session.cli_session_provider:
+            return
+        if session.cli_session_provider == provider_used:
+            return
+        logger.info(f"[{session.agent_id}] CLI session {session.cli_session_id} belongs "
+                    f"to {session.cli_session_provider}, this turn runs on "
+                    f"{provider_used} — starting fresh")
+        session.cli_session_id = None
+        session.cli_session_provider = None
+        if self.storage:
+            await self.storage.save_cli_session_id(session.id, "")
 
     def _get_agent_memory(self, agent_id: str) -> MemoryBackend | None:
         """Get the memory backend for an agent."""
@@ -672,6 +756,7 @@ class AgentManager:
             # Don't restore CLI session for skill invocations — they run fresh
             if stored.get("cli_session_id") and not session.cli_session_id and not message.skill:
                 session.cli_session_id = stored["cli_session_id"]
+                session.cli_session_provider = stored.get("cli_session_provider")
                 logger.debug(f"Restored CLI session {session.cli_session_id} from storage")
 
         # --- Build message context ---
@@ -740,10 +825,14 @@ class AgentManager:
                      self.defaults.get("llm", {}).get("model", "opus"))
         mcp_config = llm_cfg.get("mcp_config") or self.defaults.get("llm", {}).get("mcp_config")
         llm_effort = agent_cfg.get("effort")
-        # Runtime overrides (Discord /model, /effort) win over agents.yaml.
+        # Runtime overrides (agent_config: provider, model, effort) win over
+        # agents.yaml. The provider is re-resolved after the read so a switch
+        # made a moment ago applies to this very turn.
         if self.storage:
             overrides = await self.storage.get_agent_overrides(agent_id)
-            llm_model = overrides.get("model", llm_model)
+            self._apply_provider_override(agent_id, overrides)
+            llm = self._get_agent_llm(agent_id)
+            llm_model = self._effective_model(overrides, llm_model)
             llm_effort = overrides.get("effort", llm_effort)
 
         # Active usage-limit downgrade wins while it lasts, so this conversation
@@ -790,6 +879,7 @@ class AgentManager:
         # answered — recorded on every assistant message).
         provider_used = next(
             (n for n, p in self.llm_providers.items() if p is llm), "unknown")
+        await self._drop_foreign_cli_session(session, provider_used)
 
         # CLI-backed agents get no system prompt at build time — the CLI loads
         # the identity file itself. If this turn ended up on a different provider
@@ -1008,8 +1098,10 @@ class AgentManager:
         # --- Save CLI session ID for --resume on next message ---
         if response and response.session_id:
             session.cli_session_id = response.session_id
+            session.cli_session_provider = provider_used
             if self.storage:
-                await self.storage.save_cli_session_id(session.id, response.session_id)
+                await self.storage.save_cli_session_id(
+                    session.id, response.session_id, provider=provider_used)
             logger.debug(f"Saved CLI session {response.session_id} for {session.id}")
 
         # If resume failed (error response), clear the stale session and retry would
@@ -1216,8 +1308,13 @@ class AgentManager:
         llm_effort = agent_cfg.get("effort")
         if self.storage:
             overrides = await self.storage.get_agent_overrides(agent_id)
-            llm_model = overrides.get("model", llm_model)
+            self._apply_provider_override(agent_id, overrides)
+            llm = self._get_agent_llm(agent_id)
+            llm_model = self._effective_model(overrides, llm_model)
             llm_effort = overrides.get("effort", llm_effort)
+        provider_used = next(
+            (n for n, p in self.llm_providers.items() if p is llm), "unknown")
+        await self._drop_foreign_cli_session(session, provider_used)
 
         response = None
         for round_num in range(self._max_tool_rounds):
@@ -1264,9 +1361,10 @@ class AgentManager:
 
         if response and response.session_id:
             session.cli_session_id = response.session_id
+            session.cli_session_provider = provider_used
             if self.storage:
                 await self.storage.save_cli_session_id(
-                    session.id, response.session_id)
+                    session.id, response.session_id, provider=provider_used)
 
         if self.storage and response and response.content:
             await self.storage.save_message(

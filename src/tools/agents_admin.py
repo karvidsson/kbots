@@ -253,7 +253,28 @@ _EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 # is ALLOWED to do; they stay in agents.yaml where a human edits them. Model and
 # effort only decide how well it thinks, so an agent may retune itself without
 # that being a route to more privilege.
-_SETTABLE = ("model", "effort")
+_SETTABLE = ("provider", "model", "effort")
+
+
+def _known_providers() -> set[str]:
+    """Registry names of every LLM provider class the engine can build.
+
+    Imports the provider modules so their classes exist, then reads the same
+    `name` attribute the engine registry keys on. Cheap, and it is the only
+    way the tool can refuse a provider the engine would ignore.
+    """
+    import importlib
+    import pkgutil
+
+    import src.llm as llm_pkg
+    from src.core.base import LLMProvider
+    for mod in pkgutil.iter_modules(llm_pkg.__path__):
+        try:
+            importlib.import_module(f"src.llm.{mod.name}")
+        except Exception:  # a broken optional provider must not hide the rest
+            continue
+    return {getattr(cls, "name", "") for cls in LLMProvider.__subclasses__()
+            if getattr(cls, "name", "")}
 
 
 def _overrides_db() -> Path:
@@ -335,27 +356,32 @@ def _is_admin(user_id: str) -> bool:
 @tool(
     name="agent_config",
     description=(
-        "Read or change an agent's runtime LLM settings — model and effort. "
-        "Call with no arguments to see your own: provider, configured model "
-        "and effort, and any active override. Pass model or effort to change "
-        "them, or reset=true to drop the overrides and go back to agents.yaml. "
-        "Changes persist across restarts and apply from the next message, no "
-        "reboot. Only an admin can change settings; anyone can read them. "
-        "Model names are provider-local (claude_code: opus/sonnet/haiku; "
-        "codex_cli: gpt-* ids; local: an Ollama/LM Studio tag) — a name from "
-        "the wrong vendor is rejected by the backend, not here. Tier, tools "
-        "and privileges are NOT settable here: those live in agents.yaml."
+        "Read or change an agent's runtime LLM settings — provider, model and "
+        "effort. Call with no arguments to see your own: provider, model and "
+        "effort, and any active override. Pass provider, model or effort to "
+        "change them, or reset=true to drop the overrides and go back to "
+        "agents.yaml. Changes persist across restarts and apply from the next "
+        "message, no reboot: every provider is built at boot, so switching is "
+        "a lookup. A provider switch starts a fresh CLI session (a session id "
+        "only resumes on the backend that issued it) and, unless model is set "
+        "in the same call, runs on the new provider's default model, because "
+        "model names are provider-local (claude_code: opus/sonnet/haiku; "
+        "codex_cli: gpt-* ids; local: an Ollama/LM Studio tag). Only an admin "
+        "can change settings; anyone can read them. Tier, tools and privileges "
+        "are NOT settable here: those live in agents.yaml."
     ),
     category="admin",
 )
 async def agent_config(ctx: ToolContext, agent: str = "", model: str = "",
-                       effort: str = "", reset: bool = False) -> str:
-    """Read or set an agent's model/effort runtime overrides.
+                       effort: str = "", provider: str = "",
+                       reset: bool = False) -> str:
+    """Read or set an agent's provider/model/effort runtime overrides.
 
     agent: which agent to act on. Empty means yourself.
+    provider: registry name of a built provider (claude_code, codex_cli, local).
     model: provider-local model name or alias. Empty leaves it.
     effort: one of low, medium, high, xhigh, max. Empty leaves it.
-    reset: drop both overrides so agents.yaml governs again.
+    reset: drop every override so agents.yaml governs again.
     """
     overlay = os.environ.get("KBOTS_OVERLAY", "")
     if not overlay:
@@ -369,17 +395,27 @@ async def agent_config(ctx: ToolContext, agent: str = "", model: str = "",
 
     cfg = entries[agent_id] or {}
     llm_cfg = cfg.get("llm", {}) or {}
-    provider = llm_cfg.get("provider", "claude_code")
+    configured_provider = llm_cfg.get("provider", "claude_code")
     configured_model = llm_cfg.get("model", "(defaults.llm.model)")
     configured_effort = cfg.get("effort") or "(provider default)"
     current = _read_overrides(agent_id)
 
     def _state() -> str:
-        active_model = current.get("model", configured_model)
+        active_provider = current.get("provider", configured_provider)
+        # With a provider override and no model override the engine passes
+        # no model at all, so the vendor-local agents.yaml name is not used.
+        if "model" in current:
+            active_model = current["model"]
+        elif "provider" in current:
+            active_model = f"(default of {active_provider})"
+        else:
+            active_model = configured_model
         active_effort = current.get("effort", configured_effort)
         lines = [
             f"agent:     {agent_id}",
-            f"provider:  {provider}",
+            f"provider:  {active_provider}"
+            + (f"   (override; agents.yaml says {configured_provider})"
+               if "provider" in current else ""),
             f"model:     {active_model}"
             + (f"   (override; agents.yaml says {configured_model})"
                if "model" in current else ""),
@@ -389,7 +425,7 @@ async def agent_config(ctx: ToolContext, agent: str = "", model: str = "",
         ]
         return "```\n" + "\n".join(lines) + "\n```"
 
-    if not model and not effort and not reset:
+    if not model and not effort and not provider and not reset:
         return _state()
 
     # Same posture as set_hitl: an agent must not be able to retune itself on
@@ -409,6 +445,21 @@ async def agent_config(ctx: ToolContext, agent: str = "", model: str = "",
         current = _read_overrides(agent_id)
         if not changed:
             return f"No overrides were set for '{agent_id}' — nothing to reset.\n{_state()}"
+    if provider:
+        known = _known_providers()
+        if provider not in known:
+            return (f"ERROR: unknown provider {provider!r} — "
+                    f"one of {', '.join(sorted(known))}.")
+        _write_override(agent_id, "provider", provider)
+        changed.append(f"provider -> {provider}")
+        # The old model name belongs to the old vendor. Unless a model comes
+        # with the switch, drop any model override so the engine uses the new
+        # provider's default instead of sending it a foreign model id.
+        if not model and "model" in current:
+            _write_override(agent_id, "model", None)
+            changed.append("model override cleared (was for the previous provider)")
+        if not model:
+            changed.append(f"model -> default of {provider} (pass model= to pin one)")
     if effort:
         if effort not in _EFFORT_LEVELS:
             return (f"ERROR: invalid effort {effort!r} — "
