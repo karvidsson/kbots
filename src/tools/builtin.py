@@ -121,13 +121,11 @@ async def send_message(ctx: ToolContext, channel_id: str, content: str, bot: str
 
     # Fallback: send via Discord API directly (MCP server context)
     if ctx.vault:
-        token = None
-        if bot:
-            token = ctx.vault.get(f"discord-token-{bot}")
-            if not token:
-                return f"Error: no Discord token for bot '{bot}'."
-        else:
-            token = ctx.vault.get("active-discord-token") or ctx.vault.get("discord-token")
+        from src.lib.discord_auth import resolve_bot_token
+
+        token, err = resolve_bot_token(ctx.vault, bot=bot, agent_id=ctx.agent_id or "")
+        if not token and bot:
+            return err
         if token:
             import aiohttp
             headers = {

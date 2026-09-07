@@ -8,32 +8,26 @@ import aiohttp
 
 from src.core.base import ToolContext
 from src.core.tools import tool
+from src.lib.discord_auth import bot_account_for_agent, resolve_bot_token
 
 logger = logging.getLogger(__name__)
 
 DISCORD_API = "https://discord.com/api/v10"
 
 
-def _discord_headers(vault, bot: str = "") -> dict | None:
+def _discord_headers(vault, bot: str = "", agent_id: str = "") -> dict | None:
     """Get Discord bot auth headers from vault.
 
     Args:
         vault: Vault backend for token access.
         bot: Which bot account to use (e.g. 'main', 'assistant'). Empty for default.
+        agent_id: Calling agent, so an empty `bot` resolves to that agent's own
+            account rather than the shared default.
     """
-    token = None
-    if vault:
-        if bot:
-            # Account tokens live at discord-<name> (settings.py convention);
-            # discord-token-<name> is a legacy key form kept as fallback.
-            token = vault.get(f"discord-{bot}") or vault.get(f"discord-token-{bot}")
-            if not token:
-                logger.warning(f"No Discord token for bot '{bot}' (keys tried: "
-                               f"discord-{bot}, discord-token-{bot})")
-                return None
-        else:
-            token = vault.get("active-discord-token") or vault.get("discord-token")
+    token, err = resolve_bot_token(vault, bot=bot, agent_id=agent_id)
     if not token:
+        if bot:
+            logger.warning(err)
         return None
     return {
         "Authorization": f"Bot {token}",
@@ -273,18 +267,10 @@ async def send_discord_file(
         message: Optional text message to accompany the file.
         bot: Which bot account to send as (e.g. 'main', 'assistant'). Leave empty for default.
     """
-    if not ctx.vault:
-        return "Error: no vault access."
-
-    token = None
-    if bot:
-        token = ctx.vault.get(f"discord-token-{bot}")
-        if not token:
-            return f"Error: no Discord token for bot '{bot}'."
-    else:
-        token = ctx.vault.get("active-discord-token") or ctx.vault.get("discord-token")
+    sender = bot or bot_account_for_agent(ctx.agent_id or "") or "default"
+    token, err = resolve_bot_token(ctx.vault, bot=bot, agent_id=ctx.agent_id or "")
     if not token:
-        return "Error: no Discord token available."
+        return err
 
     from src.tools.ingest import validate_file_path
     path_err = validate_file_path(file_path)
@@ -318,9 +304,18 @@ async def send_discord_file(
         ) as resp:
             if resp.status == 200:
                 return f"File {path.name} sent to channel {channel_id}"
-            else:
-                error = await resp.text()
-                return f"Failed to send file (HTTP {resp.status}): {error[:300]}"
+            error = await resp.text()
+            hint = ""
+            if resp.status in (403, 404):
+                # 403/404 here is almost never the file or the network — it is
+                # this bot not being in that channel. Name the identity used so
+                # the next reader does not have to guess at egress or paths.
+                hint = (
+                    f" — bot '{sender}' cannot access channel {channel_id}. "
+                    "It is a DM or a private channel belonging to a different "
+                    "bot; retry with bot=<that account>."
+                )
+            return f"Failed to send file (HTTP {resp.status}): {error[:300]}{hint}"
 
 
 # --- Channel management tools ---
