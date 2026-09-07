@@ -74,6 +74,21 @@ async def _discord_post(vault, endpoint: str, json: dict, bot: str = "") -> dict
                 return {"error": True, "status": resp.status, "detail": error[:300]}
 
 
+async def _discord_put(vault, endpoint: str, bot: str = "") -> bool:
+    """Authenticated PUT with no body — the shape Discord uses for adding a
+    reaction. Returns True on success; callers treat failure as cosmetic."""
+    headers = _discord_headers(vault, bot=bot)
+    if not headers:
+        return False
+    async with aiohttp.ClientSession() as session:
+        async with session.put(f"{DISCORD_API}{endpoint}", headers=headers) as resp:
+            if resp.status in (200, 204):
+                return True
+            logger.error(f"Discord API PUT {endpoint}: {resp.status} "
+                         f"{(await resp.text())[:200]}")
+            return False
+
+
 async def _discord_patch(vault, endpoint: str, json: dict, bot: str = "") -> dict | None:
     """Make an authenticated PATCH request to the Discord API."""
     headers = _discord_headers(vault, bot=bot)

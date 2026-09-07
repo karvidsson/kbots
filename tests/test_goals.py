@@ -452,6 +452,281 @@ async def test_a_failed_channel_creation_does_not_undo_the_advance(goal_tools,
     assert "no guild_id" in out
 
 
+# --- staffing: nominate, then a human approves each seat ---
+
+def test_nomination_is_not_participation_until_approved():
+    """The gap is the feature: an agent nominated by another agent's judgement
+    alone must not be routed or spending turns."""
+    goal = _mk()
+    store.add_nomination(goal["id"], "redline", "owns the game repo")
+    assert [n["agent_id"] for n in store.list_nominations(goal["id"], "pending")] == ["redline"]
+    assert "redline" not in [p["agent_id"] for p in store.list_participants(goal["id"])]
+
+    store.decide_nomination(goal["id"], "redline", True, "user1")
+    assert "redline" in [p["agent_id"] for p in store.list_participants(goal["id"])]
+    assert store.get_nomination(goal["id"], "redline")["status"] == "approved"
+    assert store.list_nominations(goal["id"], "pending") == []
+
+
+def test_declined_nomination_is_remembered_and_adds_nobody():
+    goal = _mk()
+    store.add_nomination(goal["id"], "ledger", "might have a view on cost")
+    store.decide_nomination(goal["id"], "ledger", False, "user1")
+    nom = store.get_nomination(goal["id"], "ledger")
+    assert nom["status"] == "declined" and nom["decided_by"] == "user1"
+    assert "ledger" not in [p["agent_id"] for p in store.list_participants(goal["id"])]
+
+
+def test_second_reaction_on_a_decided_nomination_changes_nothing():
+    """Two people reacting, or one reacting twice, must not re-run the add."""
+    goal = _mk()
+    store.add_nomination(goal["id"], "redline", "owns the repo")
+    assert store.decide_nomination(goal["id"], "redline", True, "user1")
+    assert store.decide_nomination(goal["id"], "redline", False, "user2") is None
+    assert store.get_nomination(goal["id"], "redline")["status"] == "approved"
+
+
+def test_nomination_and_kickoff_lookup_by_message_id():
+    goal = _mk()
+    store.add_nomination(goal["id"], "redline", "owns the repo")
+    store.set_nomination_message(goal["id"], "redline", "msg-1")
+    store.update_goal(goal["id"], "maya", kickoff_message_id="msg-2")
+
+    assert store.nomination_by_message("msg-1")["agent_id"] == "redline"
+    assert store.goal_by_kickoff_message("msg-2")["id"] == goal["id"]
+    # An unrelated message must fall through so it can reach HITL.
+    assert store.nomination_by_message("msg-9") is None
+    assert store.goal_by_kickoff_message("msg-9") is None
+
+
+def test_kickoff_lookup_only_matches_a_goal_still_awaiting_approval():
+    goal = _mk()
+    store.update_goal(goal["id"], "maya", kickoff_message_id="msg-2")
+    store.update_goal(goal["id"], "maya", status="brainstorm")
+    assert store.goal_by_kickoff_message("msg-2") is None
+
+
+def test_renominating_reopens_the_decision():
+    goal = _mk()
+    store.add_nomination(goal["id"], "redline", "first reason")
+    store.decide_nomination(goal["id"], "redline", False, "user1")
+    store.add_nomination(goal["id"], "redline", "better reason")
+    nom = store.get_nomination(goal["id"], "redline")
+    assert nom["status"] == "pending" and nom["reason"] == "better reason"
+
+
+# --- participant spec parsing: a reason is mandatory ---
+
+def test_parse_nominations_requires_a_reason_per_agent():
+    from src.tools.goals import parse_nominations
+
+    pairs, problems = parse_nominations(
+        "redline: owns the game repo; rainmaker: owns pricing")
+    assert pairs == [("redline", "owns the game repo"), ("rainmaker", "owns pricing")]
+    assert problems == []
+
+    pairs, problems = parse_nominations("redline; rainmaker: owns pricing")
+    assert pairs == [("rainmaker", "owns pricing")]
+    assert len(problems) == 1 and "redline" in problems[0]
+
+
+def test_parse_nominations_tolerates_list_formatting_and_catches_duplicates():
+    from src.tools.goals import parse_nominations
+
+    pairs, problems = parse_nominations(
+        "- @redline: owns the repo\n- redline: owns it again\n")
+    assert pairs == [("redline", "owns the repo")]
+    assert len(problems) == 1 and "twice" in problems[0]
+    assert parse_nominations("") == ([], [])
+
+
+# --- goal_create: the guards that make "less is more" structural ---
+
+@pytest.fixture
+def create_tool(monkeypatch, tmp_path):
+    """goal_create with Discord stubbed out. Returns (call, posts)."""
+    from src.core.base import ToolContext
+    from src.tools import goals as tools
+
+    posts: list[tuple[str, str]] = []
+    reactions: list[tuple[str, tuple]] = []
+
+    async def _post(ctx, channel_id, content):
+        posts.append((channel_id, content))
+        return f"msg-{len(posts)}"
+
+    async def _react(ctx, channel_id, message_id, emojis):
+        reactions.append((message_id, emojis))
+
+    async def _chan(ctx, title, cfg):
+        return "chan-1", ""
+
+    monkeypatch.setattr(tools, "_post_to_channel", _post)
+    monkeypatch.setattr(tools, "_add_reactions", _react)
+    monkeypatch.setattr(tools, "_create_goal_channel", _chan)
+    monkeypatch.setattr(tools, "_agent_tier", lambda a: "privileged")
+    monkeypatch.setattr(tools, "_known_agents",
+                        lambda: {"maya", "redline", "rainmaker", "ledger", "nestor", "caio"})
+    monkeypatch.setattr(tools, "_cfg", lambda: {
+        "enabled": True, "create_tiers": ["privileged"], "default_turn_budget": 30,
+        "max_participants": 4, "_discord": {}, "_alert_channel": ""})
+
+    async def call(**kw):
+        ctx = ToolContext(agent_id="maya", channel_id="home", user_id="user1")
+        return await tools.goal_create(ctx, **kw)
+
+    return call, posts, reactions
+
+
+async def test_goal_create_refuses_a_participant_with_no_reason(create_tool):
+    call, posts, _ = create_tool
+    out = await call(title="Launch", description="d", participants="redline")
+    assert out.startswith("ERROR") and "needs a reason" in out
+    assert posts == []          # nothing posted, nothing created
+    assert store.list_goals() == []
+
+
+async def test_goal_create_refuses_more_than_the_cap(create_tool):
+    call, posts, _ = create_tool
+    out = await call(title="Launch", description="d", participants="; ".join(
+        f"{a}: because" for a in
+        ("redline", "rainmaker", "ledger", "nestor", "caio")))
+    assert out.startswith("ERROR") and "limit is 4" in out
+    assert store.list_goals() == []
+
+
+async def test_goal_create_refuses_an_agent_not_on_the_roster(create_tool):
+    call, _, _ = create_tool
+    out = await call(title="Launch", description="d",
+                     participants="ghostbot: sounds useful")
+    assert out.startswith("ERROR") and "not on the roster" in out
+
+
+async def test_goal_create_stays_proposed_and_nominates_rather_than_adding(create_tool):
+    """The whole point: created, staffed on paper, nobody routed, nothing started."""
+    call, posts, reactions = create_tool
+    out = await call(title="Launch", description="ship it",
+                     plan="cut the trailer, then post it",
+                     participants="redline: owns the game repo; rainmaker: owns pricing")
+
+    goal = store.list_goals()[0]
+    assert goal["status"] == "proposed"
+    assert goal["plan"] == "cut the trailer, then post it"
+    # owner only — the nominees are not participants yet
+    assert [p["agent_id"] for p in store.list_participants(goal["id"])] == ["maya"]
+    assert {n["agent_id"] for n in store.list_nominations(goal["id"], "pending")} == {
+        "redline", "rainmaker"}
+
+    # one kickoff card carrying ✅, then one card per nominee carrying ✅/❌
+    assert len(posts) == 3
+    assert "cut the trailer" in posts[0][1] and "awaiting your approval" in posts[0][1]
+    assert reactions[0] == ("msg-1", ("✅",))
+    assert reactions[1] == ("msg-2", ("✅", "❌"))
+    assert goal["kickoff_message_id"] == "msg-1"
+    assert "Do not start work" in out
+    # named, not counted: a count matches whatever the caller sent, so a
+    # malformed participants string reads as success while agents go missing
+    assert "redline" in out and "rainmaker" in out
+
+
+async def test_goal_create_drops_a_self_nomination(create_tool):
+    call, posts, _ = create_tool
+    await call(title="Launch", description="d",
+               participants="maya: I am the owner; redline: owns the repo")
+    goal = store.list_goals()[0]
+    assert [n["agent_id"] for n in store.list_nominations(goal["id"])] == ["redline"]
+
+
+# --- mid-goal additions: HITL-gated, reason required ---
+
+@pytest.fixture
+def add_tool(monkeypatch):
+    """goal_add_member with Discord stubbed. The HITL gate lives in the MCP
+    server, so reaching the body here is what 'already approved' looks like."""
+    from src.core.base import ToolContext
+    from src.tools import goals as tools
+
+    posts: list[tuple[str, str]] = []
+
+    async def _post(ctx, channel_id, content):
+        posts.append((channel_id, content))
+        return "msg-x"
+
+    monkeypatch.setattr(tools, "_post_to_channel", _post)
+    monkeypatch.setattr(tools, "_update_card", lambda ctx, goal: _noop())
+    monkeypatch.setattr(tools, "_known_agents",
+                        lambda: {"maya", "redline", "rainmaker"})
+
+    async def _noop():
+        return None
+
+    async def call(**kw):
+        ctx = ToolContext(agent_id="redline", channel_id="c", user_id="user1")
+        return await tools.goal_add_member(ctx, **kw)
+
+    return call, posts
+
+
+def test_goal_add_member_is_hitl_gated():
+    """The gate is the feature. If this flag is dropped, any agent can grow a
+    goal by itself again and the reason becomes decoration."""
+    from src.core.tools import get_all_tools
+    assert get_all_tools()["goal_add_member"].hitl is True
+
+
+async def test_goal_add_member_requires_a_reason(add_tool):
+    call, posts = add_tool
+    goal = _mk()
+    out = await call(goal_id=goal["id"], reason="  ", agent_id="rainmaker")
+    assert out.startswith("ERROR") and "reason is required" in out
+    assert "rainmaker" not in [p["agent_id"] for p in store.list_participants(goal["id"])]
+    assert posts == []
+
+
+async def test_goal_add_member_records_who_asked_and_why(add_tool):
+    call, posts = add_tool
+    goal = _mk()
+    out = await call(goal_id=goal["id"], reason="owns pricing", agent_id="rainmaker")
+
+    assert "rainmaker" in [p["agent_id"] for p in store.list_participants(goal["id"])]
+    nom = store.get_nomination(goal["id"], "rainmaker")
+    assert nom["status"] == "approved" and nom["reason"] == "owns pricing"
+    assert "owns pricing" in posts[0][1] and "redline" in posts[0][1]
+    assert out.startswith("✅")
+
+
+async def test_goal_add_member_defaults_to_the_caller(add_tool):
+    call, _ = add_tool
+    goal = _mk()
+    await call(goal_id=goal["id"], reason="I built the capture rig")
+    assert "redline" in [p["agent_id"] for p in store.list_participants(goal["id"])]
+
+
+async def test_goal_add_member_rejects_unknown_and_duplicate(add_tool):
+    call, _ = add_tool
+    goal = _mk()
+    assert "not on the roster" in await call(
+        goal_id=goal["id"], reason="r", agent_id="ghostbot")
+    assert "already on" in await call(
+        goal_id=goal["id"], reason="r", agent_id="maya")   # the owner
+
+
+async def test_goal_create_names_agents_whose_card_failed(create_tool, monkeypatch):
+    """A silent drop is worse than a refusal: fourteen tasks once sat assigned
+    to three agents who were never added. Name who did not make it."""
+    from src.tools import goals as tools
+
+    call, posts, _ = create_tool
+
+    async def _post_first_only(ctx, channel_id, content):
+        posts.append((channel_id, content))
+        return f"msg-{len(posts)}" if len(posts) <= 2 else ""
+
+    monkeypatch.setattr(tools, "_post_to_channel", _post_first_only)
+    out = await call(title="Launch", description="d",
+                     participants="redline: owns the repo; rainmaker: owns pricing")
+    assert "Nominated, awaiting your ✅: redline (1)" in out
+    assert "NOT nominated" in out and "rainmaker" in out
 # --- store location: goals belong in the deployment's data dir ---
 
 def test_db_path_follows_the_pinned_data_dir(tmp_path, monkeypatch):
