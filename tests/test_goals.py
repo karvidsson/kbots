@@ -240,6 +240,27 @@ def test_goal_channel_routes_nobody_but_participants():
     assert conn.get_agent_for_channel("42", "ghost-bot") is None
 
 
+def test_a_mention_still_reaches_a_non_participant():
+    """Being pinged is somebody deciding to bring you in; the wildcard match
+    is an accident of config. A goal team asking an outside specialist a
+    direct question must still reach them, or the ask dies in silence.
+
+    Note the mention need not be typed as markup: _linkify_mentions rewrites
+    plain "@Name" into a real <@id> at send time, so prose that addresses an
+    agent by name becomes a genuine ping by the time it lands.
+    """
+    from src.connectors.discord import DiscordConnector
+    goal = _mk("brainstorm", channel="42", owner="maya")
+    store.add_participant(goal["id"], "kai")
+    conn = DiscordConnector.__new__(DiscordConnector)
+    conn._agent_configs = {
+        "maya": {"routing": {"discord": {"account": "maya-bot"}}},
+        "rio": {"routing": {"discord": {"account": "rio-bot"}}},
+    }
+    assert conn.get_agent_for_channel("42", "rio-bot") is None
+    assert conn.get_agent_for_channel("42", "rio-bot", mentioned=True) == "rio"
+
+
 def test_ordinary_channel_keeps_the_wildcard_fallback():
     """The goal rule must not cost non-goal channels their routing."""
     from src.connectors.discord import DiscordConnector

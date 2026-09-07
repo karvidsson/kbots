@@ -172,7 +172,7 @@ def _watching_bot():
 
     b.connector = SimpleNamespace(
         config={},
-        get_agent_for_channel=lambda ch, acct, cat=None: "atlas",
+        get_agent_for_channel=lambda ch, acct, cat=None, mentioned=False: "atlas",
         _agent_configs={"atlas": {"routing": {"discord": {
             "mentions": True, "watch_channels": ["555"]}}}},
         emit=emit,

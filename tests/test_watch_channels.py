@@ -28,7 +28,7 @@ def _bot(routing):
 
     b.connector = SimpleNamespace(
         config={},
-        get_agent_for_channel=lambda ch, acct, cat=None: "atlas",
+        get_agent_for_channel=lambda ch, acct, cat=None, mentioned=False: "atlas",
         _agent_configs={"atlas": {"routing": {"discord": routing}}},
         emit=emit,
     )

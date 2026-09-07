@@ -532,7 +532,8 @@ class DiscordConnector(Connector):
         return routing.get("account")
 
     def get_agent_for_channel(self, channel_id: str, bot_account: str,
-                              category_id: str | None = None) -> str | None:
+                              category_id: str | None = None,
+                              mentioned: bool = False) -> str | None:
         """Find which agent handles messages in this channel from this bot.
 
         Priority: goal channel (participants only) > specific channel >
@@ -545,8 +546,14 @@ class DiscordConnector(Connector):
         # every agent on this fleet routes with an empty channels list, so
         # every bot client would otherwise match the wildcard below and the
         # whole fleet would take a turn on every message in a goal room.
+        #
+        # `mentioned` is the exception, and it is the whole difference between
+        # this rule and a wall: being pinged is somebody deciding to bring you
+        # in, where the wildcard match is an accident of config. A goal team
+        # asking an outside specialist a direct question must still reach
+        # them, and silence would be the worst answer available.
         goal_participants = self._goal_participants(channel_id)
-        if goal_participants:
+        if goal_participants and not mentioned:
             for agent_id, agent_cfg in self._agent_configs.items():
                 routing = agent_cfg.get("routing", {}).get("discord", {})
                 if (routing.get("account", "default") == bot_account
@@ -1205,7 +1212,8 @@ class DiscordBot:
         has_category = hasattr(message.channel, 'category_id') and message.channel.category_id
         category_id = str(message.channel.category_id) if has_category else None
         agent_id = self.connector.get_agent_for_channel(
-            str(message.channel.id), self.account_name, category_id
+            str(message.channel.id), self.account_name, category_id,
+            mentioned=is_mentioned,
         )
 
         if not agent_id:
