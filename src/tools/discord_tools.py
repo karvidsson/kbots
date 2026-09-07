@@ -8,35 +8,29 @@ import aiohttp
 
 from src.core.base import ToolContext
 from src.core.tools import tool
+from src.lib.discord_auth import resolve_bot_token
 
 logger = logging.getLogger(__name__)
 
 DISCORD_API = "https://discord.com/api/v10"
 
 
-def _discord_headers(vault, bot: str = "") -> dict | None:
+def _discord_headers(vault, bot: str = "", agent_id: str = "") -> dict | None:
     """Get Discord bot auth headers from vault.
 
     Args:
         vault: Vault backend for token access.
         bot: Which bot account to use (e.g. 'main', 'assistant'). Empty for default.
+        agent_id: Calling agent, so an empty `bot` resolves to that agent's own
+            account rather than the shared default.
     """
-    token = None
-    if vault:
-        if bot:
-            # Account tokens live at discord-<name> (settings.py convention);
-            # discord-token-<name> is a legacy key form kept as fallback.
-            token = vault.get(f"discord-{bot}") or vault.get(f"discord-token-{bot}")
-            if not token:
-                logger.warning(f"No Discord token for bot '{bot}' (keys tried: "
-                               f"discord-{bot}, discord-token-{bot})")
-                return None
-        else:
-            token = vault.get("active-discord-token") or vault.get("discord-token")
-    if not token:
+    auth = resolve_bot_token(vault, bot=bot, agent_id=agent_id)
+    if not auth.token:
+        if auth.error:
+            logger.warning(auth.error)
         return None
     return {
-        "Authorization": f"Bot {token}",
+        "Authorization": f"Bot {auth.token}",
         "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
     }
 
@@ -273,18 +267,13 @@ async def send_discord_file(
         message: Optional text message to accompany the file.
         bot: Which bot account to send as (e.g. 'main', 'assistant'). Leave empty for default.
     """
-    if not ctx.vault:
-        return "Error: no vault access."
-
-    token = None
-    if bot:
-        token = ctx.vault.get(f"discord-token-{bot}")
-        if not token:
-            return f"Error: no Discord token for bot '{bot}'."
-    else:
-        token = ctx.vault.get("active-discord-token") or ctx.vault.get("discord-token")
-    if not token:
-        return "Error: no Discord token available."
+    auth = resolve_bot_token(ctx.vault, bot=bot, agent_id=ctx.agent_id or "")
+    if not auth.token:
+        return auth.error
+    # The identity actually used, not the one the caller meant. When a shared
+    # token was resolved there is nothing that states whose it is, so say so
+    # rather than name an account the send may not have gone out under.
+    sender = f"bot '{auth.account}'" if auth.account else "the shared default bot"
 
     from src.tools.ingest import validate_file_path
     path_err = validate_file_path(file_path)
@@ -298,7 +287,7 @@ async def send_discord_file(
         return f"Error: file too large ({path.stat().st_size / 1024 / 1024:.1f}MB). Discord limit is 25MB."
 
     headers = {
-        "Authorization": f"Bot {token}",
+        "Authorization": f"Bot {auth.token}",
         "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
     }
 
@@ -318,9 +307,19 @@ async def send_discord_file(
         ) as resp:
             if resp.status == 200:
                 return f"File {path.name} sent to channel {channel_id}"
-            else:
-                error = await resp.text()
-                return f"Failed to send file (HTTP {resp.status}): {error[:300]}"
+            error = await resp.text()
+            hint = ""
+            if resp.status in (403, 404):
+                # Discord returns this for channel access, not for the file or
+                # the network, and it was once read as blocked egress. State
+                # the identity used and what to check; the status alone does
+                # not say who owns the channel or which bot would succeed.
+                hint = (
+                    f" — the request authenticated as {sender}. Check that this "
+                    f"bot is in channel {channel_id} and may send messages and "
+                    "attach files there."
+                )
+            return f"Failed to send file (HTTP {resp.status}): {error[:300]}{hint}"
 
 
 # --- Channel management tools ---

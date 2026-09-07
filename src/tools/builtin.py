@@ -121,17 +121,18 @@ async def send_message(ctx: ToolContext, channel_id: str, content: str, bot: str
 
     # Fallback: send via Discord API directly (MCP server context)
     if ctx.vault:
-        token = None
-        if bot:
-            token = ctx.vault.get(f"discord-token-{bot}")
-            if not token:
-                return f"Error: no Discord token for bot '{bot}'."
-        else:
-            token = ctx.vault.get("active-discord-token") or ctx.vault.get("discord-token")
-        if token:
+        from src.lib.discord_auth import resolve_bot_token
+
+        auth = resolve_bot_token(ctx.vault, bot=bot, agent_id=ctx.agent_id or "")
+        # A named bot, or an agent whose own bot has no token, is an error the
+        # caller must see. Only the no-identity-anywhere case falls through to
+        # the connector-less message below.
+        if not auth.token and auth.account:
+            return auth.error
+        if auth.token:
             import aiohttp
             headers = {
-                "Authorization": f"Bot {token}",
+                "Authorization": f"Bot {auth.token}",
                 "Content-Type": "application/json",
                 "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
             }
