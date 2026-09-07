@@ -103,6 +103,14 @@ def test_default_does_not_reach_for_main_when_agent_has_an_account(overlay):
     assert da.resolve_bot_token(vault, agent_id="engineer3").token != "main-tok"
 
 
+def test_the_shared_active_alias_cannot_override_an_agents_own_bot(overlay):
+    """active-discord-token is one mutable slot in a vault several agents
+    share. It must never outrank the caller's own account, or whichever agent
+    wrote it last decides who everyone else posts as."""
+    vault = StubVault({"discord-engineer3": "e3-tok", "active-discord-token": "someone-else"})
+    assert da.resolve_bot_token(vault, agent_id="engineer3").token == "e3-tok"
+
+
 def test_configured_account_without_a_token_fails_closed(overlay):
     """The agent has a bot of its own and its credential is missing. Sending
     as whoever the shared token belongs to is the bug, not the recovery."""
