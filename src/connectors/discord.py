@@ -532,8 +532,7 @@ class DiscordConnector(Connector):
         return routing.get("account")
 
     def get_agent_for_channel(self, channel_id: str, bot_account: str,
-                              category_id: str | None = None,
-                              mentioned: bool = False) -> str | None:
+                              category_id: str | None = None) -> str | None:
         """Find which agent handles messages in this channel from this bot.
 
         Priority: goal channel (participants only) > specific channel >
@@ -547,13 +546,16 @@ class DiscordConnector(Connector):
         # every bot client would otherwise match the wildcard below and the
         # whole fleet would take a turn on every message in a goal room.
         #
-        # `mentioned` is the exception, and it is the whole difference between
-        # this rule and a wall: being pinged is somebody deciding to bring you
-        # in, where the wildcard match is an accident of config. A goal team
-        # asking an outside specialist a direct question must still reach
-        # them, and silence would be the worst answer available.
+        # A mention is NOT an exception. It used to be, on the reasoning that
+        # being pinged is somebody deciding to bring you in. The audit says
+        # otherwise: seven turns by non-members in one day, every one of them
+        # arriving by mention from inside the room. goal_add_member exists so
+        # that joining a goal is a decision a human makes once and can see;
+        # a mention route makes it a decision any participant makes silently,
+        # as often as it likes. The caller answers the mention instead (see
+        # _goal_outsider_notice) so nothing is dropped without a word.
         goal_participants = self._goal_participants(channel_id)
-        if goal_participants and not mentioned:
+        if goal_participants:
             for agent_id, agent_cfg in self._agent_configs.items():
                 routing = agent_cfg.get("routing", {}).get("discord", {})
                 if (routing.get("account", "default") == bot_account
@@ -583,6 +585,10 @@ class DiscordConnector(Connector):
                 dm_fallback_agent = agent_id
 
         return category_agent or wildcard_agent or dm_fallback_agent
+
+    def is_goal_channel(self, channel_id: str) -> bool:
+        """True if a live goal owns this channel."""
+        return bool(self._goal_participants(channel_id))
 
     @staticmethod
     def _goal_participants(channel_id: str) -> list[str]:
@@ -1212,11 +1218,15 @@ class DiscordBot:
         has_category = hasattr(message.channel, 'category_id') and message.channel.category_id
         category_id = str(message.channel.category_id) if has_category else None
         agent_id = self.connector.get_agent_for_channel(
-            str(message.channel.id), self.account_name, category_id,
-            mentioned=is_mentioned,
+            str(message.channel.id), self.account_name, category_id
         )
 
         if not agent_id:
+            # Pinged in a goal room this bot is not staffed on. Say so once,
+            # as a marked notice so it costs nobody a turn, rather than
+            # dropping it: silence reads as a broken bot and gets retried.
+            if is_mentioned and self.connector.is_goal_channel(str(message.channel.id)):
+                await self._goal_outsider_notice(message)
             return
 
         agent_cfg = self.connector._agent_configs.get(agent_id, {})
@@ -1438,6 +1448,26 @@ class DiscordBot:
             logger.debug(f"goal reaction: no bot account for owner '{owner_agent}'")
             return False
         return account == self.account_name
+
+    async def _goal_outsider_notice(self, message) -> None:
+        """Answer a mention of a bot the goal has not staffed.
+
+        Marked with the goal-notice marker, so the participants who hear
+        everything in this room do not each spend a turn reading a refusal
+        addressed to somebody else. Best effort: a failure here must not
+        raise into the gateway handler, and the worst case is the silence
+        this exists to remove.
+        """
+        try:
+            from src.core.goal_notice import mark
+            await message.channel.send(mark(
+                f"<@{message.author.id}> **{self.account_name}** is not on this "
+                f"goal, so it will not answer here. Ask the goal's owner to add "
+                f"it with `goal_add_member`, which needs a reason and the "
+                f"owner's approval."
+            ))
+        except Exception as e:
+            logger.error(f"[{self.account_name}] goal outsider notice failed: {e}")
 
     async def _handle_goal_reaction(self, payload: discord.RawReactionActionEvent,
                                     emoji: str) -> bool:

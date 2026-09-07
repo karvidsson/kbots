@@ -172,7 +172,7 @@ def _watching_bot():
 
     b.connector = SimpleNamespace(
         config={},
-        get_agent_for_channel=lambda ch, acct, cat=None, mentioned=False: "atlas",
+        get_agent_for_channel=lambda ch, acct, cat=None: "atlas",
         _agent_configs={"atlas": {"routing": {"discord": {
             "mentions": True, "watch_channels": ["555"]}}}},
         emit=emit,
@@ -211,3 +211,50 @@ def _recorder(sink):
         sink.append(content)
         return SimpleNamespace(id=1)
     return send
+
+
+# --- a mention of an agent the goal has not staffed ---
+
+def _outsider_bot():
+    """A bot whose agent is NOT routed for this goal channel."""
+    b, emitted = _watching_bot()
+    sent = []
+
+    async def _send(content):
+        sent.append(content)
+
+    b.connector.get_agent_for_channel = lambda ch, acct, cat=None: None
+    b.connector.is_goal_channel = lambda ch: str(ch) == "555"
+    b.account_name = "atlas"
+    return b, emitted, sent, _send
+
+
+async def test_a_mention_of_an_unstaffed_agent_is_answered_not_dropped():
+    """Silence reads as a broken bot and gets retried. Say it once instead."""
+    bot, emitted, sent, send = _outsider_bot()
+    msg = _bot_msg("@Atlas can you look at this?")
+    msg.author = SimpleNamespace(id=42, bot=False, display_name="Sender")
+    msg.channel = SimpleNamespace(id=555, category_id=None, name="goal-ship-it",
+                                  send=send)
+    msg.mentions = [bot.client.user]
+
+    await bot.on_message(msg)
+
+    assert emitted == []                       # no model turn for the outsider
+    assert len(sent) == 1
+    assert goal_notice.is_system_notice(sent[0])   # and none for the room
+    assert "goal_add_member" in sent[0]
+
+
+async def test_a_mention_outside_a_goal_room_is_untouched():
+    """The rule is about goal rooms; ordinary channels keep their routing."""
+    bot, emitted, sent, send = _outsider_bot()
+    bot.connector.is_goal_channel = lambda ch: False
+    msg = _bot_msg("@Atlas hello")
+    msg.author = SimpleNamespace(id=42, bot=False, display_name="Sender")
+    msg.channel = SimpleNamespace(id=777, category_id=None, name="general",
+                                  send=send)
+    msg.mentions = [bot.client.user]
+
+    await bot.on_message(msg)
+    assert sent == []                          # nothing said, nothing routed

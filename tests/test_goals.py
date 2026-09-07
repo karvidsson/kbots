@@ -240,14 +240,17 @@ def test_goal_channel_routes_nobody_but_participants():
     assert conn.get_agent_for_channel("42", "ghost-bot") is None
 
 
-def test_a_mention_still_reaches_a_non_participant():
-    """Being pinged is somebody deciding to bring you in; the wildcard match
-    is an accident of config. A goal team asking an outside specialist a
-    direct question must still reach them, or the ask dies in silence.
+def test_a_mention_does_not_get_a_non_participant_into_a_goal_room():
+    """A mention is not a way onto a goal.
 
-    Note the mention need not be typed as markup: _linkify_mentions rewrites
-    plain "@Name" into a real <@id> at send time, so prose that addresses an
-    agent by name becomes a genuine ping by the time it lands.
+    It used to be, on the reasoning that being pinged is somebody deciding to
+    bring you in. The audit says otherwise: seven turns by non-members in one
+    day, every one of them by mention from inside the room. goal_add_member
+    exists so joining is a decision a human makes once and can see; a mention
+    route makes it a decision any participant makes silently and repeatedly.
+
+    Nothing is dropped in silence — the connector answers the mention with a
+    marked notice instead (see test_goal_notices).
     """
     from src.connectors.discord import DiscordConnector
     goal = _mk("brainstorm", channel="42", owner="maya")
@@ -257,8 +260,12 @@ def test_a_mention_still_reaches_a_non_participant():
         "maya": {"routing": {"discord": {"account": "maya-bot"}}},
         "rio": {"routing": {"discord": {"account": "rio-bot"}}},
     }
+    # both directions: the participant routes, the outsider does not, and a
+    # mention changes neither answer
+    assert conn.get_agent_for_channel("42", "maya-bot") == "maya"
     assert conn.get_agent_for_channel("42", "rio-bot") is None
-    assert conn.get_agent_for_channel("42", "rio-bot", mentioned=True) == "rio"
+    assert conn.is_goal_channel("42") is True
+    assert conn.is_goal_channel("999") is False
 
 
 def test_ordinary_channel_keeps_the_wildcard_fallback():
