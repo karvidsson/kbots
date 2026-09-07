@@ -25,13 +25,15 @@ Config (under the agent's llm block or defaults.llm):
   sandbox: workspace-write    # read-only | workspace-write | danger-full-access
   approval_policy: on-request # on-request | never
   approvals_reviewer: auto_review  # user | auto_review
-  timeout: 600                # seconds per turn
+  timeout: 3600               # seconds the turn may run
+  resume_startup_timeout: 600 # seconds a RESUMED session may take to come up
 
 Limitations (v1): per-tool allow/deny lists are not mapped — MCP exposure is
 per-server; shell/file access is governed by the codex sandbox instead.
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -39,7 +41,12 @@ import re
 from pathlib import Path
 
 from src.core.base import LLMProvider, LLMResponse, Message, agent_session_dirs
-from src.llm.claude_code import build_cli_prompt
+from src.llm.claude_code import (
+    _RESUME_STARTUP_TIMEOUT,
+    _STREAM_LIMIT,
+    _StartupTimeoutError,
+    build_cli_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +184,14 @@ class CodexCLIProvider(LLMProvider):
             "approvals_reviewer", "auto_review")
         self._validate_execution_policy(
             self._sandbox, self._approval_policy, self._approvals_reviewer)
-        self._timeout = float(config.get("timeout", 600))
+        # Same two deadlines, same defaults, as claude_code. 600 used to be a
+        # cap on the whole turn here, which killed turns that were merely long
+        # and reported them as a timeout with no partial output. A resumed
+        # session still gets a liveness deadline, because only a resume can
+        # fail by never coming up at all.
+        self._timeout = float(config.get("timeout", 3600))
+        self._startup_timeout = float(
+            config.get("resume_startup_timeout", _RESUME_STARTUP_TIMEOUT))
 
     @staticmethod
     def _validate_execution_policy(sandbox, approval_policy, approvals_reviewer) -> None:
@@ -247,7 +261,13 @@ class CodexCLIProvider(LLMProvider):
             )
             logger.debug(f"{tag}codex exec: cwd={cwd} model={model} "
                          f"resume={resuming} prompt_len={len(prompt)}")
-            result = await self._run(args, cwd, env, tag)
+            # `timeout` asks how long the turn may run and is the same either
+            # way; `startup` asks whether the CLI came up, and only a resume
+            # can fail that way.
+            result = await self._run(
+                args, cwd, env, tag,
+                timeout=float(kwargs.get("timeout") or self._timeout),
+                startup=self._startup_timeout if resuming else None)
             if result is not None:
                 return result
             if resuming:
@@ -286,19 +306,38 @@ class CodexCLIProvider(LLMProvider):
         args.append(prompt if prompt else "Continue.")
         return args
 
-    async def _run(self, args, cwd, env, tag) -> LLMResponse | None:
+    async def _run(self, args, cwd, env, tag, timeout: float,
+                   startup: float | None) -> LLMResponse | None:
         """One codex exec invocation. None = retriable failure (resume drop)."""
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=str(cwd), env=env,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            limit=_STREAM_LIMIT,
         )
+        # stdin is DEVNULL rather than inherited. `codex exec` announces
+        # "Reading additional input from stdin..." on every run, so an inherited
+        # stdin that never reaches EOF would block the whole turn until the
+        # deadline. It happens to be /dev/null under launchd; that is luck.
+        started = asyncio.Event()
+        run_task = asyncio.ensure_future(self._collect(proc, started))
         try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(), timeout=self._timeout)
+            if startup is not None:
+                await self._await_startup(started, run_task, startup)
+            stdout, stderr = await asyncio.wait_for(run_task, timeout=timeout)
+        except _StartupTimeoutError:
+            proc.kill()
+            logger.warning(f"{tag}codex resume produced no event in "
+                           f"{startup:.0f}s — dropping resume")
+            return None          # retriable: complete() falls back to fresh
         except asyncio.TimeoutError:
             proc.kill()
-            raise RuntimeError(
-                f"codex exec timed out after {self._timeout:.0f}s")
+            raise RuntimeError(f"codex exec timed out after {timeout:.0f}s")
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+                with contextlib.suppress(BaseException):
+                    await run_task
 
         thread_id, content, tokens = self._parse_events(stdout, tag)
         if proc.returncode != 0 or content is None:
@@ -317,6 +356,50 @@ class CodexCLIProvider(LLMProvider):
             stop_reason="stop",
             session_id=thread_id,
         )
+
+    @staticmethod
+    async def _collect(proc, started: asyncio.Event) -> tuple[bytes, bytes]:
+        """Read the process to completion, flagging the first JSONL event.
+
+        communicate() gives no signal until the process exits, so there was no
+        way to tell "the CLI never came up" from "the turn is long". Reading
+        line by line costs nothing and makes the first event observable.
+        """
+        out: list[bytes] = []
+
+        async def _stdout() -> None:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    return
+                out.append(line)
+                if not started.is_set() and line.lstrip().startswith(b"{"):
+                    started.set()
+
+        err_task = asyncio.ensure_future(proc.stderr.read())
+        await _stdout()
+        stderr = await err_task
+        await proc.wait()
+        return b"".join(out), stderr
+
+    @staticmethod
+    async def _await_startup(started: asyncio.Event, run_task,
+                             timeout: float) -> None:
+        """Wait for the first event, or for the run to end on its own.
+
+        A process that exits early (bad flag, auth failure) must not sit here
+        until the liveness deadline: its own completion is the answer.
+        """
+        waiter = asyncio.ensure_future(started.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {waiter, run_task}, timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                raise _StartupTimeoutError(int(timeout))
+        finally:
+            if not waiter.done():
+                waiter.cancel()
 
     @staticmethod
     def _parse_events(stdout: bytes, tag: str) -> tuple[str | None, str | None, int | None]:
