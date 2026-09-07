@@ -195,7 +195,7 @@ def store(tmp_path):
 
 def test_the_rest_can_be_taken_by_message_id(store):
     store.put("123", "the rest of it")
-    assert store.take("123") == "the rest of it"
+    assert store.take("123").rest == "the rest of it"
 
 
 def test_the_rest_survives_a_restart(tmp_path):
@@ -203,8 +203,9 @@ def test_the_rest_survives_a_restart(tmp_path):
     and a restart between the short message and the tap on the reaction would
     otherwise strand the rest with no way to ask for it again.
     """
-    OverflowStore(tmp_path / "overflow").put("123", "the rest of it")
-    assert OverflowStore(tmp_path / "overflow").take("123") == "the rest of it"
+    OverflowStore(tmp_path / "overflow").put("123", "the rest of it", account="maya-bot")
+    kept = OverflowStore(tmp_path / "overflow").take("123")
+    assert (kept.rest, kept.account) == ("the rest of it", "maya-bot")
 
 
 def test_taking_the_rest_twice_gives_nothing_the_second_time(store):
@@ -218,7 +219,7 @@ def test_more_works_without_pointing_at_a_message(store):
     to its most recent shortened reply.
     """
     store.put("123", "the rest", channel_id="chan")
-    assert store.take_latest_for_channel("chan") == "the rest"
+    assert store.take_latest_for_channel("chan").rest == "the rest"
     assert store.take_latest_for_channel("chan") is None
 
 
@@ -246,7 +247,7 @@ def test_old_remainders_are_dropped(tmp_path):
     os.utime(path, (time.time() - 7200, time.time() - 7200))
     store.put("new", "fresh text")     # any write prunes
     assert store.take("old") is None
-    assert store.take("new") == "fresh text"
+    assert store.take("new").rest == "fresh text"
 
 
 def test_the_store_is_bounded(tmp_path):
@@ -320,8 +321,9 @@ def connector(tmp_path, monkeypatch):
                                             "threshold_chars": 300}}}},
         str(tmp_path))
     channel = _FakeChannel()
-    bot = types.SimpleNamespace(client=types.SimpleNamespace(
-        get_channel=lambda _id: channel))
+    bot = types.SimpleNamespace(
+        account_name="maya-bot",
+        client=types.SimpleNamespace(get_channel=lambda _id: channel))
     monkeypatch.setattr(conn, "_get_bot", lambda _name=None: bot)
 
     async def passthrough(content, _channel):
@@ -361,6 +363,55 @@ async def test_the_rest_is_addressed_to_the_channel_it_came_from(connector):
     sent = await conn.send("555", LONG)
     assert conn._shortener.store.take_latest_for_channel("555")
     assert conn._shortener.store.take(str(sent.id)) is None, "taken twice"
+
+
+# --- the remainder is owed by a particular bot ---
+
+async def test_the_rest_remembers_which_bot_owes_it(connector):
+    conn, _ = connector
+    sent = await conn.send("555", LONG)
+    assert conn._shortener.store.take(str(sent.id)).account == "maya-bot"
+
+
+def _expander(account_name, store):
+    """A gateway client that did NOT post the shortened message."""
+    from src.connectors.discord import DiscordBot
+    b = DiscordBot.__new__(DiscordBot)
+    b.account_name = account_name
+    sends = []
+
+    async def send(channel_id, content, **kwargs):
+        sends.append((kwargs.get("bot_account"), content))
+
+    b.connector = types.SimpleNamespace(send=send)
+    b._shortener_store = store
+    return b, sends
+
+
+async def test_a_losing_client_expands_under_the_authors_name(tmp_path):
+    """Every client sees the 🔍 and the take is first-come, so the winner is
+    arbitrary. It emitted the rest under its OWN name: five times in one hour
+    another agent's words appeared over an uninvolved agent's, and one of the
+    fabricated attributions was believed and became a work item.
+    """
+    store = OverflowStore(tmp_path / "overflow")
+    store.put("7", "the rest of the argument", account="maya-bot")
+    bot, sends = _expander("kai-bot", store)
+
+    await bot._send_overflow("555", store.take("7"), "🔍 reaction")
+    assert sends == [("maya-bot", "the rest of the argument")]
+
+
+async def test_an_unattributed_remainder_falls_back_to_the_sender(tmp_path):
+    """Remainders written by an older build carry no account. Losing the name
+    is not a reason to lose the text."""
+    store = OverflowStore(tmp_path / "overflow")
+    (tmp_path / "overflow").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "overflow" / "7.md").write_text("legacy text", encoding="utf-8")
+    bot, sends = _expander("kai-bot", store)
+
+    await bot._send_overflow("555", store.take("7"), "more")
+    assert sends == [("kai-bot", "legacy text")]
 
 
 async def test_shortening_is_skipped_when_the_reply_carries_a_file(connector, tmp_path):

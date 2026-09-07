@@ -248,8 +248,10 @@ class _FakeStore:
         self.taken = []
 
     def take(self, message_id):
+        from src.core.reply_shorten import Overflow
         self.taken.append(message_id)
-        return self.payloads.pop(message_id, None)
+        rest = self.payloads.pop(message_id, None)
+        return None if rest is None else Overflow(rest, "main")
 
 
 async def _run_reaction(handler_self, message_id, user_id, emoji="\U0001f50d"):

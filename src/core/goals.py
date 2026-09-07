@@ -287,21 +287,20 @@ def get_goal_by_channel(channel_id: str,
     return dict(row) if row else None
 
 
-def is_retired_goal_channel(channel_id: str) -> bool:
-    """True if a goal owns this channel and none of them are still routed.
+def is_goal_channel(channel_id: str) -> bool:
+    """True if any goal owns this channel, whatever its status.
 
-    A goal channel outlives the goal. Once the goal is abandoned or done the
-    room stays in Discord, stays in the agents' session history, and is
-    therefore the freshest thing `_latest_session_channel` can find for
-    precisely the agents who worked hardest in it — so a later message to one
-    of them lands in a dead room nobody is reading.
+    A goal channel outlives the goal: the room stays in Discord and in the
+    agents' session history, so it is the freshest thing
+    `_latest_session_channel` can find for precisely the agents who worked
+    hardest in it. This used to ask only whether the goal was retired, which
+    let a LIVE goal's room become an agent's inbox — unrelated mail then
+    arrived carrying that goal's context, in front of its participants, and
+    read as work on it. Both are wrong destinations, so neither is a home.
     """
-    channel_id = str(channel_id)
     row = _get_db().execute(
-        "SELECT 1 FROM goals WHERE channel_id=? LIMIT 1", (channel_id,)).fetchone()
-    if not row:
-        return False          # not a goal channel at all
-    return get_goal_by_channel(channel_id) is None
+        "SELECT 1 FROM goals WHERE channel_id=? LIMIT 1", (str(channel_id),)).fetchone()
+    return row is not None
 
 
 def list_goals(statuses: tuple | None = None) -> list[dict]:

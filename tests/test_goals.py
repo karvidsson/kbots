@@ -211,11 +211,85 @@ def test_goal_channel_routes_participant_without_config():
     }
     assert conn.get_agent_for_channel("42", "maya-bot") == "maya"
     assert conn.get_agent_for_channel("42", "kai-bot") == "kai"
-    # Non-participant account: nothing routed
-    conn._agent_configs["rio"] = {"routing": {"discord": {"account": "rio-bot"}}}
-    del conn._agent_configs["rio"]
-    # Explicit channel match still wins over goal routing
+    # An ordinary channel is untouched by goal routing.
     assert conn.get_agent_for_channel("777", "maya-bot") == "maya"
+
+
+def test_goal_channel_routes_nobody_but_participants():
+    """The wildcard fallback used to run after the goal lookup, so a bot whose
+    agent is not a participant still resolved — by category, by wildcard, or as
+    the DM fallback. Every agent on a real fleet routes with an empty channels
+    list, so that meant the whole fleet took a turn on every message in a goal
+    room, under a goal's context, in front of its participants.
+    """
+    from src.connectors.discord import DiscordConnector
+    goal = _mk("brainstorm", channel="42", owner="maya")
+    store.add_participant(goal["id"], "kai")
+    conn = DiscordConnector.__new__(DiscordConnector)
+    conn._agent_configs = {
+        "maya": {"routing": {"discord": {"account": "maya-bot"}}},
+        "kai": {"routing": {"discord": {"account": "kai-bot"}}},
+        "rio": {"routing": {"discord": {"account": "rio-bot"}}},   # wildcard
+    }
+    assert conn.get_agent_for_channel("42", "rio-bot") is None
+    # ... and with a category, which reaches the category branch instead.
+    assert conn.get_agent_for_channel("42", "rio-bot", category_id="c1") is None
+    # Participants still route.
+    assert conn.get_agent_for_channel("42", "kai-bot") == "kai"
+    # A bot with no agent at all resolves to nothing rather than raising.
+    assert conn.get_agent_for_channel("42", "ghost-bot") is None
+
+
+def test_a_mention_does_not_get_a_non_participant_into_a_goal_room():
+    """A mention is not a way onto a goal.
+
+    It used to be, on the reasoning that being pinged is somebody deciding to
+    bring you in. The audit says otherwise: seven turns by non-members in one
+    day, every one of them by mention from inside the room. goal_add_member
+    exists so joining is a decision a human makes once and can see; a mention
+    route makes it a decision any participant makes silently and repeatedly.
+
+    Nothing is dropped in silence — the connector answers the mention with a
+    marked notice instead (see test_goal_notices).
+    """
+    from src.connectors.discord import DiscordConnector
+    goal = _mk("brainstorm", channel="42", owner="maya")
+    store.add_participant(goal["id"], "kai")
+    conn = DiscordConnector.__new__(DiscordConnector)
+    conn._agent_configs = {
+        "maya": {"routing": {"discord": {"account": "maya-bot"}}},
+        "rio": {"routing": {"discord": {"account": "rio-bot"}}},
+    }
+    # both directions: the participant routes, the outsider does not, and a
+    # mention changes neither answer
+    assert conn.get_agent_for_channel("42", "maya-bot") == "maya"
+    assert conn.get_agent_for_channel("42", "rio-bot") is None
+    assert conn.is_goal_channel("42") is True
+    assert conn.is_goal_channel("999") is False
+
+
+def test_ordinary_channel_keeps_the_wildcard_fallback():
+    """The goal rule must not cost non-goal channels their routing."""
+    from src.connectors.discord import DiscordConnector
+    conn = DiscordConnector.__new__(DiscordConnector)
+    conn._agent_configs = {"rio": {"routing": {"discord": {"account": "rio-bot"}}}}
+    assert conn.get_agent_for_channel("999", "rio-bot") == "rio"
+
+
+def test_goal_routing_failure_leaves_ordinary_routing_intact(monkeypatch):
+    """A goals store that cannot be read must not take every channel offline.
+    Refusing everything is the safe-looking answer and the wrong one: it
+    silences the whole fleet on a store error."""
+    from src.connectors.discord import DiscordConnector
+
+    def boom(_channel_id):
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(store, "routed_participants_for_channel", boom)
+    conn = DiscordConnector.__new__(DiscordConnector)
+    conn._agent_configs = {"rio": {"routing": {"discord": {"account": "rio-bot"}}}}
+    assert conn._goal_participants("42") == []
+    assert conn.get_agent_for_channel("42", "rio-bot") == "rio"
 
 
 def test_goal_turn_budget_overrides_chain_limit():

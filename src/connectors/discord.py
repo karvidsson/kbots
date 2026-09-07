@@ -281,7 +281,11 @@ class DiscordConnector(Connector):
                 first_msg = sent
 
         if rest and first_msg is not None:
-            self._shortener.store.put(str(first_msg.id), rest, channel_id=str(channel_id))
+            # The account is stored with the rest: whichever client wins the
+            # take must speak as the bot that owes the words, not as itself.
+            self._shortener.store.put(str(first_msg.id), rest,
+                                      channel_id=str(channel_id),
+                                      account=getattr(bot, "account_name", None))
             try:
                 # Pre-added by the bot, so expanding is a tap on a control that
                 # is already there rather than something to remember.
@@ -531,10 +535,34 @@ class DiscordConnector(Connector):
                               category_id: str | None = None) -> str | None:
         """Find which agent handles messages in this channel from this bot.
 
-        Priority: specific channel > category > wildcard (empty channels list).
-        Each bot account is an independent Discord client, so routing is
-        scoped to the bot_account — other bots' claims are irrelevant.
+        Priority: goal channel (participants only) > specific channel >
+        category > wildcard (empty channels list). Each bot account is an
+        independent Discord client, so routing is scoped to the bot_account —
+        other bots' claims are irrelevant.
         """
+        # A goal channel belongs to its goal, and only its participants may be
+        # resolved for it. This has to come FIRST and it has to stop here:
+        # every agent on this fleet routes with an empty channels list, so
+        # every bot client would otherwise match the wildcard below and the
+        # whole fleet would take a turn on every message in a goal room.
+        #
+        # A mention is NOT an exception. It used to be, on the reasoning that
+        # being pinged is somebody deciding to bring you in. The audit says
+        # otherwise: seven turns by non-members in one day, every one of them
+        # arriving by mention from inside the room. goal_add_member exists so
+        # that joining a goal is a decision a human makes once and can see;
+        # a mention route makes it a decision any participant makes silently,
+        # as often as it likes. The caller answers the mention instead (see
+        # _goal_outsider_notice) so nothing is dropped without a word.
+        goal_participants = self._goal_participants(channel_id)
+        if goal_participants:
+            for agent_id, agent_cfg in self._agent_configs.items():
+                routing = agent_cfg.get("routing", {}).get("discord", {})
+                if (routing.get("account", "default") == bot_account
+                        and agent_id in goal_participants):
+                    return agent_id
+            return None
+
         wildcard_agent = None
         category_agent = None
         dm_fallback_agent = None
@@ -556,22 +584,25 @@ class DiscordConnector(Connector):
             if category_id is None and dm_fallback_agent is None:
                 dm_fallback_agent = agent_id
 
-        # Goal channels route dynamically: a participant of a live goal is
-        # bound to its channel by the goal store, with no agents.yaml entry.
-        # One Discord app per agent, so at most one participant per account.
+        return category_agent or wildcard_agent or dm_fallback_agent
+
+    def is_goal_channel(self, channel_id: str) -> bool:
+        """True if a live goal owns this channel."""
+        return bool(self._goal_participants(channel_id))
+
+    @staticmethod
+    def _goal_participants(channel_id: str) -> list[str]:
+        """Agents routed into this channel by a live goal.
+
+        Empty for an ordinary channel, and empty when the goals store cannot
+        be read — a store that is down must not take every channel offline.
+        """
         try:
             from src.core import goals
-            participants = goals.routed_participants_for_channel(channel_id)
-            if participants:
-                for agent_id, agent_cfg in self._agent_configs.items():
-                    routing = agent_cfg.get("routing", {}).get("discord", {})
-                    if (routing.get("account", "default") == bot_account
-                            and agent_id in participants):
-                        return agent_id
+            return goals.routed_participants_for_channel(channel_id)
         except Exception:
             logger.debug("goal routing lookup failed", exc_info=True)
-
-        return category_agent or wildcard_agent or dm_fallback_agent
+            return []
 
 
 class DiscordBot:
@@ -1156,11 +1187,9 @@ class DiscordBot:
         shortener = getattr(self.connector, "_shortener", None)
         if (shortener and shortener.enabled and not message.author.bot
                 and wants_more(message.content)):
-            rest = shortener.store.take_latest_for_channel(str(message.channel.id))
-            if rest:
-                await self.connector.send(str(message.channel.id), rest,
-                                          bot_account=self.account_name,
-                                          no_shorten=True)
+            entry = shortener.store.take_latest_for_channel(str(message.channel.id))
+            if entry:
+                await self._send_overflow(str(message.channel.id), entry, "more")
                 return
         if not is_mentioned and self.client.user:
             # Check role mentions — Discord auto-creates a managed role for
@@ -1193,6 +1222,11 @@ class DiscordBot:
         )
 
         if not agent_id:
+            # Pinged in a goal room this bot is not staffed on. Say so once,
+            # as a marked notice so it costs nobody a turn, rather than
+            # dropping it: silence reads as a broken bot and gets retried.
+            if is_mentioned and self.connector.is_goal_channel(str(message.channel.id)):
+                await self._goal_outsider_notice(message)
             return
 
         agent_cfg = self.connector._agent_configs.get(agent_id, {})
@@ -1216,6 +1250,15 @@ class DiscordBot:
         # or the channel is explicitly watched
         if message.author.bot:
             if not (is_mentioned or is_watched):
+                return
+
+            # The goals feature's own confirmations are posted into the room
+            # the participants are watching, so without this each one woke
+            # every participant and spent a turn on a message none of them
+            # could act on. The marker travels on the message, so this needs
+            # no shared state and cannot lose a race against the gateway.
+            from src.core.goal_notice import is_system_notice
+            if is_system_notice(message.content):
                 return
 
             # Chain breaker — too many bot-triggered turns with no human around.
@@ -1294,11 +1337,10 @@ class DiscordBot:
         # with nothing in the logs to say why.
         shortener = getattr(self.connector, "_shortener", None)
         if shortener and emoji == shortener.emoji:
-            rest = shortener.store.take(str(payload.message_id))
-            if rest:
-                await self.connector.send(str(payload.channel_id), rest,
-                                          bot_account=self.account_name,
-                                          no_shorten=True)
+            entry = shortener.store.take(str(payload.message_id))
+            if entry:
+                await self._send_overflow(str(payload.channel_id), entry,
+                                          f"{shortener.emoji} reaction")
                 return
 
         # Reveal what a sanitize alert would have stripped. Same emoji as the
@@ -1368,6 +1410,65 @@ class DiscordBot:
         except Exception as e:
             logger.error(f"HITL reaction handling failed: {e}", exc_info=True)
 
+    async def _send_overflow(self, channel_id: str, entry, trigger: str) -> None:
+        """Post a held-back remainder as the bot that owes it.
+
+        Every client sees the 🔍 and the "more", and the take is first-come, so
+        the winner used to emit the rest under its own name. Expansions also
+        logged nothing at all, which is why five misattributed posts left no
+        trace in the log to find them by.
+        """
+        account = entry.account or self.account_name
+        if entry.account and entry.account != self.account_name:
+            logger.debug(f"[{self.account_name}] won the overflow take for "
+                         f"'{entry.account}' — sending as them")
+        logger.info(f"[{account}] reply-shorten: sending {len(entry.rest)} held "
+                    f"chars to {channel_id} ({trigger})")
+        await self.connector.send(channel_id, entry.rest,
+                                  bot_account=account, no_shorten=True)
+
+    def _owns_goal_reaction(self, payload: discord.RawReactionActionEvent,
+                            owner_agent: str) -> bool:
+        """Whether THIS client should act on a reaction every client can see.
+
+        The card's author is the right actor: it is a bot that is demonstrably
+        in the channel, and Discord tells us who it is. `message_author_id` is
+        optional in the gateway payload, though, so when it is missing the
+        clients elect the goal owner's bot instead of racing. Electing beats
+        racing even when the elected bot turns out not to be in the channel:
+        a missing confirmation is visible, a confirmation under the wrong
+        agent's name is misinformation.
+        """
+        me = getattr(self.client.user, "id", None)
+        author_id = getattr(payload, "message_author_id", None)
+        if author_id is not None:
+            return me is not None and author_id == me
+        account = self.connector._find_bot_for_agent(owner_agent)
+        if not account:
+            logger.debug(f"goal reaction: no bot account for owner '{owner_agent}'")
+            return False
+        return account == self.account_name
+
+    async def _goal_outsider_notice(self, message) -> None:
+        """Answer a mention of a bot the goal has not staffed.
+
+        Marked with the goal-notice marker, so the participants who hear
+        everything in this room do not each spend a turn reading a refusal
+        addressed to somebody else. Best effort: a failure here must not
+        raise into the gateway handler, and the worst case is the silence
+        this exists to remove.
+        """
+        try:
+            from src.core.goal_notice import mark
+            await message.channel.send(mark(
+                f"<@{message.author.id}> **{self.account_name}** is not on this "
+                f"goal, so it will not answer here. Ask the goal's owner to add "
+                f"it with `goal_add_member`, which needs a reason and the "
+                f"owner's approval."
+            ))
+        except Exception as e:
+            logger.error(f"[{self.account_name}] goal outsider notice failed: {e}")
+
     async def _handle_goal_reaction(self, payload: discord.RawReactionActionEvent,
                                     emoji: str) -> bool:
         """✅/❌ on a goal nomination or kickoff card. True if it was ours.
@@ -1375,6 +1476,7 @@ class DiscordBot:
         Returns True only when the message really is a goal card, so an
         unrelated ✅ falls through to HITL exactly as before.
         """
+        from src.core import goal_notice
         from src.core import goals as store
         try:
             message_id = str(payload.message_id)
@@ -1386,6 +1488,13 @@ class DiscordBot:
             # agents' turns, so it is an admin's call, not any reader's.
             if not self._is_admin(payload.user_id):
                 return True
+            # Every gateway client sees this reaction. Exactly one must act, or
+            # the confirmation goes out under whichever bot won the race to
+            # decide_nomination, which is how a nomination for one agent came
+            # back announced by an unrelated one.
+            owner = (goal or store.get_goal(nom["goal_id"]) or {}).get("owner_agent", "")
+            if not self._owns_goal_reaction(payload, owner):
+                return True  # a goal card, handled by another client
             channel = (self.client.get_channel(payload.channel_id)
                        or await self.client.fetch_channel(payload.channel_id))
             user = f"<@{payload.user_id}>"
@@ -1396,8 +1505,8 @@ class DiscordBot:
                                                approved, str(payload.user_id)):
                     return True  # already decided; a second reaction changes nothing
                 verb = "added to" if approved else "kept off"
-                await channel.send(
-                    f"{emoji} **{nom['agent_id']}** {verb} `{nom['goal_id']}` (by {user}).")
+                await channel.send(goal_notice.mark(
+                    f"{emoji} **{nom['agent_id']}** {verb} `{nom['goal_id']}` (by {user})."))
                 logger.info(f"Goal {nom['goal_id']}: {nom['agent_id']} "
                             f"{'approved' if approved else 'declined'} by {payload.user_id}")
                 return True
@@ -1409,9 +1518,9 @@ class DiscordBot:
                     if p["agent_id"] != goal["owner_agent"]]
             note = (f" {len(pending)} nomination(s) still undecided — they stay "
                     f"off unless you approve them." if pending else "")
-            await channel.send(
+            await channel.send(goal_notice.mark(
                 f"✅ `{goal['id']}` approved by {user}. Team: "
-                f"{', '.join(team) or 'owner only'}.{note}")
+                f"{', '.join(team) or 'owner only'}.{note}"))
             # The owner starts it, not this handler: advancing out of 'proposed'
             # is where an anchored goal acquires its own channel, and that lives
             # in goal_set. Driving it from here would need a second copy.
