@@ -292,17 +292,22 @@ def test_goal_routing_failure_leaves_ordinary_routing_intact(monkeypatch):
     assert conn.get_agent_for_channel("42", "rio-bot") == "rio"
 
 
-def test_goal_turn_budget_overrides_chain_limit():
+def test_goal_turn_budget_is_one_ledger_in_the_store():
+    """Budget 3: turns 1-3 pass, the 4th is over and announces once, the 5th
+    is over and silent. Counted in the store, so every entry path and every
+    gateway client charge the same number (tests/test_goal_lifecycle.py
+    covers the AgentManager side)."""
     goal = _mk("executing", channel="42", budget=3)
-    bot = _bot({"maya": {"routing": {"discord": {"account": "main"}}}})
-    now = time.monotonic()
-    results = [bot._bot_chain_check(42, from_bot=True, now=now + i)
-               for i in range(5)]
-    # budget 3: turns 1-3 pass, 4-5 suppressed (global default is 12)
-    assert results == [False, False, False, True, True]
+    results = [store.record_turn("42", "kai", "bot") for _ in range(5)]
+    assert [r["exhausted"] for r in results] == [False, False, False, True, True]
+    assert [r["announce"] for r in results] == [False, False, False, True, False]
     events = [e for e in store._get_db().execute(
         "SELECT kind FROM goal_events WHERE goal_id=?", (goal["id"],))]
-    assert ("budget_exhausted",) in [tuple(e) for e in events]
+    assert [tuple(e) for e in events].count(("budget_exhausted",)) == 1
+    # a goal-channel bot chain is the ledger's job now, not the connector's
+    bot = _bot({"maya": {"routing": {"discord": {"account": "main"}}}})
+    now = time.monotonic()
+    assert all(not bot._bot_chain_check(42, from_bot=True, now=now + i) for i in range(5))
 
 
 def test_non_goal_channel_keeps_global_limit():

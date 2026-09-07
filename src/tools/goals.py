@@ -239,6 +239,46 @@ async def _update_card(ctx: ToolContext, goal: dict) -> None:
         {"content": _card_text(goal)})
 
 
+# Discord permission bits denied on a retired goal's channel: SEND_MESSAGES,
+# CREATE_PUBLIC_THREADS, CREATE_PRIVATE_THREADS, SEND_MESSAGES_IN_THREADS.
+# Reading stays: the room is the record of the work.
+_ARCHIVE_DENY = (1 << 11) | (1 << 35) | (1 << 36) | (1 << 38)
+
+
+async def _archive_channel(ctx: ToolContext, goal: dict) -> str:
+    """Make a retired goal's channel read-only. Best effort; returns a note.
+
+    Retiring used to leave the room writable, so agents kept posting into a
+    goal nobody was routed to. A borrowed (anchored) home channel is never
+    touched: it belongs to the proposer, not to the goal.
+    """
+    if goal.get("anchored"):
+        return ""
+    if not ctx.vault or not goal.get("channel_id"):
+        return "channel not archived: no vault access"
+    from src.tools.discord_tools import _discord_get, _discord_patch
+    chan = await _discord_get(ctx.vault, f"/channels/{goal['channel_id']}")
+    if not chan or not isinstance(chan, dict) or chan.get("error") or not chan.get("guild_id"):
+        detail = (chan or {}).get("detail", "could not read the channel") \
+            if isinstance(chan, dict) else "could not read the channel"
+        return f"channel not archived: {detail}"
+    guild_id = str(chan["guild_id"])
+    overwrites = [o for o in (chan.get("permission_overwrites") or [])
+                  if str(o.get("id")) != guild_id]
+    overwrites.append({"id": guild_id, "type": 0, "allow": "0",
+                       "deny": str(_ARCHIVE_DENY)})
+    topic = (chan.get("topic") or "")
+    if not topic.startswith("["):
+        topic = f"[{goal['status']}] {topic}".strip()
+    result = await _discord_patch(
+        ctx.vault, f"/channels/{goal['channel_id']}",
+        {"permission_overwrites": overwrites, "topic": topic[:1000]})
+    if not result or result.get("error"):
+        return f"channel not archived: {(result or {}).get('detail', 'edit failed')}"
+    store.log_event(goal["id"], ctx.agent_id, "archived", "channel read-only")
+    return "channel archived read-only"
+
+
 def _card_text(goal: dict) -> str:
     parts = [f"🎯 **GOAL: {goal['title']}** (`{goal['id']}`) — **{goal['status']}**",
              goal["description"][:500]]
@@ -553,6 +593,10 @@ async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> st
     chan_note = ""
     if leaving_proposed and goal.get("anchored"):
         goal, chan_note = await _acquire_channel(ctx, goal, cfg)
+    # Retiring closes the room: nothing routes there any more, so nothing
+    # should be able to post there either.
+    if field == "status" and goal["status"] in ("done", "abandoned"):
+        chan_note = await _archive_channel(ctx, goal)
 
     await _update_card(ctx, goal)
     return (f"✅ `{goal['id']}` {field} → {kwargs[field]}. Status: "
@@ -827,6 +871,9 @@ async def goal_decide(ctx: ToolContext, decision_id: int, outcome: str,
             lines.append("🪦 Goal abandoned.")
         except ValueError as e:
             return f"ERROR: decision recorded but abandon failed: {e}"
+        note = await _archive_channel(ctx, goal)
+        if note:
+            lines.append(note)
     await _update_card(ctx, goal)
     return "\n".join(lines)
 

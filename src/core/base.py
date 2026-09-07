@@ -389,6 +389,10 @@ class IncomingMessage:
     # Skill invocation (set by slash command handler, None for regular messages)
     skill: str | None = None
     skill_params: dict | None = None
+    # What started this turn: "user" (a human), "bot" (another bot's message),
+    # "agent" (inter-agent delivery), "schedule", "job". A goal's turn budget
+    # counts everything but "user" (src/core/goals.py record_turn).
+    source: str = "user"
 
 
 class MessageRole(str, Enum):

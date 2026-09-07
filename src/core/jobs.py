@@ -396,6 +396,7 @@ class JobWatcher:
                      f"log: {job.get('log_path')}\n"
                      f"last lines:\n{tail}"),
             bot_account=job.get("bot_account") or None,
+            source="job",
         )
         asyncio.create_task(mgr.handle_message(agent_id, msg), name=f"job-{job['id']}")
 

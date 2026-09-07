@@ -1081,15 +1081,15 @@ class DiscordBot:
         chain = prev_count + 1
         self._bot_chain[channel_id] = (chain, now)
         limit = int(self.connector.config.get("bot_chain_limit", _BOT_CHAIN_LIMIT))
-        goal = None
         try:
-            # A sanctioned goal collaboration gets that goal's turn budget
-            # instead of the global limit. Restart-safe (a DB read), and the
-            # exemption ends the moment the goal pauses, blocks, or finishes.
+            # A goal channel is budgeted by the goal store, not by this chain:
+            # AgentManager.handle_message counts every turn there (bot, inter-
+            # agent, schedule, job) against one restart-safe number. This
+            # per-client tally would count only what THIS gateway client saw,
+            # once per client, which is how a budget of 30 became 30 per bot.
             from src.core import goals
-            goal = goals.active_goal_for_channel(str(channel_id))
-            if goal:
-                limit = int(goal["turn_budget"])
+            if goals.active_goal_for_channel(str(channel_id)):
+                return False
         except Exception:
             logger.debug("goal budget lookup failed", exc_info=True)
         if chain > limit:
@@ -1099,34 +1099,8 @@ class DiscordBot:
                     f"channel {channel_id} with no human message — going quiet until "
                     f"a human posts"
                 )
-                if goal:
-                    self._announce_budget_exhausted(channel_id, goal)
             return True
         return False
-
-    def _announce_budget_exhausted(self, channel_id: int, goal: dict) -> None:
-        """Make the goal channel's silence legible: one system line + an event."""
-        try:
-            from src.core import goals
-            goals.log_event(goal["id"], "system", "budget_exhausted",
-                            f"turn budget {goal['turn_budget']} reached")
-        except Exception:
-            logger.debug("budget_exhausted event failed", exc_info=True)
-        try:
-            channel = self.client.get_channel(channel_id)
-            if channel:
-                asyncio.create_task(self._safe_send(
-                    channel,
-                    f"⏸ Turn budget reached for goal `{goal['id']}` — waiting "
-                    f"for a human check-in before the team continues."))
-        except Exception:
-            logger.debug("budget notice failed", exc_info=True)
-
-    async def _safe_send(self, channel, content: str) -> None:
-        try:
-            await channel.send(content)
-        except discord.HTTPException:
-            logger.debug("budget notice send failed", exc_info=True)
 
     def _render_mentions(self, message: discord.Message) -> str:
         """Replace raw mention markup with readable @names.
@@ -1317,6 +1291,7 @@ class DiscordBot:
             raw=message,
             bot_account=self.account_name,
             watched=is_watched and not is_mentioned,
+            source="bot" if message.author.bot else "user",
         ))
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:

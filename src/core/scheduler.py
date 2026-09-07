@@ -105,6 +105,7 @@ class Scheduler:
             user_name="scheduler",
             content=f"⏰ Scheduled task: {schedule['instruction']}",
             bot_account=account,
+            source="schedule",
             # A schedule may fire a registered skill — the skill's own llm
             # pin / tool scoping (PR feat/skill-llm-pinning) then apply.
             skill=schedule.get("skill") or None,
