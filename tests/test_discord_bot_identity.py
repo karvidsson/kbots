@@ -1,9 +1,12 @@
 """An agent's Discord calls must use that agent's own bot account.
 
-Regression cover for the 403 "Missing Access" (code 50001) that engineer3 hit
-on 2026-09-06 uploading to its own DM: with no explicit bot= the in-process
-tool path authenticated as the shared main bot, which is not in that DM. It
-was misread as a sandbox egress block. See src/lib/discord_auth.py.
+Regression cover for a 403 "Missing Access" (code 50001) on an agent
+uploading to its own DM: with no explicit bot= the in-process tool path
+authenticated as the shared main bot, which is not in that DM. It was
+misread as a sandbox egress block. See src/lib/discord_auth.py.
+
+The agents here (atlas, beacon, quill, nomad) are fixtures. Core is
+published and must not name any deployment's real agents.
 """
 
 from unittest.mock import MagicMock
@@ -27,19 +30,19 @@ class StubVault:
 
 @pytest.fixture
 def overlay(tmp_path, monkeypatch):
-    """An overlay where engineer3 posts as itself and jarvis as 'main'."""
+    """An overlay where atlas posts as itself and beacon as 'main'."""
     (tmp_path / "config").mkdir(parents=True)
     (tmp_path / "config" / "agents.yaml").write_text(
         "agents:\n"
-        "  engineer3:\n"
+        "  atlas:\n"
         "    routing:\n"
         "      discord:\n"
-        "        account: engineer3\n"
-        "  jarvis:\n"
+        "        account: atlas\n"
+        "  beacon:\n"
         "    routing:\n"
         "      discord:\n"
         "        account: main\n"
-        "  redline: {}\n"
+        "  quill: {}\n"
         "  nomad: {}\n"
     )
     (tmp_path / "config" / "config.yaml").write_text(
@@ -48,10 +51,10 @@ def overlay(tmp_path, monkeypatch):
         "    accounts:\n"
         "      main:\n"
         "        token_key: discord-token\n"
-        "      engineer3:\n"
-        "        token_key: discord-engineer3\n"
-        "      redline:\n"
-        "        token_key: discord-redline\n"
+        "      atlas:\n"
+        "        token_key: discord-atlas\n"
+        "      quill:\n"
+        "        token_key: discord-quill\n"
     )
     monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
     monkeypatch.delenv("KBOTS_MODULES", raising=False)
@@ -61,7 +64,7 @@ def overlay(tmp_path, monkeypatch):
 # --- account and key resolution ---
 
 def test_account_comes_from_routing_not_the_name(overlay):
-    assert da.bot_account_for_agent("jarvis") == "main"
+    assert da.bot_account_for_agent("beacon") == "main"
 
 
 def test_account_falls_back_to_agent_name(overlay):
@@ -69,7 +72,7 @@ def test_account_falls_back_to_agent_name(overlay):
 
 
 def test_token_key_comes_from_connector_config(overlay):
-    assert da.token_key_for_account("engineer3") == "discord-engineer3"
+    assert da.token_key_for_account("atlas") == "discord-atlas"
 
 
 def test_token_key_defaults_for_unconfigured_account(overlay):
@@ -77,12 +80,12 @@ def test_token_key_defaults_for_unconfigured_account(overlay):
 
 
 def test_own_account_is_configured_via_routing(overlay):
-    assert da.own_account_for_agent("engineer3") == ("engineer3", True)
+    assert da.own_account_for_agent("atlas") == ("atlas", True)
 
 
 def test_own_account_is_configured_via_connector_accounts(overlay):
     """No discord routing on the agent, but the account exists in config."""
-    assert da.own_account_for_agent("redline") == ("redline", True)
+    assert da.own_account_for_agent("quill") == ("quill", True)
 
 
 def test_own_account_is_unconfigured_when_nothing_names_it(overlay):
@@ -92,39 +95,39 @@ def test_own_account_is_unconfigured_when_nothing_names_it(overlay):
 # --- the bug: no explicit bot must not mean "the main bot" ---
 
 def test_default_uses_the_calling_agents_own_token(overlay):
-    vault = StubVault({"discord-engineer3": "e3-tok", "discord-token": "main-tok"})
-    auth = da.resolve_bot_token(vault, agent_id="engineer3")
-    assert (auth.token, auth.account, auth.error) == ("e3-tok", "engineer3", None)
+    vault = StubVault({"discord-atlas": "atlas-tok", "discord-token": "main-tok"})
+    auth = da.resolve_bot_token(vault, agent_id="atlas")
+    assert (auth.token, auth.account, auth.error) == ("atlas-tok", "atlas", None)
 
 
 def test_default_does_not_reach_for_main_when_agent_has_an_account(overlay):
     """The precise 403 case: main's token would be accepted before this fix."""
-    vault = StubVault({"discord-engineer3": "e3-tok", "discord-token": "main-tok"})
-    assert da.resolve_bot_token(vault, agent_id="engineer3").token != "main-tok"
+    vault = StubVault({"discord-atlas": "atlas-tok", "discord-token": "main-tok"})
+    assert da.resolve_bot_token(vault, agent_id="atlas").token != "main-tok"
 
 
 def test_the_shared_active_alias_cannot_override_an_agents_own_bot(overlay):
     """active-discord-token is one mutable slot in a vault several agents
     share. It must never outrank the caller's own account, or whichever agent
     wrote it last decides who everyone else posts as."""
-    vault = StubVault({"discord-engineer3": "e3-tok", "active-discord-token": "someone-else"})
-    assert da.resolve_bot_token(vault, agent_id="engineer3").token == "e3-tok"
+    vault = StubVault({"discord-atlas": "atlas-tok", "active-discord-token": "someone-else"})
+    assert da.resolve_bot_token(vault, agent_id="atlas").token == "atlas-tok"
 
 
 def test_configured_account_without_a_token_fails_closed(overlay):
     """The agent has a bot of its own and its credential is missing. Sending
     as whoever the shared token belongs to is the bug, not the recovery."""
     vault = StubVault({"discord-token": "main-tok", "active-discord-token": "active-tok"})
-    auth = da.resolve_bot_token(vault, agent_id="engineer3")
+    auth = da.resolve_bot_token(vault, agent_id="atlas")
     assert auth.token is None
-    assert auth.account == "engineer3"
-    assert "engineer3" in auth.error and "discord-engineer3" in auth.error
+    assert auth.account == "atlas"
+    assert "atlas" in auth.error and "discord-atlas" in auth.error
 
 
 def test_account_configured_only_in_connector_config_also_fails_closed(overlay):
     vault = StubVault({"discord-token": "main-tok"})
-    auth = da.resolve_bot_token(vault, agent_id="redline")
-    assert auth.token is None and "redline" in auth.error
+    auth = da.resolve_bot_token(vault, agent_id="quill")
+    assert auth.token is None and "quill" in auth.error
 
 
 def test_agent_without_own_token_still_gets_the_shared_default(overlay):
@@ -161,7 +164,7 @@ def test_no_token_anywhere_is_an_error(overlay):
 
 
 def test_no_vault_is_an_error(overlay):
-    auth = da.resolve_bot_token(None, agent_id="engineer3")
+    auth = da.resolve_bot_token(None, agent_id="atlas")
     assert auth.token is None and "no vault access" in auth.error
 
 
@@ -170,13 +173,13 @@ def test_no_vault_is_an_error(overlay):
 def test_explicit_bot_uses_the_configured_token_key(overlay):
     """In-process the vault holds discord-<account>; only the MCP subprocess
     aliases it to discord-token-<account>. Looking at the alias alone missed."""
-    vault = StubVault({"discord-engineer3": "e3-tok", "discord-token": "main-tok"})
-    assert da.resolve_bot_token(vault, bot="engineer3").token == "e3-tok"
+    vault = StubVault({"discord-atlas": "atlas-tok", "discord-token": "main-tok"})
+    assert da.resolve_bot_token(vault, bot="atlas").token == "atlas-tok"
 
 
 def test_explicit_bot_accepts_the_mcp_alias(overlay):
-    vault = StubVault({"discord-token-engineer3": "e3-tok"})
-    assert da.resolve_bot_token(vault, bot="engineer3").token == "e3-tok"
+    vault = StubVault({"discord-token-atlas": "atlas-tok"})
+    assert da.resolve_bot_token(vault, bot="atlas").token == "atlas-tok"
 
 
 def test_explicit_bot_missing_never_falls_back(overlay):
@@ -187,17 +190,17 @@ def test_explicit_bot_missing_never_falls_back(overlay):
 
 
 def test_explicit_bot_ignores_the_calling_agents_token(overlay):
-    vault = StubVault({"discord-engineer3": "e3-tok"})
-    auth = da.resolve_bot_token(vault, bot="rescue", agent_id="engineer3")
+    vault = StubVault({"discord-atlas": "atlas-tok"})
+    auth = da.resolve_bot_token(vault, bot="rescue", agent_id="atlas")
     assert auth.token is None and "rescue" in auth.error
 
 
 # --- wired through the tools ---
 
 def test_headers_default_to_the_calling_agents_bot(overlay):
-    vault = StubVault({"discord-engineer3": "e3-tok", "discord-token": "main-tok"})
-    headers = _discord_headers(vault, agent_id="engineer3")
-    assert headers["Authorization"] == "Bot e3-tok"
+    vault = StubVault({"discord-atlas": "atlas-tok", "discord-token": "main-tok"})
+    headers = _discord_headers(vault, agent_id="atlas")
+    assert headers["Authorization"] == "Bot atlas-tok"
 
 
 def test_headers_without_agent_id_are_unchanged(overlay):
@@ -215,9 +218,9 @@ async def test_send_discord_file_authenticates_as_the_calling_agent(overlay, tmp
     monkeypatch.setattr("src.tools.discord_tools.resolve_bot_token", fake_resolve)
     f = tmp_path / "a.txt"
     f.write_text("x")
-    ctx = ToolContext(agent_id="engineer3", vault=StubVault({"discord-engineer3": "t"}))
+    ctx = ToolContext(agent_id="atlas", vault=StubVault({"discord-atlas": "t"}))
     await send_discord_file(ctx, "1000000000000000001", str(f))
-    assert sent == {"bot": "", "agent_id": "engineer3"}
+    assert sent == {"bot": "", "agent_id": "atlas"}
 
 
 def _stub_403(monkeypatch):
@@ -255,10 +258,10 @@ async def test_send_discord_file_403_names_the_bot_that_was_used(overlay, tmp_pa
     f = tmp_path / "a.txt"
     f.write_text("x")
     _stub_403(monkeypatch)
-    ctx = ToolContext(agent_id="engineer3", vault=StubVault({"discord-engineer3": "t"}))
+    ctx = ToolContext(agent_id="atlas", vault=StubVault({"discord-atlas": "t"}))
     out = await send_discord_file(ctx, "1000000000000000001", str(f))
     assert "Missing Access" in out
-    assert "engineer3" in out and "1000000000000000001" in out
+    assert "atlas" in out and "1000000000000000001" in out
 
 
 async def test_send_discord_file_403_does_not_diagnose_channel_ownership(overlay, tmp_path,
@@ -268,7 +271,7 @@ async def test_send_discord_file_403_does_not_diagnose_channel_ownership(overlay
     f = tmp_path / "a.txt"
     f.write_text("x")
     _stub_403(monkeypatch)
-    ctx = ToolContext(agent_id="engineer3", vault=StubVault({"discord-engineer3": "t"}))
+    ctx = ToolContext(agent_id="atlas", vault=StubVault({"discord-atlas": "t"}))
     out = await send_discord_file(ctx, "1000000000000000001", str(f))
     assert "belonging to a different bot" not in out
     assert "retry with bot=" not in out
@@ -293,7 +296,7 @@ async def test_send_discord_file_refuses_when_own_bot_has_no_token(overlay, tmp_
     f = tmp_path / "a.txt"
     f.write_text("x")
     _stub_403(monkeypatch)
-    ctx = ToolContext(agent_id="engineer3", vault=StubVault({"discord-token": "main-tok"}))
+    ctx = ToolContext(agent_id="atlas", vault=StubVault({"discord-token": "main-tok"}))
     out = await send_discord_file(ctx, "1000000000000000001", str(f))
     assert "Missing Access" not in out
-    assert "engineer3" in out and "discord-engineer3" in out
+    assert "atlas" in out and "discord-atlas" in out
