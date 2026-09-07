@@ -402,6 +402,10 @@ class AgentManager:
                         bot_account=message.bot_account,
                     )
         async with lock:
+            # The goal turn budget is charged here and nowhere else: whatever
+            # started this turn, it arrives through this method.
+            if not await self._goal_turn_allowed(agent_id, message):
+                return
             self.active_turns += 1
             self._inflight_seq += 1
             turn_key = self._inflight_seq
@@ -418,6 +422,55 @@ class AgentManager:
             finally:
                 self.active_turns -= 1
                 self._inflight_turns.pop(turn_key, None)
+
+    @staticmethod
+    def _turn_source(message: IncomingMessage) -> str:
+        """What started a turn. Prefers the explicit field; older constructors
+        are recognised by their marks (inter-agent sender, bot author,
+        scheduler/jobs user names) so nothing counts as a human by accident."""
+        if getattr(message, "_inter_agent_sender", None):
+            return "agent"
+        source = getattr(message, "source", "user") or "user"
+        if source != "user":
+            return source
+        if message.raw is not None and getattr(
+                getattr(message.raw, "author", None), "bot", False):
+            return "bot"
+        if message.user_name in ("scheduler", "jobs"):
+            return "schedule" if message.user_name == "scheduler" else "job"
+        return "user"
+
+    async def _goal_turn_allowed(self, agent_id: str, message: IncomingMessage) -> bool:
+        """Charge this turn to the channel's goal, if any. False means the
+        budget is spent and the turn must not run; the first refusal posts one
+        line in the channel so the silence is legible."""
+        try:
+            from src.core import goals as goal_store
+            source = self._turn_source(message)
+            verdict = goal_store.record_turn(
+                message.channel_id, agent_id, source, human=(source == "user"))
+        except Exception:
+            logger.debug("goal turn accounting failed", exc_info=True)
+            return True
+        if not verdict or not verdict["exhausted"]:
+            return True
+        goal = verdict["goal"]
+        if verdict["announce"]:
+            logger.warning(
+                f"Goal {goal['id']}: turn budget {verdict['limit']} reached in "
+                f"channel {message.channel_id} — quiet until a human posts")
+            connector = self.connectors.get(message.connector)
+            if connector:
+                with contextlib.suppress(Exception):
+                    await connector.send(
+                        message.channel_id,
+                        f"⏸ Turn budget reached for goal `{goal['id']}` — waiting "
+                        f"for a human check-in before the team continues.",
+                        bot_account=message.bot_account)
+        else:
+            logger.info(f"Goal {goal['id']}: turn {verdict['count']} over budget "
+                        f"{verdict['limit']}, dropping {agent_id}'s turn")
+        return False
 
     def inflight_snapshot(self) -> list[dict]:
         """Metadata of turns currently running — the shutdown path persists

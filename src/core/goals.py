@@ -214,6 +214,12 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
     # reminds once and then times out (src/core/goal_janitor.py).
     if "proposal_reminded_at" not in cols:
         db.execute("ALTER TABLE goals ADD COLUMN proposal_reminded_at REAL NOT NULL DEFAULT 0")
+    # The turn ledger: agent turns in this goal's channel since a human last
+    # spoke there. Lives in the store so every entry path (connector, inter-
+    # agent mail, schedules, jobs) counts against ONE number that survives a
+    # restart, instead of each gateway client keeping its own tally.
+    if "turns_since_human" not in cols:
+        db.execute("ALTER TABLE goals ADD COLUMN turns_since_human INTEGER NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -686,6 +692,44 @@ def active_goal_for_channel(channel_id: str) -> dict | None:
     channel_id = str(channel_id)
     return _cached(f"active:{channel_id}",
                    lambda: get_goal_by_channel(channel_id, ACTIVE_STATUSES))
+
+
+def record_turn(channel_id: str, agent_id: str, source: str = "bot",
+                human: bool = False) -> dict | None:
+    """The one place a goal turn is counted.
+
+    Called by AgentManager.handle_message for every turn, whatever started
+    it. A human message resets the count; anything else (a bot message, an
+    inter-agent delivery, a schedule, a job) spends one turn. Returns None
+    when the channel has no actively worked goal, else
+    {"goal", "count", "limit", "exhausted", "announce"} where `announce` is
+    True exactly once per exhaustion, on the first turn past the budget.
+    """
+    channel_id = str(channel_id)
+    goal = active_goal_for_channel(channel_id)
+    if not goal:
+        return None
+    db = _get_db()
+    limit = int(goal["turn_budget"])
+    if human:
+        db.execute("UPDATE goals SET turns_since_human=0 WHERE id=?", (goal["id"],))
+        db.commit()
+        _invalidate_cache()
+        return {"goal": goal, "count": 0, "limit": limit,
+                "exhausted": False, "announce": False}
+    row = db.execute("SELECT turns_since_human FROM goals WHERE id=?",
+                     (goal["id"],)).fetchone()
+    count = int(row[0] if row else 0) + 1
+    db.execute("UPDATE goals SET turns_since_human=? WHERE id=?", (count, goal["id"]))
+    db.commit()
+    _invalidate_cache()
+    exhausted = count > limit
+    announce = count == limit + 1
+    if announce:
+        log_event(goal["id"], "system", "budget_exhausted",
+                  f"turn budget {limit} reached ({source} turn by {agent_id})")
+    return {"goal": goal, "count": count, "limit": limit,
+            "exhausted": exhausted, "announce": announce}
 
 
 def routed_participants_for_channel(channel_id: str) -> list[str]:
