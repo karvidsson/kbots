@@ -99,6 +99,11 @@ _SCHEMA: dict[str, tuple] = {
         "objection_window_hours": (int, False, None, None),
         "escalation_user": (str, False, None, None),
         "alert_on_block": (bool, False, None, None),
+        "max_participants": (int, False, None, None),
+        # Proposal nudge and timeout (src/core/goal_janitor.py). 0 disables.
+        "proposal_timeout_hours": ((int, float), False, None, None),
+        "proposal_remind_hours": ((int, float), False, None, None),
+        "janitor_tick_seconds": (int, False, None, None),
     }),
     "admin_users": (dict, False, None, None),
     "agents": (dict, False, None, None),

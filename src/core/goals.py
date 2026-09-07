@@ -209,6 +209,11 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE goals ADD COLUMN plan TEXT NOT NULL DEFAULT ''")
     if "kickoff_message_id" not in cols:
         db.execute("ALTER TABLE goals ADD COLUMN kickoff_message_id TEXT NOT NULL DEFAULT ''")
+    # When the one "still waiting for your ✅" nudge went out. A proposal that
+    # nobody reacts to used to sit there forever, unlike a HITL request, which
+    # reminds once and then times out (src/core/goal_janitor.py).
+    if "proposal_reminded_at" not in cols:
+        db.execute("ALTER TABLE goals ADD COLUMN proposal_reminded_at REAL NOT NULL DEFAULT 0")
     db.commit()
 
 
@@ -472,6 +477,83 @@ def goal_by_kickoff_message(message_id: str) -> dict | None:
         "SELECT * FROM goals WHERE kickoff_message_id=? AND status='proposed'",
         (message_id,)).fetchone()
     return dict(row) if row else None
+
+
+# --- proposal expiry ---
+#
+# A HITL request reminds once and times out. A proposal had neither: a kickoff
+# card nobody reacted to left the goal 'proposed' forever, its nominations
+# pending forever, and its owner waiting on a decision nobody knew was owed.
+
+def stale_proposals(older_than: float, *, reminded: bool | None = None,
+                    now: float | None = None) -> list[dict]:
+    """Goals still 'proposed' after `older_than` seconds.
+
+    reminded=False returns only those not yet nudged, reminded=True only
+    those already nudged, None both.
+    """
+    now = time.time() if now is None else now
+    sql = "SELECT * FROM goals WHERE status='proposed' AND created_at <= ?"
+    params: list = [now - older_than]
+    if reminded is False:
+        sql += " AND proposal_reminded_at = 0"
+    elif reminded is True:
+        sql += " AND proposal_reminded_at > 0"
+    rows = _get_db().execute(sql + " ORDER BY created_at", params).fetchall()
+    return [dict(r) for r in rows]
+
+
+def mark_proposal_reminded(goal_id: str, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    db = _get_db()
+    db.execute("UPDATE goals SET proposal_reminded_at=? WHERE id=?", (now, goal_id))
+    db.commit()
+    _invalidate_cache()
+    log_event(goal_id, "system", "proposal_reminded", "")
+
+
+def expire_proposal(goal_id: str, now: float | None = None) -> dict | None:
+    """Abandon a proposal nobody approved. Pending nominations become
+    'expired' (not 'declined': nobody said no) and the goal is abandoned,
+    which is the only exit from 'proposed' besides starting it. None when the
+    goal is not (or no longer) proposed."""
+    goal = get_goal(goal_id)
+    if not goal or goal["status"] != "proposed":
+        return None
+    now = time.time() if now is None else now
+    db = _get_db()
+    db.execute(
+        "UPDATE goal_nominations SET status='expired', decided_by='system', "
+        "decided_at=? WHERE goal_id=? AND status='pending'", (now, goal_id))
+    db.commit()
+    log_event(goal_id, "system", "proposal_expired", "")
+    return update_goal(goal_id, "system", status="abandoned")
+
+
+# --- ownership ---
+
+def reassign_owner(goal_id: str, actor: str, new_owner: str) -> dict:
+    """Hand a goal to another agent. The new owner becomes a participant with
+    the owner role and the old owner stays on as a member, so nothing that was
+    routed stops being routed. Raises ValueError on unknown goal."""
+    goal = get_goal(goal_id)
+    if not goal:
+        raise ValueError(f"unknown goal '{goal_id}'")
+    old = goal["owner_agent"]
+    if new_owner == old:
+        return goal
+    db = _get_db()
+    now = time.time()
+    db.execute(
+        "INSERT INTO goal_participants (goal_id, agent_id, role, joined_at) "
+        "VALUES (?,?,?,?) ON CONFLICT(goal_id, agent_id) DO UPDATE SET role='owner'",
+        (goal_id, new_owner, "owner", now))
+    db.execute("UPDATE goal_participants SET role='member' WHERE goal_id=? AND agent_id=?",
+               (goal_id, old))
+    db.commit()
+    _invalidate_cache()
+    log_event(goal_id, actor, "owner", f"{old} → {new_owner}")
+    return update_goal(goal_id, actor, owner_agent=new_owner)
 
 
 # --- tasks ---
