@@ -262,6 +262,23 @@ def get_goal_by_channel(channel_id: str,
     return dict(row) if row else None
 
 
+def is_retired_goal_channel(channel_id: str) -> bool:
+    """True if a goal owns this channel and none of them are still routed.
+
+    A goal channel outlives the goal. Once the goal is abandoned or done the
+    room stays in Discord, stays in the agents' session history, and is
+    therefore the freshest thing `_latest_session_channel` can find for
+    precisely the agents who worked hardest in it — so a later message to one
+    of them lands in a dead room nobody is reading.
+    """
+    channel_id = str(channel_id)
+    row = _get_db().execute(
+        "SELECT 1 FROM goals WHERE channel_id=? LIMIT 1", (channel_id,)).fetchone()
+    if not row:
+        return False          # not a goal channel at all
+    return get_goal_by_channel(channel_id) is None
+
+
 def list_goals(statuses: tuple | None = None) -> list[dict]:
     db = _get_db()
     if statuses:
