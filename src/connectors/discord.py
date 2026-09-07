@@ -531,10 +531,25 @@ class DiscordConnector(Connector):
                               category_id: str | None = None) -> str | None:
         """Find which agent handles messages in this channel from this bot.
 
-        Priority: specific channel > category > wildcard (empty channels list).
-        Each bot account is an independent Discord client, so routing is
-        scoped to the bot_account — other bots' claims are irrelevant.
+        Priority: goal channel (participants only) > specific channel >
+        category > wildcard (empty channels list). Each bot account is an
+        independent Discord client, so routing is scoped to the bot_account —
+        other bots' claims are irrelevant.
         """
+        # A goal channel belongs to its goal, and only its participants may be
+        # resolved for it. This has to come FIRST and it has to stop here:
+        # every agent on this fleet routes with an empty channels list, so
+        # every bot client would otherwise match the wildcard below and the
+        # whole fleet would take a turn on every message in a goal room.
+        goal_participants = self._goal_participants(channel_id)
+        if goal_participants:
+            for agent_id, agent_cfg in self._agent_configs.items():
+                routing = agent_cfg.get("routing", {}).get("discord", {})
+                if (routing.get("account", "default") == bot_account
+                        and agent_id in goal_participants):
+                    return agent_id
+            return None
+
         wildcard_agent = None
         category_agent = None
         dm_fallback_agent = None
@@ -556,22 +571,21 @@ class DiscordConnector(Connector):
             if category_id is None and dm_fallback_agent is None:
                 dm_fallback_agent = agent_id
 
-        # Goal channels route dynamically: a participant of a live goal is
-        # bound to its channel by the goal store, with no agents.yaml entry.
-        # One Discord app per agent, so at most one participant per account.
+        return category_agent or wildcard_agent or dm_fallback_agent
+
+    @staticmethod
+    def _goal_participants(channel_id: str) -> list[str]:
+        """Agents routed into this channel by a live goal.
+
+        Empty for an ordinary channel, and empty when the goals store cannot
+        be read — a store that is down must not take every channel offline.
+        """
         try:
             from src.core import goals
-            participants = goals.routed_participants_for_channel(channel_id)
-            if participants:
-                for agent_id, agent_cfg in self._agent_configs.items():
-                    routing = agent_cfg.get("routing", {}).get("discord", {})
-                    if (routing.get("account", "default") == bot_account
-                            and agent_id in participants):
-                        return agent_id
+            return goals.routed_participants_for_channel(channel_id)
         except Exception:
             logger.debug("goal routing lookup failed", exc_info=True)
-
-        return category_agent or wildcard_agent or dm_fallback_agent
+            return []
 
 
 class DiscordBot:

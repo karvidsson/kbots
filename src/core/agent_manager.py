@@ -1321,11 +1321,13 @@ class AgentManager:
         """The agent's most recently active eligible non-internal channel.
 
         "Most recent" is a trailing indicator of where an agent last spoke, so
-        a retired goal's room is the freshest thing on record for exactly the
-        agents who worked hardest in it. Twice now a later message to one of
-        them has landed in a dead room: once in a migration channel, once in an
-        abandoned goal's. Skip channels owned by a goal that is no longer
-        routed and take the next one instead.
+        a goal's room is the freshest thing on record for exactly the agents
+        who worked hardest in it. Three times now a later message to one of
+        them has landed in one: a migration channel, an abandoned goal's, and
+        a live goal's, where it arrived carrying that goal's context in front
+        of its participants and read as work on it. A goal room is a room for
+        its goal, never an agent's inbox — skip every channel a goal owns,
+        retired or not, and take the next one instead.
         """
         live: list[Session] = sorted(
             (s for s in self.sessions.values()
@@ -1337,17 +1339,26 @@ class AgentManager:
                 if channel not in candidates:
                     candidates.append(channel)
         for channel in candidates:
-            if not self._is_retired_goal_channel(channel):
+            if not self._is_goal_channel(channel):
                 return channel
+        # Every candidate was a goal room. Say so: the caller returns None and
+        # the message is dropped, which is otherwise indistinguishable from an
+        # agent nobody has ever spoken to.
+        if candidates:
+            logger.warning(
+                f"No home channel for '{agent_id}': all {len(candidates)} recent "
+                f"channels belong to goals. Give it an explicit home_channel or "
+                f"channels entry in its routing.")
         return None
 
     @staticmethod
-    def _is_retired_goal_channel(channel_id: str) -> bool:
+    def _is_goal_channel(channel_id: str) -> bool:
         """Best effort: a goals store that cannot be read must not block
-        delivery, so an error here means 'not retired' rather than no route."""
+        delivery, so an error here means 'not a goal channel' rather than no
+        route."""
         try:
             from src.core import goals as goal_store
-            return goal_store.is_retired_goal_channel(channel_id)
+            return goal_store.is_goal_channel(channel_id)
         except Exception as e:
             logger.debug(f"goal-channel check failed for {channel_id}: {e}")
             return False

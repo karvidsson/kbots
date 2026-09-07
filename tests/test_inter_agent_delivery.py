@@ -11,6 +11,7 @@ to the caller).
 """
 
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 
 from src.core.agent_manager import AgentManager
@@ -178,12 +179,14 @@ async def test_concurrent_asks_serialize_on_internal_session(tmp_path):
     assert active["max"] == 1
 
 
-# --- a retired goal's room is not a home channel ---
+# --- a goal's room is not a home channel, live or retired ---
 
-async def test_home_channel_skips_a_retired_goal_room(tmp_path, monkeypatch):
-    """"Most recently active" is a trailing indicator, so an abandoned goal's
-    room is the freshest thing on record for exactly the agents who worked
-    hardest in it. Twice a later message to one of them landed in a dead room.
+async def test_home_channel_skips_a_goal_room(tmp_path, monkeypatch):
+    """"Most recently active" is a trailing indicator, so a goal's room is the
+    freshest thing on record for exactly the agents who worked hardest in it.
+    Twice a later message to one of them landed in a dead room, and once in a
+    LIVE goal's room, where it arrived carrying that goal's context in front of
+    its participants and read as work on it. Neither is a home.
     """
     from src.core import goals as store
 
@@ -198,12 +201,38 @@ async def test_home_channel_skips_a_retired_goal_room(tmp_path, monkeypatch):
         mgr._get_or_create_session("beta", "old-home", "user1")
         mgr._get_or_create_session("beta", "goal-chan", "user1")  # newest
 
-        # while the goal is live its room IS where the agent lives
-        assert await mgr._resolve_home_channel("beta") == ("stub", "goal-chan", "beta-bot")
+        # live goal: unrelated mail still does not belong in its room
+        assert await mgr._resolve_home_channel("beta") == ("stub", "old-home", "beta-bot")
 
         store.update_goal(goal["id"], "beta", status="abandoned")
         store._cache.clear()
         assert await mgr._resolve_home_channel("beta") == ("stub", "old-home", "beta-bot")
+    finally:
+        if store._db is not None:
+            store._db.close()
+        store._db = None
+        store._cache.clear()
+
+
+async def test_no_home_when_every_channel_belongs_to_a_goal(tmp_path, monkeypatch, caplog):
+    """Dropping the message is the safe outcome, but it must not be silent:
+    without a log line it is indistinguishable from an agent nobody has ever
+    spoken to."""
+    from src.core import goals as store
+
+    monkeypatch.setattr(store, "DB_PATH", str(tmp_path / "goals.db"))
+    monkeypatch.setattr(store, "_db", None)
+    store._cache.clear()
+    try:
+        goal = store.create_goal("Launch", "d", "beta", "goal-chan", "u")
+        store.update_goal(goal["id"], "beta", status="brainstorm")
+
+        mgr, _, _ = _mgr(tmp_path)
+        mgr._get_or_create_session("beta", "goal-chan", "user1")
+
+        with caplog.at_level(logging.WARNING):
+            assert await mgr._resolve_home_channel("beta") is None
+        assert "No home channel for 'beta'" in caplog.text
     finally:
         if store._db is not None:
             store._db.close()
