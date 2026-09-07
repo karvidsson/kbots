@@ -502,6 +502,15 @@ async def main() -> None:
     # before that. A late pin would mean the first reads hit the wrong file.
     from src.core import goals as _goals
     _goals.set_data_dir(data_dir)
+    # goals.alert_on_block defaults on, but the alert it promises is gated on
+    # security.alert_channel. On a deployment without one it looks enabled and
+    # never fires — say so once here rather than at the moment a goal blocks.
+    _goals_cfg = config.get("goals", {}) or {}
+    if _goals_cfg.get("alert_on_block", True) and not alerter.enabled:
+        logger.warning(
+            "Goals: alert_on_block is on but security.alert_channel is unset — a "
+            "blocked goal will post in its own channel only, nobody is alerted. "
+            "Set security.alert_channel or goals.alert_on_block: false.")
     _prev = _version.read_running_version(data_dir)
     _running = _version.write_running_version(data_dir)
     _run_v = _running.get("version") or _running["short"]
@@ -694,6 +703,18 @@ async def main() -> None:
     janitor = BrowserJanitor(config.get("browser", {}))
     if janitor.enabled:
         asyncio.create_task(janitor.run(), name="browser-janitor")
+
+    # --- Goal janitor: remind once, then expire proposals nobody approved ---
+    from src.core.goal_janitor import GoalJanitor
+    from src.tools.goals import _cfg as _goal_tool_cfg
+    from src.tools.goals import _escalation_mention
+    goal_janitor = GoalJanitor(
+        config.get("goals", {}), active_connectors,
+        mention=lambda: _escalation_mention(_goal_tool_cfg()))
+    if goal_janitor.enabled:
+        asyncio.create_task(goal_janitor.run(), name="goal-janitor")
+    else:
+        logger.info("Goal janitor: OFF (goals.proposal_timeout_hours is 0)")
 
     # --- Turn judge: auto-label collected turns for training export (default off) ---
     judge_cfg = tc_cfg.get("judge", {}) or {}

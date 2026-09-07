@@ -861,3 +861,147 @@ def test_split_store_warning_names_stores_and_ignores_scratch(tmp_path, monkeypa
 
     # Same dir on both sides is not a split at all.
     assert base.warn_on_split_store({"kbots": {"data_dir": str(legacy)}}) == []
+
+
+# --- hardening (goal g-harden-the-goals-feature, PR B) ------------------------
+
+def test_parse_nominations_keeps_a_semicolon_inside_a_reason():
+    """The parser split every ';' and then refused the tail as an agent with
+    no reason. Found while creating the goal whose reason had one."""
+    pairs, problems = tools_parse(
+        "engineer: owns the engine; and the overlay; rainmaker: ran the launch")
+    assert problems == []
+    assert pairs == [("engineer", "owns the engine; and the overlay"),
+                     ("rainmaker", "ran the launch")]
+
+
+def test_parse_nominations_still_refuses_a_bare_agent_after_a_pair():
+    pairs, problems = tools_parse("engineer: owns the engine; rainmaker")
+    assert pairs == [("engineer", "owns the engine")]
+    assert problems and "rainmaker" in problems[0]
+
+
+def tools_parse(spec):
+    from src.tools.goals import parse_nominations
+    return parse_nominations(spec)
+
+
+def test_reassign_owner_swaps_roles_and_keeps_the_old_owner_routed():
+    goal = _mk("executing")
+    store.add_participant(goal["id"], "redline")
+    out = store.reassign_owner(goal["id"], "jarvis", "redline")
+    assert out["owner_agent"] == "redline"
+    roles = {p["agent_id"]: p["role"] for p in store.list_participants(goal["id"])}
+    assert roles == {"maya": "member", "redline": "owner"}
+    assert "maya" in store.routed_participants_for_channel("123")
+    kinds = [e["kind"] for e in store.list_events(goal["id"])] if hasattr(store, "list_events") \
+        else [r[0] for r in store._get_db().execute(
+            "SELECT kind FROM goal_events WHERE goal_id=?", (goal["id"],))]
+    assert "owner" in kinds
+
+
+def test_reassign_owner_to_a_newcomer_adds_them_as_owner():
+    goal = _mk()
+    store.reassign_owner(goal["id"], "jarvis", "nestor")
+    roles = {p["agent_id"]: p["role"] for p in store.list_participants(goal["id"])}
+    assert roles == {"maya": "member", "nestor": "owner"}
+
+
+@pytest.mark.asyncio
+async def test_goal_set_hands_the_goal_to_a_roster_agent(goal_tools, monkeypatch):
+    tools, _ = goal_tools
+    posts: list[tuple[str, str]] = []
+
+    async def _post(ctx, channel_id, content):
+        posts.append((channel_id, content))
+        return "m"
+
+    monkeypatch.setattr(tools, "_post_to_channel", _post)
+    monkeypatch.setattr(tools, "_known_agents", lambda: {"maya", "redline"})
+    goal = _mk("executing")
+    out = await tools.goal_set(_ctx("maya"), goal["id"], "owner_agent", "@redline")
+    assert out.startswith("✅") and "redline" in out and "maya stays on" in out
+    assert store.get_goal(goal["id"])["owner_agent"] == "redline"
+    assert posts and "maya" in posts[0][1] and "redline" in posts[0][1]
+
+    assert "not on the roster" in await tools.goal_set(
+        _ctx("redline"), goal["id"], "owner_agent", "ghostbot")
+    assert "already owns" in await tools.goal_set(
+        _ctx("redline"), goal["id"], "owner_agent", "redline")
+
+
+@pytest.mark.asyncio
+async def test_goal_set_by_a_privileged_agent_who_is_not_the_owner(goal_tools, monkeypatch):
+    """An owner that is offline or retired must not strand the goal."""
+    tools, _ = goal_tools
+    monkeypatch.setattr(tools, "_known_agents", lambda: {"maya", "redline", "jarvis"})
+    monkeypatch.setattr(tools, "_agent_tier",
+                        lambda a: "privileged" if a == "jarvis" else "assistant")
+    goal = _mk("executing")
+    assert (await tools.goal_set(_ctx("jarvis"), goal["id"], "owner_agent", "redline")
+            ).startswith("✅")
+    assert "only the owner" in await tools.goal_set(
+        _ctx("nestor"), goal["id"], "title", "hijacked")
+
+
+@pytest.mark.asyncio
+async def test_goal_set_refuses_a_zero_turn_budget(goal_tools):
+    """0 is 'use the default' at goal_create. Stored on a live goal it would
+    be a budget of nothing: every bot turn in the channel suppressed."""
+    tools, _ = goal_tools
+    goal = _mk("executing")
+    out = await tools.goal_set(_ctx("maya"), goal["id"], "turn_budget", "0")
+    assert out.startswith("ERROR") and "at least 1" in out
+    assert store.get_goal(goal["id"])["turn_budget"] == 30
+    assert "whole number" in await tools.goal_set(_ctx("maya"), goal["id"], "turn_budget", "lots")
+    assert (await tools.goal_set(_ctx("maya"), goal["id"], "turn_budget", "12")).startswith("✅")
+    assert store.get_goal(goal["id"])["turn_budget"] == 12
+
+
+def test_goal_create_says_zero_budget_means_the_default():
+    from src.core.tools import get_all_tools
+    desc = get_all_tools()["goal_create"].description
+    assert "0 (the default) means the configured default" in desc
+
+
+def test_goal_add_member_denial_names_the_missing_approvals_channel():
+    """Both gate paths (MCP and in-process) hand the agent this text when
+    security.hitl.channel is unset. Pinned for goal_add_member because that is
+    the call a goal owner makes mid-goal and then reports as 'denied'."""
+    from src.core.hitl import hitl_result_message
+    for reason in ("no_channel", "no discord token or HITL channel"):
+        msg = hitl_result_message("goal_add_member", {"status": "denied", "reason": reason})
+        assert "no approval channel is configured" in msg
+        assert "set_hitl_channel" in msg and "did NOT run" in msg
+    desc = get_tool_description("goal_add_member")
+    assert "security.hitl.channel unset" in desc
+
+
+def get_tool_description(name):
+    from src.core.tools import get_all_tools
+    return get_all_tools()[name].description
+
+
+def test_stale_proposals_and_expiry():
+    t0 = 1_000_000.0
+    goal = store.create_goal("Slow", "", "maya", "c1", "u")
+    store._get_db().execute("UPDATE goals SET created_at=? WHERE id=?", (t0, goal["id"]))
+    store._get_db().commit()
+    store.add_nomination(goal["id"], "redline", "owns the repo")
+    started = _mk("brainstorm", channel="c2")
+
+    assert [g["id"] for g in store.stale_proposals(3600, now=t0 + 7200)] == [goal["id"]]
+    assert store.stale_proposals(3600, now=t0 + 60) == []
+    assert store.stale_proposals(3600, reminded=True, now=t0 + 7200) == []
+    store.mark_proposal_reminded(goal["id"], now=t0 + 7200)
+    assert store.stale_proposals(3600, reminded=False, now=t0 + 7200) == []
+    assert [g["id"] for g in store.stale_proposals(3600, reminded=True, now=t0 + 7200)] \
+        == [goal["id"]]
+
+    out = store.expire_proposal(goal["id"], now=t0 + 9000)
+    assert out["status"] == "abandoned"
+    assert store.get_nomination(goal["id"], "redline")["status"] == "expired"
+    assert store.nomination_by_message("") is None
+    assert store.expire_proposal(goal["id"]) is None            # already gone
+    assert store.expire_proposal(started["id"]) is None         # not proposed
+    assert store.get_goal(started["id"])["status"] == "brainstorm"

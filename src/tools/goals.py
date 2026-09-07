@@ -155,6 +155,15 @@ def parse_nominations(spec: str) -> tuple[list[tuple[str, str]], list[str]]:
         agent, sep, reason = chunk.partition(":")
         agent = agent.strip().lstrip("@")
         reason = reason.strip()
+        # A reason may itself contain a semicolon ("owns the engine; and the
+        # overlay"). The tail after it has no colon and is not one word, so it
+        # is the rest of the previous reason, not a bare agent id. A single
+        # token with no colon is still what it looks like: an agent without a
+        # reason, and that stays refused.
+        if not sep and pairs and " " in chunk:
+            prev_agent, prev_reason = pairs[-1]
+            pairs[-1] = (prev_agent, f"{prev_reason}; {chunk}")
+            continue
         if not sep or not reason:
             problems.append(f"'{agent or chunk}' has no reason — use "
                             f"'{agent or 'agent'}: why they are needed'")
@@ -321,6 +330,9 @@ def _clear_wake(goal: dict) -> None:
         "agent can do, leave it out.\n"
         "plan is your proposed approach in a few lines: what you will do first, "
         "and what done looks like.\n"
+        "turn_budget is agent turns between human check-ins. 0 (the default) "
+        "means the configured default (goals.default_turn_budget, 30), not "
+        "'no budget'.\n"
         "Nothing starts on your say-so. Each nominee gets its own message with "
         "✅/❌ and the goal gets a kickoff card with ✅; the goal stays 'proposed', "
         "nobody is routed and no turns are spent until the user reacts."
@@ -334,6 +346,7 @@ async def goal_create(ctx: ToolContext, title: str, description: str,
 
     participants: "agent: why they are needed; agent: why". Reason required.
     plan: the approach you propose, summarised for the user to approve.
+    turn_budget: 0 means the configured default (goals.default_turn_budget).
     """
     cfg = _cfg()
     if not cfg.get("enabled", True):
@@ -471,11 +484,14 @@ async def goal_status(ctx: ToolContext, goal_id: str = "") -> str:
 @tool(
     name="goal_set",
     description=(
-        "Owner-only setter for a goal. field is one of: status (proposed/"
-        "brainstorm/strategy/executing/paused/blocked_on_user/done/abandoned — "
-        "transitions are validated), strategy, plan, title, description, "
-        "turn_budget, owner_agent. Coordinator-tier agents and humans may also "
-        "advance a 'proposed' goal."
+        "Set one field of a goal. Callable by the goal's owner and by any "
+        "coordinator- or privileged-tier agent (so an owner that is offline, "
+        "renamed or retired does not strand the goal). field is one of: status "
+        "(proposed/brainstorm/strategy/executing/paused/blocked_on_user/done/"
+        "abandoned — transitions are validated), strategy, plan, title, "
+        "description, turn_budget (agent turns between human check-ins, at "
+        "least 1), owner_agent (hands the goal to another roster agent; the "
+        "old owner stays on as a member)."
     ),
     category="goals",
 )
@@ -491,11 +507,40 @@ async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> st
                 "description, turn_budget, owner_agent.")
     if not _is_owner_or_coordinator(goal, ctx.agent_id):
         return (f"ERROR: only the owner ({goal['owner_agent']}) or a "
-                f"coordinator-tier agent can change this goal.")
+                f"coordinator- or privileged-tier agent can change this goal.")
+    value = value.strip()
+
+    if field == "owner_agent":
+        new_owner = value.lstrip("@")
+        known = _known_agents()
+        if not new_owner or (known and new_owner not in known):
+            return (f"ERROR: '{new_owner}' is not on the roster. Call team_list "
+                    f"and use the exact agent id.")
+        old = goal["owner_agent"]
+        if new_owner == old:
+            return f"`{new_owner}` already owns `{goal['id']}` — nothing to do."
+        goal = store.reassign_owner(goal["id"], ctx.agent_id, new_owner)
+        await _update_card(ctx, goal)
+        await _post_to_channel(
+            ctx, goal["channel_id"],
+            f"🔑 `{goal['id']}` owner: **{old}** → **{new_owner}** (by {ctx.agent_id}).")
+        return (f"✅ `{goal['id']}` owner → {new_owner}. {old} stays on as a "
+                f"member. Status: {goal['status']}.")
+
+    if field == "turn_budget":
+        try:
+            budget = int(value)
+        except ValueError:
+            return "ERROR: turn_budget must be a whole number of turns."
+        if budget < 1:
+            return ("ERROR: turn_budget must be at least 1. 0 means 'default' "
+                    "only at goal_create; a goal cannot run on zero turns.")
+        value = budget
+
     leaving_proposed = (field == "status" and goal["status"] == "proposed"
-                        and value.strip() != "proposed")
+                        and value != "proposed")
     try:
-        kwargs = {field: int(value) if field == "turn_budget" else value.strip()}
+        kwargs = {field: value}
         goal = store.update_goal(goal["id"], ctx.agent_id, **kwargs)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -544,7 +589,10 @@ async def _acquire_channel(ctx: ToolContext, goal: dict, cfg: dict) -> tuple[dic
         "Requires human approval — the request goes to the approvals channel "
         "with your reason and waits. A goal that grows by one agent's say-so is "
         "how three participants become seven and the turn budget goes to "
-        "commentary, so this stays a decision a human makes."
+        "commentary, so this stays a decision a human makes. On a deployment "
+        "with no approvals channel (security.hitl.channel unset) the call is "
+        "refused with a message saying exactly that; do not retry it, tell "
+        "the user."
     ),
     category="goals",
     hitl=True,
