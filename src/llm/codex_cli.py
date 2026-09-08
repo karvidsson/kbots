@@ -28,8 +28,19 @@ Config (under the agent's llm block or defaults.llm):
   timeout: 3600               # seconds the turn may run
   resume_startup_timeout: 600 # seconds a RESUMED session may take to come up
 
-Limitations (v1): per-tool allow/deny lists are not mapped — MCP exposure is
-per-server; shell/file access is governed by the codex sandbox instead.
+Tool grants: the engine's `disallowed_tools` (agent tool list, per-sender
+access control, other agents' private tools) reaches codex through
+KBOTS_MCP_DENY on the MCP server rather than a CLI flag, because codex has no
+per-tool switch. See deny_env.
+
+Limitation: blocked BUILTINS are still not enforced. `disallow_builtins:
+[Bash]` is honoured for claude_code via --disallowedTools and has no codex
+equivalent — codex's shell is governed by the sandbox, and its execpolicy
+rules engine (`codex execpolicy check`) cannot be reached from `codex exec`
+in 0.153.4: there is no --rules flag, no config key, no discovered
+default.rules at either $CODEX_HOME or <project>/.codex, and the
+`request_rule` feature is marked removed. An agent that must not run shell
+commands needs `sandbox: read-only`, which also costs it file edits.
 """
 
 import asyncio
@@ -86,7 +97,33 @@ _LOOPBACK_ENV = ("KBOTS_INTERNAL_API", "KBOTS_INTERNAL_TOKEN")
 # and refuses the owner — indistinguishable, from Discord, from a tier denial.
 # Absent by design for scheduler/trigger/agent-to-agent turns: no sender, no
 # admin rights, which is the fail-closed behaviour those gates expect.
-_CONTEXT_ENV = ("KBOTS_USER_ID",)
+# KBOTS_MCP_DENY rides the same path: see deny_env below.
+_CONTEXT_ENV = ("KBOTS_USER_ID", "KBOTS_MCP_DENY")
+
+# Prefix the engine puts on kbots tool names when it builds CLI grant lists.
+_KBOTS_TOOL_PREFIX = "mcp__kbots-tools__"
+
+
+def deny_env(disallowed_tools) -> dict:
+    """KBOTS_MCP_DENY for this turn, from the engine's disallowed_tools list.
+
+    Claude Code enforces that list itself via --disallowedTools. Codex has no
+    per-tool switch at all: `mcp_servers.<name>` carries command/args/env and
+    nothing else (verified against codex-cli 0.153.4 — an `enabled_tools` key
+    is silently dropped), and kbots exposes every tool through the single
+    kbots-tools server, so server-level enable/disable cannot express "all of
+    these except three". Enforcement therefore moves into the MCP server, which
+    codex respawns per `codex exec`, so a per-turn value is safe.
+
+    Builtins in the list (Bash, Edit, ...) are dropped here: they are not MCP
+    tools and codex's shell is governed by the sandbox instead. That gap is
+    real and unclosed — see the module docstring.
+    """
+    names = sorted({
+        t[len(_KBOTS_TOOL_PREFIX):] for t in (disallowed_tools or [])
+        if t.startswith(_KBOTS_TOOL_PREFIX)
+    })
+    return {"KBOTS_MCP_DENY": ",".join(names)} if names else {}
 
 
 def _expand_env_refs(value: str, env: dict) -> str:
@@ -238,6 +275,10 @@ class CodexCLIProvider(LLMProvider):
         user_id = kwargs.get("user_id") or ""
         if user_id:
             env["KBOTS_USER_ID"] = str(user_id)
+        # Tool grants the engine computed for this turn. Set on codex's own env
+        # only so mcp_config_args can copy it into each server's table; codex
+        # itself ignores it.
+        env.update(deny_env(kwargs.get("disallowed_tools")))
 
         # One retry: a stale/unknown session id drops resume and starts fresh.
         for resuming in ([True, False] if session_id else [False]):
