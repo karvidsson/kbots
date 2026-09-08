@@ -10,8 +10,10 @@ from src.core.startup_context import _build_lessons, build_startup_context
 class FakeMemory:
     def __init__(self, lessons):
         self._lessons = lessons
+        self.calls = []
 
-    async def list_by_category(self, agent_id, category, limit=100):
+    async def list_by_category(self, agent_id, category, limit=100, own_only=False):
+        self.calls.append({"agent_id": agent_id, "own_only": own_only})
         return [m for m in self._lessons if m.get("category") == category][:limit]
 
 
@@ -114,7 +116,10 @@ async def test_reflect_skips_below_min(overlay, tmp_path):
     mgr = FakeMgr(FakeMemory(lessons), tmp_path, FakeLLM())
     r = Reflector(mgr, {"min_lessons": 3})
     assert await r._reflect("a") is False
-    assert not (tmp_path / "LESSONS.md").exists()
+    # no digest, but not nothing either: a stub says why (see the own-lessons
+    # tests below), so the agent never boots on a stale file
+    from src.core.reflector import _HEADER, _STUB
+    assert (tmp_path / "LESSONS.md").read_text() == _HEADER + _STUB
 
 
 def test_build_lessons_block(tmp_path):
@@ -246,3 +251,77 @@ def test_extract_disabled_without_graph_config():
     assert r.extract_enabled is False
     r = Reflector(object(), {}, graph_cfg={"enabled": True, "extract": False})
     assert r.extract_enabled is False
+
+
+# --- own lessons only, and what happens when there are too few -------------
+
+async def test_reflect_asks_for_the_agents_own_lessons(overlay, tmp_path):
+    """The store's default read is fleet-wide; the digest must not be."""
+    mem = FakeMemory(_lessons())
+    r = Reflector(FakeMgr(mem, tmp_path, FakeLLM()), {"min_lessons": 3})
+    assert await r._reflect("a") is True
+    assert mem.calls == [{"agent_id": "a", "own_only": True}]
+
+
+async def test_too_few_lessons_replaces_a_reflector_digest_with_a_stub(overlay, tmp_path):
+    """A v1 file digested the whole fleet. It must not survive as this
+    agent's 'own experience' just because the agent has nothing to say."""
+    from src.core.reflector import _HEADER, _STUB
+    (tmp_path / "LESSONS.md").write_text(_HEADER + "## Preferred\n- someone else's\n")
+    llm = FakeLLM()
+    r = Reflector(FakeMgr(FakeMemory([]), tmp_path, llm), {"min_lessons": 3})
+    assert await r._reflect("a") is False
+    assert (tmp_path / "LESSONS.md").read_text() == _HEADER + _STUB
+    assert llm.calls == []                       # no model call for a stub
+
+
+async def test_too_few_lessons_replaces_a_provider_apology(overlay, tmp_path):
+    from src.core.reflector import _HEADER, _STUB
+    (tmp_path / "LESSONS.md").write_text(
+        _HEADER + "That took too long and I had to stop. Try a shorter question.\n")
+    r = Reflector(FakeMgr(FakeMemory([]), tmp_path, FakeLLM()), {"min_lessons": 3})
+    await r._reflect("a")
+    assert (tmp_path / "LESSONS.md").read_text() == _HEADER + _STUB
+
+
+async def test_too_few_lessons_writes_a_stub_when_there_is_no_file(overlay, tmp_path):
+    from src.core.reflector import _HEADER, _STUB
+    r = Reflector(FakeMgr(FakeMemory([]), tmp_path, FakeLLM()), {"min_lessons": 3})
+    await r._reflect("a")
+    assert (tmp_path / "LESSONS.md").read_text() == _HEADER + _STUB
+
+
+async def test_too_few_lessons_never_touches_a_hand_written_file(overlay, tmp_path):
+    hand = "# LESSONS\n\nMy own notes, kept by hand.\n"
+    (tmp_path / "LESSONS.md").write_text(hand)
+    r = Reflector(FakeMgr(FakeMemory([]), tmp_path, FakeLLM()), {"min_lessons": 3})
+    await r._reflect("a")
+    assert (tmp_path / "LESSONS.md").read_text() == hand
+
+
+async def test_stub_is_not_rewritten_every_tick(overlay, tmp_path):
+    from src.core.reflector import _HEADER, _STUB
+    r = Reflector(FakeMgr(FakeMemory([]), tmp_path, FakeLLM()), {"min_lessons": 3})
+    await r._reflect("a")
+    first = (tmp_path / "LESSONS.md").stat().st_mtime_ns
+    await r._reflect("a")
+    assert (tmp_path / "LESSONS.md").stat().st_mtime_ns == first
+    assert (tmp_path / "LESSONS.md").read_text() == _HEADER + _STUB
+
+
+def test_digest_version_bump_expires_every_timer_once(overlay, tmp_path):
+    from src.core import runtime_state
+    mgr = FakeMgr(FakeMemory([]), tmp_path, FakeLLM())
+    mgr.agent_configs = {"a": {}, "b": {}}
+    runtime_state.set_flag("reflector_last_a", 1_700_000_000.0)
+    runtime_state.set_flag("reflector_last_b", 1_700_000_000.0)
+    runtime_state.clear_flag("reflector_digest_version")
+    r = Reflector(mgr, {})
+    assert r._reset_timers_if_digest_changed() is True
+    assert runtime_state.get_flag("reflector_last_a") == 0
+    assert runtime_state.get_flag("reflector_last_b") == 0
+    assert r._due("a", 1_700_000_001.0)
+    # once: a later boot with the same version leaves the timers alone
+    runtime_state.set_flag("reflector_last_a", 1_700_000_000.0)
+    assert r._reset_timers_if_digest_changed() is False
+    assert runtime_state.get_flag("reflector_last_a") == 1_700_000_000.0
