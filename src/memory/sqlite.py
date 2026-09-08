@@ -548,13 +548,25 @@ class SQLiteMemory(MemoryBackend):
         return self._row_to_dict(row) if row else None
 
     async def list_by_category(self, agent_id: str, category: str,
-                               limit: int = 100) -> list[dict]:
+                               limit: int = 100, own_only: bool = False) -> list[dict]:
         """List an agent's non-archived memories in a category (e.g. 'lesson').
 
         Unlike search() this needs no FTS query — used by the reflector to
         consolidate all of an agent's lessons regardless of confidence.
+
+        `own_only` narrows "an agent's" to what that agent itself saved (its
+        `agent:` and `private:` scopes) plus anything `global`. The default
+        visibility is fleet-wide when `fleet_read` is on, which is right for
+        recall and wrong for a file that says "what has worked for YOU": with
+        the default, every agent's LESSONS.md became a digest of the whole
+        fleet's lessons, and an agent that had never saved one booted on a
+        page about other agents' work.
         """
-        scope_sql, scope_params = self._scope_filter(agent_id)
+        if own_only:
+            scope_sql = "scope LIKE ? OR scope = ? OR scope = ?"
+            scope_params = ["global%", f"agent:{agent_id}", f"private:{agent_id}"]
+        else:
+            scope_sql, scope_params = self._scope_filter(agent_id)
         rows = self.db.execute(
             f"""SELECT * FROM memories
                 WHERE ({scope_sql})
