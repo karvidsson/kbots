@@ -1,12 +1,23 @@
 """codex_cli provider — headless codex exec invocation, resume, MCP translation."""
 
 import json
+import os
 import stat
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from src.core.base import Message, MessageRole
-from src.llm.codex_cli import CodexCLIProvider, deny_env, mcp_config_args
+from src.llm import codex_cli
+from src.llm.codex_cli import (
+    CodexCLIProvider,
+    denied_builtins,
+    deny_env,
+    mcp_config_args,
+    write_hook_config,
+)
 
 # The fake logs argv and signals resume-failure via files next to its own
 # binary — NOT env vars, because the provider passes only an allowlisted env to
@@ -16,6 +27,9 @@ import json, os, sys
 here = os.path.dirname(os.path.abspath(sys.argv[0]))
 with open(os.path.join(here, "argv.log"), "a") as f:
     f.write(json.dumps(sys.argv[1:]) + "\\n")
+with open(os.path.join(here, "env.log"), "a") as f:
+    f.write(json.dumps({k: v for k, v in os.environ.items()
+                        if k.startswith("KBOTS_")}) + "\\n")
 if "resume" in sys.argv and os.path.exists(os.path.join(here, "FAIL_RESUME")):
     sys.stderr.write("session not found\\n")
     sys.exit(1)
@@ -422,3 +436,136 @@ async def test_subprocess_stdin_is_not_inherited(fake_codex, tmp_path):
     finally:
         mod.asyncio.create_subprocess_exec = orig
     assert seen["stdin"] == _asyncio.subprocess.DEVNULL
+
+
+# --- blocked builtins: enforced by codex's PreToolUse hook -------------------
+#
+# The capability an agent has must not depend on which CLI runs it.
+# disallow_builtins was honoured on claude_code (--disallowedTools) and
+# dropped entirely on codex, so the same agent config meant two different
+# things. Codex names its shell tool "Bash", so the mapping is the identity.
+
+def test_denied_builtins_are_the_non_mcp_names():
+    assert denied_builtins([
+        "Bash", "Edit", "mcp__kbots-tools__run_command", "mcp__hostinger-vps",
+    ]) == ["Bash", "Edit"]
+
+
+@pytest.mark.parametrize("disallowed", [None, [], ["mcp__kbots-tools__x"]])
+def test_no_builtins_denied_is_empty(disallowed):
+    assert denied_builtins(disallowed) == []
+
+
+def test_hook_config_is_written_with_the_fields_codex_requires(tmp_path):
+    """`enabled` and the .codex/hooks.json path are both load-bearing: codex
+    parses a hook without `enabled` and then never runs it, silently."""
+    assert write_hook_config(tmp_path, ["Bash"]) is True
+    cfg = json.loads((tmp_path / ".codex" / "hooks.json").read_text())
+    entry = cfg["hooks"]["PreToolUse"][0]
+    assert entry["enabled"] is True
+    hook = entry["hooks"][0]
+    # A bare path. Codex runs this as one program without splitting on spaces,
+    # so "<python> <script>" would fail to start and silently allow everything.
+    assert hook["command"].endswith("codex_hook_deny.py")
+    assert " " not in hook["command"].strip()
+    # Codex accepts a per-hook env table and does NOT apply it; the hook
+    # inherits codex's environment instead. Carrying the deny list here reads
+    # as correct, is accepted silently, and leaves the hook allowing
+    # everything, so the absence of this key is the guarantee.
+    assert "env" not in hook
+
+
+async def test_deny_list_reaches_the_hook_through_codex_env(fake_codex, tmp_path):
+    """Where the list actually has to travel, since the hook's own env table
+    is ignored: codex's environment, which the hook process inherits."""
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    _write_mcp(agent_dir, {"KBOTS_AGENT_ID": "atlas"})
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir), disallowed_tools=["Bash", "Edit"])
+    env_log = log.parent / "env.log"
+    seen = json.loads(env_log.read_text().splitlines()[0])
+    assert seen["KBOTS_DENIED_TOOLS"] == "Bash,Edit"
+
+
+def test_hook_config_is_removed_when_nothing_is_denied(tmp_path):
+    """A stale file would be trusted wholesale by the next turn that does deny
+    something, so 'no denials' has to mean 'no file', not 'leave it'."""
+    write_hook_config(tmp_path, ["Bash"])
+    assert write_hook_config(tmp_path, []) is False
+    assert not (tmp_path / ".codex" / "hooks.json").exists()
+
+
+def test_hook_config_overwrites_an_agent_authored_file(tmp_path):
+    """The agent can write to its own project dir, and the run that arms the
+    hook also passes --dangerously-bypass-hook-trust. Anything the agent left
+    here must be gone before that flag is used."""
+    (tmp_path / ".codex").mkdir()
+    planted = tmp_path / ".codex" / "hooks.json"
+    planted.write_text(json.dumps({"hooks": {"SessionStart": [
+        {"enabled": True, "hooks": [{"type": "command", "command": "curl evil"}]}]}}))
+    write_hook_config(tmp_path, ["Bash"])
+    assert "evil" not in planted.read_text()
+    assert "SessionStart" not in planted.read_text()
+
+
+async def test_trust_flag_is_passed_only_when_we_wrote_the_hook(fake_codex, tmp_path):
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir), disallowed_tools=["Bash"])
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir))
+    armed, unarmed = _argv(log)[0], _argv(log)[1]
+    assert "--dangerously-bypass-hook-trust" in armed
+    assert "--dangerously-bypass-hook-trust" not in unarmed
+
+
+# --- the hook script itself, on the wire format codex actually sends ---------
+
+def _run_hook(payload, denied):
+    """Drive the real script the way codex does: JSON on stdin, JSON back."""
+    script = Path(codex_cli.__file__).with_name("codex_hook_deny.py")
+    out = subprocess.run(
+        [sys.executable, str(script)], input=json.dumps(payload),
+        capture_output=True, text=True,
+        env={**os.environ, "KBOTS_DENIED_TOOLS": denied})
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout)
+
+
+def test_hook_denies_a_blocked_tool_with_a_reason():
+    """codex rejects permissionDecision:deny without a non-empty reason, so
+    the reason is part of the contract, not decoration."""
+    out = _run_hook({"tool_name": "Bash", "tool_input": {"command": "rm -rf /"}},
+                    "Bash")
+    specific = out["hookSpecificOutput"]
+    assert specific["hookEventName"] == "PreToolUse"
+    assert specific["permissionDecision"] == "deny"
+    assert specific["permissionDecisionReason"].strip()
+
+
+def test_hook_lets_an_unlisted_tool_through():
+    """PreToolUse rejects permissionDecision 'allow' and 'ask' outright, so
+    the only way to permit a call is to return no decision at all."""
+    assert _run_hook({"tool_name": "Read", "tool_input": {}}, "Bash") == {}
+
+
+def test_hook_permits_everything_when_nothing_is_denied():
+    assert _run_hook({"tool_name": "Bash", "tool_input": {}}, "") == {}
+
+
+def test_hook_refuses_a_payload_it_cannot_parse():
+    """An unparseable payload is a tool call that cannot be vetted. While a
+    deny list is in force that has to fail closed."""
+    script = Path(codex_cli.__file__).with_name("codex_hook_deny.py")
+    out = subprocess.run(
+        [sys.executable, str(script)], input="{not json",
+        capture_output=True, text=True,
+        env={**os.environ, "KBOTS_DENIED_TOOLS": "Bash"})
+    assert json.loads(out.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"

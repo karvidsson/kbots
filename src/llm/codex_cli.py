@@ -33,14 +33,16 @@ access control, other agents' private tools) reaches codex through
 KBOTS_MCP_DENY on the MCP server rather than a CLI flag, because codex has no
 per-tool switch. See deny_env.
 
-Limitation: blocked BUILTINS are still not enforced. `disallow_builtins:
-[Bash]` is honoured for claude_code via --disallowedTools and has no codex
-equivalent — codex's shell is governed by the sandbox, and its execpolicy
-rules engine (`codex execpolicy check`) cannot be reached from `codex exec`
-in 0.153.4: there is no --rules flag, no config key, no discovered
-default.rules at either $CODEX_HOME or <project>/.codex, and the
-`request_rule` feature is marked removed. An agent that must not run shell
-commands needs `sandbox: read-only`, which also costs it file edits.
+Blocked builtins (`disallow_builtins: [Bash]`) are enforced through codex's
+PreToolUse hook, which refuses the call and tells the model why. Codex names
+its shell tool "Bash", the same name kbots already uses, so the config maps
+across untranslated. See write_hook_config.
+
+Not the execpolicy engine, which looked like the obvious fit and is not
+reachable: `codex exec` in 0.153.4 has no --rules flag, no config key accepts
+a rules path, no default.rules is discovered at $CODEX_HOME or
+<project>/.codex (both tested against a live run), and `codex features list`
+reports `request_rule` as removed.
 """
 
 import asyncio
@@ -115,15 +117,98 @@ def deny_env(disallowed_tools) -> dict:
     these except three". Enforcement therefore moves into the MCP server, which
     codex respawns per `codex exec`, so a per-turn value is safe.
 
-    Builtins in the list (Bash, Edit, ...) are dropped here: they are not MCP
-    tools and codex's shell is governed by the sandbox instead. That gap is
-    real and unclosed — see the module docstring.
+    Builtins in the list (Bash, Edit, ...) are not MCP tools and are dropped
+    here; write_hook_config enforces those instead.
     """
     names = sorted({
         t[len(_KBOTS_TOOL_PREFIX):] for t in (disallowed_tools or [])
         if t.startswith(_KBOTS_TOOL_PREFIX)
     })
     return {"KBOTS_MCP_DENY": ",".join(names)} if names else {}
+
+
+def denied_builtins(disallowed_tools) -> list[str]:
+    """The non-MCP names in the engine's disallowed_tools list.
+
+    Everything with an mcp__ prefix is a tool the MCP server withholds
+    (deny_env); what is left is a CLI builtin, which is the hook's business.
+    """
+    return sorted({
+        t for t in (disallowed_tools or [])
+        if t and not t.startswith("mcp__")
+    })
+
+
+def write_hook_config(project_dir: Path, denied: list[str]) -> bool:
+    """Write <project_dir>/.codex/hooks.json denying `denied`. True if written.
+
+    Codex's PreToolUse hook is the only way to refuse a builtin without taking
+    the sandbox to read-only, which would also cost the agent file edits. The
+    hook receives {"tool_name": "Bash", "tool_input": {...}} and returns a
+    deny decision; codex reports the refusal to the model as text, so it can
+    say what it cannot do instead of failing opaquely.
+
+    Three properties of codex 0.153.4 this depends on, each verified live:
+
+    * `<cwd>/.codex/hooks.json` is the ONLY discovery path. `hooks.managed_dir`
+      is a real config key and does not load a hooks.json placed there, and
+      neither does $CODEX_HOME. So the file has to go in the agent's own
+      project dir.
+    * `"enabled": true` per entry is required. Without it the hook is parsed
+      and never runs, silently.
+    * an untrusted hook is skipped, also silently, so the run needs
+      --dangerously-bypass-hook-trust.
+
+    That flag is why this function OVERWRITES rather than merges, and why the
+    caller must only pass the flag when this returned True. The flag trusts
+    every hook codex finds, and the file lives in a directory the agent can
+    write to, so a prompt-injected agent could otherwise leave a hook here and
+    have the next turn run it. Rewriting the file immediately before spawn
+    destroys anything the agent put there; with nothing to deny we delete it
+    and pass no flag, so an agent-authored hook stays untrusted and inert.
+    """
+    hooks_dir = Path(project_dir) / ".codex"
+    hooks_file = hooks_dir / "hooks.json"
+    if not denied:
+        # Not "leave it alone": a file from an earlier turn would still be
+        # here, and this turn has no flag to make it run, but the next turn
+        # with denials would trust whatever it contains.
+        hooks_file.unlink(missing_ok=True)
+        return False
+
+    script = Path(__file__).with_name("codex_hook_deny.py")
+    config = {
+        "hooks": {
+            "PreToolUse": [{
+                # The script filters by name, so one entry covers every
+                # denied tool and the command string stays identical across
+                # turns and agents.
+                "matcher": "*",
+                "enabled": True,
+                "hooks": [{
+                    "type": "command",
+                    # A bare executable path, NOT "<python> <script>": codex
+                    # runs this string as one program and does not split it on
+                    # spaces, so an interpreter prefix makes the hook fail to
+                    # start, which it reports nowhere and which fails open.
+                    # The script carries its own shebang and imports only the
+                    # stdlib, so the interpreter on PATH is enough.
+                    #
+                    # No "env" key here. Codex 0.153.4 accepts one and does not
+                    # apply it: the hook process inherits codex's environment
+                    # instead. The deny list therefore travels in the env this
+                    # provider hands the codex subprocess (KBOTS_DENIED_TOOLS,
+                    # set in complete()), which the hook does receive. Putting
+                    # it here instead looks right, is accepted silently, and
+                    # leaves the hook allowing everything.
+                    "command": str(script),
+                }],
+            }]
+        }
+    }
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hooks_file.write_text(json.dumps(config, indent=2) + "\n")
+    return True
 
 
 def _expand_env_refs(value: str, env: dict) -> str:
@@ -279,6 +364,15 @@ class CodexCLIProvider(LLMProvider):
         # only so mcp_config_args can copy it into each server's table; codex
         # itself ignores it.
         env.update(deny_env(kwargs.get("disallowed_tools")))
+        # Builtins are refused by a PreToolUse hook instead, which has to be on
+        # disk before codex starts. Rewritten (or removed) every turn, so it
+        # always states this turn's grants and never an earlier turn's.
+        builtins = denied_builtins(kwargs.get("disallowed_tools"))
+        hooks_armed = write_hook_config(cwd, builtins)
+        if hooks_armed:
+            # The hook reads this from the environment it inherits from codex.
+            env["KBOTS_DENIED_TOOLS"] = ",".join(builtins)
+            logger.debug(f"{tag}codex hook denies: {', '.join(builtins)}")
 
         # One retry: a stale/unknown session id drops resume and starts fresh.
         for resuming in ([True, False] if session_id else [False]):
@@ -299,6 +393,7 @@ class CodexCLIProvider(LLMProvider):
                 approval_policy=approval_policy,
                 approvals_reviewer=approvals_reviewer,
                 additional_dirs=additional_dirs,
+                hooks_armed=hooks_armed,
             )
             logger.debug(f"{tag}codex exec: cwd={cwd} model={model} "
                          f"resume={resuming} prompt_len={len(prompt)}")
@@ -329,11 +424,17 @@ class CodexCLIProvider(LLMProvider):
         approval_policy,
         approvals_reviewer,
         additional_dirs,
+        hooks_armed: bool = False,
     ) -> list[str]:
         args = [self._codex_bin, "exec", "--json", "--skip-git-repo-check",
                 "-s", sandbox,
                 "-c", f"approval_policy = {_toml_str(approval_policy)}",
                 "-c", f"approvals_reviewer = {_toml_str(approvals_reviewer)}"]
+        if hooks_armed:
+            # Codex skips an untrusted hook silently, which for a deny hook
+            # means failing open. Only ever passed for the file we just wrote
+            # ourselves; see write_hook_config for why that bounds the flag.
+            args.append("--dangerously-bypass-hook-trust")
         for directory in additional_dirs:
             args.extend(["--add-dir", directory])
         if model:
