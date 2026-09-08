@@ -70,6 +70,52 @@ _APPROVAL_REVIEWERS = ("user", "auto_review")
 _EFFORT_MAP = {"low": "low", "medium": "medium", "high": "high",
                "xhigh": "xhigh", "max": "xhigh"}
 
+# `approvals_reviewer = auto_review` puts a reviewer model in front of every
+# escalated action. When it refuses, codex prints the verdict to stderr as a
+# Rust debug string and the tool call returns status "declined":
+#
+#   ERROR codex_core::tools::router: error=exec_command failed: CreateProcess {
+#     message: "Rejected(\"This action was rejected due to unacceptable risk.
+#     \nReason: <why>\nDo not bypass ...\")" }
+#
+# A refusal is a decision with a stated reason, not a crash, and that reason is
+# the only thing telling the owner what to authorise instead. It sits well past
+# the first 300 characters of stderr, so it has to be dug out rather than
+# truncated into.
+_REJECTED = re.compile(r"Rejected\(\\?\"(.+?)\\?\"\)", re.DOTALL)
+_REASON_LINE = re.compile(r"Reason:\s*(.+?)(?:\\n|\n|$)", re.DOTALL)
+
+
+# Phrases that mean "this host cannot talk to the API", as opposed to any
+# sentence containing the letters a-u-t-h.
+_AUTH_MARKERS = (
+    "codex login", "not logged in", "please log in", "please login",
+    "authentication failed", "401 unauthorized", "invalid api key",
+    "missing api key", "no credentials", "auth.json",
+)
+
+
+def _looks_like_auth_error(stderr: str) -> bool:
+    low = (stderr or "").lower()
+    return any(m in low for m in _AUTH_MARKERS)
+
+
+def refusal_reason(stderr: str) -> str | None:
+    """The auto-review reviewer's stated reason, if it refused something.
+
+    Returns just the reason, not the boilerplate around it: the rest of the
+    Rejected() payload is instruction addressed to the codex model ("do not
+    bypass this", "continue with a safer alternative") and repeating it to the
+    owner reads as the agent lecturing them about their own request.
+    """
+    hit = _REJECTED.search(stderr or "")
+    if not hit:
+        return None
+    body = hit.group(1).replace("\\n", "\n")
+    reason = _REASON_LINE.search(body)
+    text = (reason.group(1) if reason else body.split("\n")[0]).strip()
+    return text or None
+
 
 def _toml_str(value: str) -> str:
     """A TOML basic string (json string quoting is valid TOML)."""
@@ -374,6 +420,10 @@ class CodexCLIProvider(LLMProvider):
             env["KBOTS_DENIED_TOOLS"] = ",".join(builtins)
             logger.debug(f"{tag}codex hook denies: {', '.join(builtins)}")
 
+        # Why the last attempt failed, filled in by _run. A list because the
+        # loop may run twice and only the final attempt's cause is the one to
+        # report; a per-call local keeps concurrent agents independent.
+        why: list[str] = []
         # One retry: a stale/unknown session id drops resume and starts fresh.
         for resuming in ([True, False] if session_id else [False]):
             prompt = build_cli_prompt(messages, resuming=resuming)
@@ -403,13 +453,17 @@ class CodexCLIProvider(LLMProvider):
             result = await self._run(
                 args, cwd, env, tag,
                 timeout=float(kwargs.get("timeout") or self._timeout),
-                startup=self._startup_timeout if resuming else None)
+                startup=self._startup_timeout if resuming else None,
+                why=why)
             if result is not None:
                 return result
             if resuming:
                 logger.warning(
                     f"{tag}codex resume {session_id} failed — starting fresh")
-        raise RuntimeError("codex exec failed (see logs for stderr)")
+        # Carry the cause into the message the owner sees. "see logs for stderr"
+        # made every distinct failure look identical in Discord.
+        raise RuntimeError(f"codex exec failed: {why[-1]}" if why
+                           else "codex exec failed (see logs for stderr)")
 
     def _build_args(
         self,
@@ -449,7 +503,8 @@ class CodexCLIProvider(LLMProvider):
         return args
 
     async def _run(self, args, cwd, env, tag, timeout: float,
-                   startup: float | None) -> LLMResponse | None:
+                   startup: float | None,
+                   why: list[str] | None = None) -> LLMResponse | None:
         """One codex exec invocation. None = retriable failure (resume drop)."""
         proc = await asyncio.create_subprocess_exec(
             *args, cwd=str(cwd), env=env,
@@ -482,19 +537,53 @@ class CodexCLIProvider(LLMProvider):
                     await run_task
 
         thread_id, content, tokens = self._parse_events(stdout, tag)
+        model = str(args[args.index('-m') + 1]) if '-m' in args else "codex-default"
         if proc.returncode != 0 or content is None:
             err = (stderr or b"").decode(errors="replace").strip()
-            if "login" in err.lower() or "auth" in err.lower():
+            refusal = refusal_reason(err)
+            # Refusal first, and only then auth. The old test was `"auth" in
+            # err`, which matches "authorization" and "authorized" — both of
+            # which appear in ordinary approval-review verdicts. A refusal was
+            # therefore reported as an auth failure telling the owner to run
+            # `codex login`, which is neither the problem nor a fix for it.
+            if refusal is None and _looks_like_auth_error(err):
                 raise RuntimeError(
                     f"codex auth error — run `codex login` on the host: {err[:300]}")
+            if content:
+                # A non-zero exit does NOT mean the turn produced nothing. An
+                # auto-review refusal, or an abort after several of them, ends
+                # the process non-zero having already written a real reply that
+                # usually explains the situation. Discarding it cost the owner
+                # the answer AND the reason, and left "codex exec failed" as the
+                # only visible symptom; on a resume it also spent a second full
+                # turn redoing work that would be refused identically.
+                logger.warning(
+                    f"{tag}codex exec rc={proc.returncode} but the turn "
+                    f"produced a reply — returning it"
+                    + (f" (blocked: {refusal})" if refusal else ""))
+                return LLMResponse(
+                    content=content + (
+                        f"\n\n(Blocked by codex automatic approval review: "
+                        f"{refusal})" if refusal else ""),
+                    tokens_used=tokens,
+                    model=model,
+                    # Not "error": that clears the CLI session id, and the codex
+                    # thread is intact and resumable. Not "stop" either, so the
+                    # reflector does not mine a cut-short turn for lessons.
+                    stop_reason="aborted",
+                    session_id=thread_id,
+                )
+            cause = (f"blocked by automatic approval review: {refusal}"
+                     if refusal else (err[-400:] or "no output and no stderr"))
             logger.warning(
-                f"{tag}codex exec rc={proc.returncode}, "
-                f"content={'yes' if content else 'no'}: {err[:300]}")
+                f"{tag}codex exec rc={proc.returncode}, no content: {cause}")
+            if why is not None:
+                why.append(cause)
             return None
         return LLMResponse(
             content=content,
             tokens_used=tokens,
-            model=str(args[args.index('-m') + 1]) if '-m' in args else "codex-default",
+            model=model,
             stop_reason="stop",
             session_id=thread_id,
         )

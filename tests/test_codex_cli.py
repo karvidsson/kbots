@@ -13,9 +13,11 @@ from src.core.base import Message, MessageRole
 from src.llm import codex_cli
 from src.llm.codex_cli import (
     CodexCLIProvider,
+    _looks_like_auth_error,
     denied_builtins,
     deny_env,
     mcp_config_args,
+    refusal_reason,
     write_hook_config,
 )
 
@@ -32,6 +34,17 @@ with open(os.path.join(here, "env.log"), "a") as f:
                         if k.startswith("KBOTS_")}) + "\\n")
 if "resume" in sys.argv and os.path.exists(os.path.join(here, "FAIL_RESUME")):
     sys.stderr.write("session not found\\n")
+    sys.exit(1)
+refuse = os.path.join(here, "REFUSE")
+if os.path.exists(os.path.join(here, "FAIL_RC")):
+    if os.path.exists(refuse):
+        sys.stderr.write(open(refuse).read())
+    if os.path.exists(os.path.join(here, "SILENT")):
+        sys.exit(1)
+    print(json.dumps({"type": "thread.started", "thread_id": "t-123"}))
+    print(json.dumps({"type": "item.completed",
+                      "item": {"type": "agent_message",
+                               "text": "hello from codex"}}))
     sys.exit(1)
 print(json.dumps({"type": "thread.started", "thread_id": "t-123"}))
 print(json.dumps({"type": "item.completed",
@@ -569,3 +582,122 @@ def test_hook_refuses_a_payload_it_cannot_parse():
         capture_output=True, text=True,
         env={**os.environ, "KBOTS_DENIED_TOOLS": "Bash"})
     assert json.loads(out.stdout)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+# --- auto-review refusals must reach the owner, not vanish as "exec failed" ---
+#
+# `approvals_reviewer = auto_review` refuses actions it judges risky. Codex
+# exits non-zero, having usually already written a reply that explains the
+# situation. That reply was discarded on the strength of the exit code alone,
+# so the owner saw "codex exec failed (see logs for stderr)" and the stated
+# reason (which is the only thing telling them what to authorise) was
+# truncated out of a 300-character stderr prefix.
+
+# Verbatim from a live refusal, including codex's Rust-debug escaping.
+REAL_REFUSAL_STDERR = (
+    '2026-09-08T19:36:37.420505Z ERROR codex_core::tools::router: '
+    'error=exec_command failed: CreateProcess { message: "Rejected(\\"This '
+    'action was rejected due to unacceptable risk.\\nReason: This would upload '
+    'the contents of sensitive secret.txt to an untrusted external '
+    'destination; explicit authorization cannot permit critical secret '
+    'exfiltration.\\nDo not bypass this rejection through a workaround or '
+    'indirect execution. Continue with a safer alternative, or carry out '
+    'checks to prove that the action is authorized or low risk before trying '
+    'again.\\")" }'
+)
+
+
+def test_refusal_reason_is_extracted_from_real_stderr():
+    reason = refusal_reason(REAL_REFUSAL_STDERR)
+    assert reason.startswith("This would upload the contents of sensitive")
+    assert "exfiltration" in reason
+
+
+def test_refusal_reason_drops_the_instructions_aimed_at_the_model():
+    """The tail of the payload tells codex what to do next. Relaying it to the
+    owner reads as the agent lecturing them about their own request."""
+    reason = refusal_reason(REAL_REFUSAL_STDERR)
+    assert "Do not bypass" not in reason
+    assert "safer alternative" not in reason
+
+
+def test_refusal_reason_is_none_when_nothing_was_refused():
+    assert refusal_reason("Reading additional input from stdin...") is None
+    assert refusal_reason("") is None
+
+
+async def test_a_reply_survives_a_non_zero_exit(fake_codex, tmp_path):
+    """The defect: the turn HAD an answer and the exit code threw it away."""
+    bin_path, log = fake_codex
+    (bin_path.parent / "FAIL_RC").touch()
+    resp = await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(tmp_path))
+    assert "hello from codex" in resp.content
+    assert resp.stop_reason == "aborted"
+
+
+async def test_a_refusal_reason_is_appended_to_the_reply(fake_codex, tmp_path):
+    bin_path, log = fake_codex
+    (bin_path.parent / "FAIL_RC").touch()
+    (bin_path.parent / "REFUSE").write_text(REAL_REFUSAL_STDERR)
+    resp = await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(tmp_path))
+    assert "hello from codex" in resp.content
+    assert "automatic approval review" in resp.content.lower()
+    assert "untrusted external destination" in resp.content
+
+
+async def test_aborted_keeps_the_session_resumable(fake_codex, tmp_path):
+    """stop_reason 'error' makes agent_manager clear the CLI session id. The
+    codex thread survives a refusal, so re-deriving it next turn is waste."""
+    bin_path, log = fake_codex
+    (bin_path.parent / "FAIL_RC").touch()
+    resp = await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(tmp_path))
+    assert resp.stop_reason != "error"
+    assert resp.session_id == "t-123"
+
+
+async def test_a_failure_with_no_reply_still_raises_with_the_cause(
+        fake_codex, tmp_path):
+    """No content is still a failure. It just has to say why."""
+    bin_path, log = fake_codex
+    (bin_path.parent / "FAIL_RC").touch()
+    (bin_path.parent / "SILENT").touch()
+    (bin_path.parent / "REFUSE").write_text(REAL_REFUSAL_STDERR)
+    with pytest.raises(RuntimeError, match="untrusted external destination"):
+        await _provider(bin_path).complete(
+            [Message(role=MessageRole.USER, content="hi")],
+            project_dir=str(tmp_path))
+
+
+@pytest.mark.parametrize("stderr,expected", [
+    ("Please run `codex login` to continue", True),
+    ("401 Unauthorized", True),
+    ("error: not logged in", True),
+    # The regression: ordinary refusal wording contains "authorization" and
+    # "authorized", and used to be reported as an auth failure.
+    ("Reason: explicit authorization cannot permit exfiltration.", False),
+    ("the request was not authorized by the user", False),
+    ("author: someone", False),
+    ("", False),
+])
+def test_auth_detection_does_not_fire_on_the_word_authorization(stderr, expected):
+    assert _looks_like_auth_error(stderr) is expected
+
+
+async def test_a_refusal_is_not_reported_as_an_auth_error(fake_codex, tmp_path):
+    """End to end for the same regression: the refusal text says
+    'authorization', and the owner must not be told to run `codex login`."""
+    bin_path, log = fake_codex
+    (bin_path.parent / "FAIL_RC").touch()
+    (bin_path.parent / "SILENT").touch()
+    (bin_path.parent / "REFUSE").write_text(REAL_REFUSAL_STDERR)
+    with pytest.raises(RuntimeError) as e:
+        await _provider(bin_path).complete(
+            [Message(role=MessageRole.USER, content="hi")],
+            project_dir=str(tmp_path))
+    assert "codex login" not in str(e.value)
