@@ -21,6 +21,7 @@ deploy-blocked report on a fresh VPS, 2026-08-26.
 import importlib.util
 import plistlib
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -85,6 +86,30 @@ def test_the_rendered_unit_grants_every_directory_the_engine_writes(tmp_path):
                 if ln.startswith("ReadWritePaths="))
     for d in base.overlay_writable_dirs(tmp_path):
         assert str(d) in line, f"{d} missing from {line}"
+
+
+def test_every_directory_an_agent_session_gets_is_one_the_unit_can_write(monkeypatch, tmp_path):
+    """The pairing the codex fell through. Two gates decide whether an agent can
+    write a path: agent_session_dirs() hands it to the session, and the unit
+    mounts it read-write. Granting the first without the second is invisible in
+    every test and on any host with no sandbox, and surfaces only as EROFS on a
+    hardened Linux install, in the one place the agent was told to write.
+    """
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    monkeypatch.setenv("KBOTS_TMP", str(tmp_path / "tmp"))
+    # Named literally, NOT derived from OVERLAY_WRITABLE_SUBDIRS: a fixture built
+    # from the constant under test cannot fail. Drop an entry and the directory
+    # simply would not exist, agent_session_dirs() would skip it, and the
+    # assertion below would pass on nothing.
+    for d in ("agents", "codex", "tmp"):
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+
+    granted = setup.service_writable_dirs(tmp_path)
+    for raw in base.agent_session_dirs():
+        d = Path(raw)
+        if tmp_path not in d.parents and d != tmp_path:
+            continue  # outside the overlay, not this unit's business
+        assert d in granted, f"{d} is handed to an agent session but mounted read-only"
 
 
 def test_the_wizard_creates_every_path_it_grants(tmp_path):

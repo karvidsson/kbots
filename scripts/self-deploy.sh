@@ -25,7 +25,13 @@ cd "$ENGINE_ROOT"
 # must target the owner's gui domain (gui/0 doesn't exist), $HOME-derived
 # overlay/log paths must resolve to the owner's, and a root-run test gate
 # leaves root-owned caches (.ruff_cache, __pycache__) that break later runs.
-OWNER="$(stat -f %Su "$ENGINE_ROOT" 2>/dev/null || stat -c %U "$ENGINE_ROOT" 2>/dev/null)"
+# GNU stat first, BSD second. The order matters and is not cosmetic: `-f` on
+# GNU coreutils means "filesystem status", not a format string, so `stat -f %Su`
+# SUCCEEDS on Linux and prints block counts. Probing BSD first therefore never
+# falls through, OWNER becomes a blob of filesystem statistics, and the re-exec
+# below dies on `sudo: unknown user` — after the deploy has already reported
+# itself started. BSD stat has no `-c` and simply errors, so it falls through.
+OWNER="$(stat -c %U "$ENGINE_ROOT" 2>/dev/null || stat -f %Su "$ENGINE_ROOT" 2>/dev/null)"
 if [ "$(id -u)" = "0" ] && [ -n "$OWNER" ] && [ "$OWNER" != "root" ]; then
     echo "[self-deploy] running as root — re-executing as install owner '$OWNER'"
     exec sudo -H -u "$OWNER" "${BASH_SOURCE[0]}" "$@"
@@ -86,7 +92,11 @@ health_ok() {
 log "install at $(git rev-parse --short HEAD) — pulling latest"
 # Bare pull uses the branch's configured tracking remote (may be 'upstream',
 # not 'origin'); matches update.sh and avoids a hardcoded remote name.
-if ! git pull --ff-only; then
+# --no-rebase because a deployment repo may carry pull.rebase=true, and a
+# rebasing pull aborts on ANY unstaged change even when there is nothing to
+# fetch. A deploy must not be blocked by an unrelated local edit it will never
+# touch; --ff-only already rules out the merge commit --no-rebase would allow.
+if ! git pull --ff-only --no-rebase; then
     log "pull failed / not fast-forward — aborting (resolve manually)"; exit 1
 fi
 # Fetch tags too — the platform version is derived from the nearest vX.Y.Z tag
