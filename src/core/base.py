@@ -309,8 +309,13 @@ def install_write_root() -> Path:
 # one bug. Adding a new state file must not be able to reintroduce it, so there
 # is one list and a test that holds the two ends together.
 OVERLAY_STATE_DIR = "data"
-OVERLAY_WRITABLE_SUBDIRS = ("agents", "config", OVERLAY_STATE_DIR, "tmp",
-                            "tools", "skills")
+# codex/ is here because agent_session_dirs() hands every agent the codex as a
+# working directory and the startup context tells it to keep the codex current.
+# Granting a directory to the session while the unit mounts it read-only is the
+# exact split this constant exists to prevent: the agent is told to write, the
+# permission layer allows it, and the kernel returns EROFS from under both.
+OVERLAY_WRITABLE_SUBDIRS = ("agents", "codex", "config", OVERLAY_STATE_DIR,
+                            "tmp", "tools", "skills")
 
 
 def overlay_writable_dirs(overlay: str | Path) -> list[Path]:
