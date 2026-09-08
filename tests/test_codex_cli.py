@@ -6,7 +6,7 @@ import stat
 import pytest
 
 from src.core.base import Message, MessageRole
-from src.llm.codex_cli import CodexCLIProvider, mcp_config_args
+from src.llm.codex_cli import CodexCLIProvider, deny_env, mcp_config_args
 
 # The fake logs argv and signals resume-failure via files next to its own
 # binary — NOT env vars, because the provider passes only an allowlisted env to
@@ -280,6 +280,55 @@ async def test_no_user_id_leaves_identity_unset(fake_codex, tmp_path):
         project_dir=str(agent_dir),
     )
     assert "KBOTS_USER_ID" not in " ".join(_argv(log)[0])
+
+
+# --- tool grants: the engine's disallowed_tools list must actually bite ---
+
+
+def test_deny_env_keeps_only_kbots_tools():
+    """Builtins and external MCP servers share the disallowed_tools list.
+    Only kbots tools can be withheld by the kbots MCP server, and it wants
+    bare names, not the CLI's mcp__kbots-tools__ prefix."""
+    assert deny_env([
+        "mcp__kbots-tools__run_command",
+        "mcp__kbots-tools__create_tool",
+        "Bash",
+        "mcp__hostinger-vps",
+    ]) == {"KBOTS_MCP_DENY": "create_tool,run_command"}
+
+
+@pytest.mark.parametrize("disallowed", [None, [], ["Bash"], ["mcp__other"]])
+def test_deny_env_empty_when_nothing_kbots_is_blocked(disallowed):
+    """An empty value would still be forwarded as a var; nothing blocked must
+    mean nothing set, so the server's own parse stays trivially empty."""
+    assert deny_env(disallowed) == {}
+
+
+async def test_run_passes_tool_denials_to_mcp_servers(fake_codex, tmp_path):
+    """The hole this closes: codex has no --disallowedTools, so before this
+    every per-agent and per-sender tool block was silently dropped."""
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    _write_mcp(agent_dir, {"KBOTS_AGENT_ID": "atlas"})
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir),
+        disallowed_tools=["mcp__kbots-tools__run_command", "Bash"],
+    )
+    assert 'KBOTS_MCP_DENY = "run_command"' in " ".join(_argv(log)[0])
+
+
+async def test_no_denials_leaves_the_surface_whole(fake_codex, tmp_path):
+    bin_path, log = fake_codex
+    agent_dir = tmp_path / "agent"
+    agent_dir.mkdir()
+    _write_mcp(agent_dir, {"KBOTS_AGENT_ID": "atlas"})
+    await _provider(bin_path).complete(
+        [Message(role=MessageRole.USER, content="hi")],
+        project_dir=str(agent_dir),
+    )
+    assert "KBOTS_MCP_DENY" not in " ".join(_argv(log)[0])
 
 
 # --- deadlines: same two questions as claude_code, same defaults ---

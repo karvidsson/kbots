@@ -513,13 +513,27 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     dangerous_prefixes = DANGEROUS_TOOL_PREFIXES
     dangerous_names = DANGEROUS_TOOL_NAMES
 
+    # Per-turn deny list, set by a provider that cannot gate tools in the CLI
+    # itself. Claude Code takes --disallowedTools; codex has no equivalent (its
+    # MCP config is per-server, so a single kbots-tools server is all-or-
+    # nothing), which left every access-control decision below unenforced for
+    # codex agents. Codex respawns its MCP servers once per `codex exec`, so a
+    # value computed for this turn — agent tool list, per-sender tier, private
+    # tools of other agents — applies to exactly this turn.
+    denied = {t.strip() for t in
+              os.environ.get("KBOTS_MCP_DENY", "").split(",") if t.strip()}
+
     # Register each kbots tool as an MCP tool with middleware wrapping
     skipped = []
+    withheld = []
     failed = []
     for tool_name, tool_def in kbots_tools.items():
         if restrict and (tool_name in dangerous_names
                          or tool_name.startswith(dangerous_prefixes)):
             skipped.append(tool_name)
+            continue
+        if tool_name in denied:
+            withheld.append(tool_name)
             continue
         # One malformed tool must not cost the agent all the others. Registration
         # touches user-authored signatures, so it is exactly where a bad edit
@@ -537,6 +551,9 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     if skipped:
         logger.warning(f"KBOTS_MCP_RESTRICT: withheld {len(skipped)} dangerous tools "
                        f"from the MCP surface: {', '.join(sorted(skipped))}")
+    if withheld:
+        logger.info(f"KBOTS_MCP_DENY: withheld {len(withheld)} tools for this "
+                    f"turn: {', '.join(sorted(withheld))}")
 
     return mcp
 
