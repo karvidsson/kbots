@@ -215,3 +215,25 @@ async def test_session_with_no_recorded_provider_is_left_alone(tmp_path, storage
     await storage.save_cli_session_id("bot:c1", "legacy-1")   # no provider
     await mgr.handle_message("bot", _msg())
     assert alpha.calls[0]["session_id"] == "legacy-1"
+
+
+# --- background jobs pick a model the current provider accepts --------------
+
+@pytest.mark.asyncio
+async def test_background_model_follows_the_provider_override(tmp_path, storage):
+    alpha, beta = RecordingProvider(), RecordingProvider()
+    mgr = _mk_manager(tmp_path, storage, {"alpha": alpha, "beta": beta})
+    alpha.name, beta.name = "alpha", "beta"
+
+    # configured: alpha-large on alpha
+    assert await mgr.background_model_for("bot", alpha) == "alpha-large"
+    # a cheap model configured for this provider wins
+    assert await mgr.background_model_for("bot", alpha, cheap={"alpha": "alpha-mini"}) == "alpha-mini"
+    # switched to beta with no model: beta's own default, never alpha-large
+    await storage.set_agent_override("bot", "provider", "beta")
+    assert await mgr.background_model_for("bot", beta) is None
+    # switched with a model: that model
+    await storage.set_agent_override("bot", "model", "beta-pro")
+    assert await mgr.background_model_for("bot", beta) == "beta-pro"
+    # and the cheap map only applies to its own provider
+    assert await mgr.background_model_for("bot", beta, cheap={"alpha": "alpha-mini"}) == "beta-pro"

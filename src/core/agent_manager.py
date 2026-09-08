@@ -333,6 +333,30 @@ class AgentManager:
             return ""
         return configured
 
+    async def background_model_for(self, agent_id: str, llm,
+                                   cheap: dict | None = None) -> str | None:
+        """Model for a background call (summary, reflection) on `llm`.
+
+        Model names are vendor-local, so a background job must pick one the
+        agent's CURRENT provider accepts: a cheap model configured for that
+        provider if there is one, else the agent's effective model with
+        runtime overrides applied. A provider override with no model override
+        yields None, the provider's own default. Reading agents.yaml alone
+        handed codex an 'opus' after a live provider switch and earned a 400.
+        """
+        name = getattr(llm, "name", "")
+        if cheap and cheap.get(name):
+            return cheap[name]
+        overrides: dict = {}
+        if self.storage:
+            try:
+                overrides = await self.storage.get_agent_overrides(agent_id)
+            except Exception as e:
+                logger.debug(f"override read failed for {agent_id}: {e}")
+        configured = (((self.agent_configs.get(agent_id) or {}).get("llm") or {})
+                      .get("model"))
+        return self._effective_model(overrides, configured) or None
+
     async def _drop_foreign_cli_session(self, session: "Session", provider_used: str) -> None:
         """Forget a CLI session id that a different provider minted.
 
@@ -1755,7 +1779,9 @@ class AgentManager:
             response = await llm.complete(
                 [Message(role=MessageRole.USER, content=summary_prompt)],
                 project_dir=self._get_project_dir(agent_id),
-                model="haiku",  # cheap and fast for summaries
+                # cheap and fast for summaries, but only where that name exists
+                model=await self.background_model_for(
+                    agent_id, llm, cheap={"claude_code": "haiku"}),
                 agent_id=agent_id,
             )
 

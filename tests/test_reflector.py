@@ -325,3 +325,58 @@ def test_digest_version_bump_expires_every_timer_once(overlay, tmp_path):
     runtime_state.set_flag("reflector_last_a", 1_700_000_000.0)
     assert r._reset_timers_if_digest_changed() is False
     assert runtime_state.get_flag("reflector_last_a") == 1_700_000_000.0
+
+
+# --- the reflection model follows runtime overrides --------------------------
+
+class OverrideMgr(FakeMgr):
+    """A manager that answers background_model_for like the real one: cheap
+    model for the provider if configured, else the effective model with
+    overrides applied (None when a provider override has no model)."""
+
+    def __init__(self, *a, overrides=None, **kw):
+        super().__init__(*a, **kw)
+        self.overrides = overrides or {}
+        self.asked = []
+
+    async def background_model_for(self, agent_id, llm, cheap=None):
+        self.asked.append(agent_id)
+        if "model" in self.overrides:
+            return self.overrides["model"]
+        if self.overrides.get("provider"):
+            return None
+        return (self.agent_configs[agent_id].get("llm") or {}).get("model")
+
+
+async def test_reflect_uses_the_model_override_after_a_provider_switch(overlay, tmp_path):
+    """agents.yaml still says opus; the agent was switched to codex at runtime
+    with model gpt-6-astra. Reflecting on 'opus' 400s on codex."""
+    llm = FakeLLM(name="codex_cli")
+    mgr = OverrideMgr(FakeMemory(_lessons()), tmp_path, llm,
+                      {"llm": {"provider": "claude_code", "model": "opus"}},
+                      overrides={"provider": "codex_cli", "model": "gpt-6-astra"})
+    r = Reflector(mgr, {"model": "haiku", "min_lessons": 3})
+    assert await r._reflect("a") is True
+    assert llm.calls[0]["model"] == "gpt-6-astra"
+    assert mgr.asked == ["a"]
+
+
+async def test_reflect_uses_provider_default_after_a_bare_provider_switch(overlay, tmp_path):
+    llm = FakeLLM(name="codex_cli")
+    mgr = OverrideMgr(FakeMemory(_lessons()), tmp_path, llm,
+                      {"llm": {"provider": "claude_code", "model": "opus"}},
+                      overrides={"provider": "codex_cli"})
+    r = Reflector(mgr, {"model": "haiku", "min_lessons": 3})
+    assert await r._reflect("a") is True
+    assert llm.calls[0]["model"] is None
+
+
+async def test_configured_cheap_model_still_wins_over_an_override(overlay, tmp_path):
+    llm = FakeLLM(name="claude_code")
+    mgr = OverrideMgr(FakeMemory(_lessons()), tmp_path, llm,
+                      {"llm": {"provider": "claude_code", "model": "opus"}},
+                      overrides={"model": "sonnet"})
+    r = Reflector(mgr, {"model": "haiku", "min_lessons": 3})
+    assert await r._reflect("a") is True
+    assert llm.calls[0]["model"] == "haiku"
+    assert mgr.asked == []
