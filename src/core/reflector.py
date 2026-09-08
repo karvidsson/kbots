@@ -147,19 +147,27 @@ class Reflector:
         last = runtime_state.get_flag(f"reflector_last_{agent_id}", 0) or 0
         return (now - float(last)) >= self.interval_h * 3600
 
-    def _model_for(self, agent_id: str, llm) -> str | None:
+    async def _model_for(self, agent_id: str, llm) -> str | None:
         """Reflection model for this agent.
 
         A cheap model configured for the provider if there is one, otherwise
-        the agent's OWN configured model. Deliberately not the provider's
-        default: providers are shared singletons built from defaults.llm, so
-        passing None hands a codex agent the fleet's Claude alias and earns a
-        400. Only an agent with no model of its own falls through to the
-        provider, where the fleet default is the right answer anyway.
+        the agent's OWN effective model: agents.yaml with runtime overrides
+        applied, via the manager. Deliberately not the provider's default:
+        providers are shared singletons built from defaults.llm, so passing
+        None hands a codex agent the fleet's Claude alias and earns a 400.
+        Only an agent with no model of its own falls through to the provider,
+        where the fleet default is the right answer anyway.
+
+        Overrides matter here: an agent switched to codex at runtime keeps an
+        'opus' in agents.yaml, and reflecting on that 400'd until its next
+        restart.
         """
         configured = self.models.get(getattr(llm, "name", ""))
         if configured:
             return configured
+        pick = getattr(self.mgr, "background_model_for", None)
+        if pick:
+            return await pick(agent_id, llm)
         agent_cfg = (getattr(self.mgr, "agent_configs", {}) or {}).get(agent_id) or {}
         return (agent_cfg.get("llm") or {}).get("model")
 
@@ -272,7 +280,7 @@ class Reflector:
             Message(role=MessageRole.SYSTEM, content=_SYSTEM),
             Message(role=MessageRole.USER, content=f"Agent's saved lessons:\n\n{digest}"),
         ]
-        model = self._model_for(agent_id, llm)
+        model = await self._model_for(agent_id, llm)
         resp = await llm.complete(
             messages, tools=None, project_dir=self._work_dir(),
             model=model, timeout=180,
@@ -328,11 +336,12 @@ class Reflector:
             llm = self.mgr._get_agent_llm(agent_id)
         except Exception:
             return 0
+        model = await self._model_for(agent_id, llm)
         resp = await llm.complete(
             [Message(role=MessageRole.SYSTEM, content=_EXTRACT_SYSTEM),
              Message(role=MessageRole.USER, content=f"Agent's memories:\n\n{digest}")],
             tools=None, project_dir=self._work_dir(),
-            model=self._model_for(agent_id, llm), timeout=180,
+            model=model, timeout=180,
         )
         # Don't advance the cursor past memories a failed call never read.
         if not _is_real_answer(resp):
@@ -384,5 +393,5 @@ class Reflector:
         logger.info(f"Graph extraction: {agent_id} — {len(memories)} memories read, "
                     f"{linked} edges linked, {anchored} entity anchors, "
                     f"{off_vocab} off-vocabulary relations "
-                    f"(model={self._model_for(agent_id, llm) or 'provider default'})")
+                    f"(model={model or 'provider default'})")
         return linked
