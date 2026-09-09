@@ -9,6 +9,7 @@ channel telling it to inspect its interrupted work and either finish it or
 abstain (NO_REPLY replies are dropped, so silence stays silent).
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -63,9 +64,7 @@ def save_interrupted(data_dir: Path | str, turns: list[dict]) -> int:
     return len(records)
 
 
-def load_and_clear(data_dir: Path | str) -> list[dict]:
-    """Read and remove the interrupted-turns file. Empty list when absent/bad."""
-    path = Path(data_dir) / FILENAME
+def _read(path: Path) -> list[dict]:
     if not path.exists():
         return []
     try:
@@ -73,12 +72,94 @@ def load_and_clear(data_dir: Path | str) -> list[dict]:
         turns = data.get("turns", [])
     except (json.JSONDecodeError, OSError) as e:
         logger.warning(f"Unreadable {FILENAME}: {e}")
-        turns = []
+        return []
+    return turns if isinstance(turns, list) else []
+
+
+def load_pending(data_dir: Path | str) -> list[dict]:
+    """Read the interrupted-turns file without consuming it.
+
+    The file used to be read and deleted in one step, and delivery ran the
+    turns one after another. A long first recovery turn then held the rest,
+    and a second restart inside that window found no file and dropped them:
+    the owner's question in a goal channel was never answered because one
+    engineer's recovery ran for twenty minutes ahead of it. Records now stay
+    on disk until each one has been handed to its agent.
+    """
+    path = Path(data_dir) / FILENAME
+    turns = _read(path)
+    if not turns and path.exists():
+        # unreadable or empty: nothing to recover, do not keep tripping on it
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    return turns
+
+
+def load_and_clear(data_dir: Path | str) -> list[dict]:
+    """Read and remove the interrupted-turns file. Empty list when absent/bad."""
+    path = Path(data_dir) / FILENAME
+    turns = _read(path)
     try:
         path.unlink()
     except OSError:
         pass
-    return turns if isinstance(turns, list) else []
+    return turns
+
+
+_file_lock = asyncio.Lock()
+
+
+def _same(a: dict, b: dict) -> bool:
+    return (str(a.get("agent_id")), str(a.get("channel_id"))) == \
+        (str(b.get("agent_id")), str(b.get("channel_id")))
+
+
+async def mark_delivered(data_dir: Path | str, turn: dict) -> None:
+    """Drop one record from the file; delete the file when it is the last."""
+    path = Path(data_dir) / FILENAME
+    async with _file_lock:
+        remaining = [t for t in _read(path) if not _same(t, turn)]
+        try:
+            if remaining:
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(json.dumps({"saved_at": time.time(), "turns": remaining},
+                                          indent=2))
+                tmp.replace(path)
+            elif path.exists():
+                path.unlink()
+        except OSError as e:
+            logger.error(f"Could not update {FILENAME}: {e}")
+
+
+async def deliver_all(agent_manager, data_dir: Path | str, turns: list[dict],
+                      delay: float = 20.0) -> None:
+    """Hand every interrupted turn to its agent, all at once.
+
+    Concurrent on purpose: recovery turns are independent conversations, and
+    running them in sequence let one slow agent starve the rest. Each record
+    is removed from the file only once its agent has been given the turn, so
+    a restart mid-way re-delivers whatever had not been reached. The killed
+    turn itself is then in flight again and the shutdown path re-records it.
+    """
+    await asyncio.sleep(delay)  # let connectors finish coming online
+
+    async def _one(turn: dict) -> None:
+        agent_id = turn.get("agent_id")
+        if agent_id not in getattr(agent_manager, "agent_configs", {}):
+            logger.warning(f"Restart recovery: unknown agent {agent_id!r} — skipped")
+            await mark_delivered(data_dir, turn)
+            return
+        logger.info(f"Restart recovery → {agent_id} in {turn.get('channel_id')}")
+        try:
+            await agent_manager.handle_message(agent_id, build_recovery_message(turn))
+        except Exception as e:
+            logger.error(f"Restart recovery for {agent_id} failed: {e}")
+        finally:
+            await mark_delivered(data_dir, turn)
+
+    await asyncio.gather(*(_one(t) for t in turns))
 
 
 def build_recovery_message(turn: dict) -> IncomingMessage:
