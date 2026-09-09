@@ -592,23 +592,14 @@ async def main() -> None:
 
     # --- Restart recovery: turns killed at the last shutdown's drain timeout
     # get one synthetic turn each, telling the agent to resume or report.
-    from src.core.recovery import build_recovery_message, load_and_clear
-    interrupted = load_and_clear(data_dir)
+    # Delivered concurrently, and each record stays on disk until its agent
+    # has the turn, so a slow recovery cannot hold the others and a second
+    # restart cannot lose them (see recovery.deliver_all).
+    from src.core.recovery import deliver_all, load_pending
+    interrupted = load_pending(data_dir)
     if interrupted:
-        async def _deliver_recovery():
-            await asyncio.sleep(20)  # let connectors finish coming online
-            for turn in interrupted:
-                agent_id = turn.get("agent_id")
-                if agent_id not in agent_manager.agent_configs:
-                    logger.warning(f"Restart recovery: unknown agent {agent_id!r} — skipped")
-                    continue
-                logger.info(f"Restart recovery → {agent_id} in {turn.get('channel_id')}")
-                try:
-                    await agent_manager.handle_message(
-                        agent_id, build_recovery_message(turn))
-                except Exception as e:
-                    logger.error(f"Restart recovery for {agent_id} failed: {e}")
-        asyncio.create_task(_deliver_recovery(), name="restart-recovery")
+        asyncio.create_task(deliver_all(agent_manager, data_dir, interrupted),
+                            name="restart-recovery")
 
     # --- Identity reconcile: an agent whose Discord ACCOUNT name disagrees with
     # its config gets one turn to rename itself. Off by default: a rename is

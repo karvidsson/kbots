@@ -129,3 +129,61 @@ async def test_inflight_snapshot_tracks_running_turns(tmp_path):
     release.set()
     await asyncio.wait_for(task, timeout=5)
     assert mgr.inflight_snapshot() == []
+
+
+# --- delivery: concurrent, and durable until handed over (#54) --------------
+
+class _Mgr:
+    def __init__(self, delays):
+        self.agent_configs = {a: {} for a in delays}
+        self._delays = delays
+        self.started: list[str] = []
+        self.finished: list[str] = []
+
+    async def handle_message(self, agent_id, message):
+        self.started.append(agent_id)
+        await asyncio.sleep(self._delays[agent_id])
+        self.finished.append(agent_id)
+
+
+async def test_recovery_turns_run_concurrently(tmp_path):
+    """A slow first recovery used to hold every later one behind it."""
+    from src.core.recovery import deliver_all, load_pending
+    save_interrupted(tmp_path, [_turn(agent="slow", channel="1"),
+                                _turn(agent="fast", channel="2")])
+    mgr = _Mgr({"slow": 0.3, "fast": 0.01})
+    await deliver_all(mgr, tmp_path, load_pending(tmp_path), delay=0)
+    assert mgr.finished == ["fast", "slow"]          # fast did not wait for slow
+    assert not (tmp_path / FILENAME).exists()        # both delivered, file gone
+
+
+async def test_undelivered_records_survive_until_handed_over(tmp_path):
+    """Records leave the file one by one as their agent gets the turn, so a
+    restart in the middle re-delivers only what was not reached."""
+    from src.core.recovery import deliver_all, load_pending, mark_delivered
+    save_interrupted(tmp_path, [_turn(agent="a", channel="1"),
+                                _turn(agent="b", channel="2")])
+    assert len(load_pending(tmp_path)) == 2
+    assert len(load_pending(tmp_path)) == 2          # reading does not consume
+    await mark_delivered(tmp_path, _turn(agent="a", channel="1"))
+    left = load_pending(tmp_path)
+    assert [t["agent_id"] for t in left] == ["b"]
+    # a "second boot" now delivers only b
+    mgr = _Mgr({"a": 0, "b": 0})
+    await deliver_all(mgr, tmp_path, left, delay=0)
+    assert mgr.started == ["b"]
+    assert not (tmp_path / FILENAME).exists()
+
+
+async def test_failed_or_unknown_recovery_is_still_cleared(tmp_path):
+    from src.core.recovery import deliver_all, load_pending
+
+    class _Boom(_Mgr):
+        async def handle_message(self, agent_id, message):
+            raise RuntimeError("provider down")
+
+    save_interrupted(tmp_path, [_turn(agent="a", channel="1"),
+                                _turn(agent="ghost", channel="2")])
+    mgr = _Boom({"a": 0})                            # ghost is not configured
+    await deliver_all(mgr, tmp_path, load_pending(tmp_path), delay=0)
+    assert not (tmp_path / FILENAME).exists()        # neither is retried forever
