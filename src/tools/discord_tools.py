@@ -36,19 +36,62 @@ def _discord_headers(vault, bot: str = "", agent_id: str = "") -> dict | None:
     }
 
 
-async def _discord_get(vault, endpoint: str, bot: str = "") -> dict | list | None:
-    """Make an authenticated GET request to the Discord API."""
-    headers = _discord_headers(vault, bot=bot)
-    if not headers:
+async def _discord_get(vault, endpoint: str, bot: str = "",
+                       err: list[str] | None = None) -> dict | list | None:
+    """Make an authenticated GET request to the Discord API.
+
+    Every failure collapses to None, which is why callers could only ever say
+    "check the channel ID and bot permissions" — three very different causes
+    (wrong id, bot not in the channel, rate limit) with one hint covering none
+    of them. The status goes to logger.error, but that lands in the MCP
+    server's own log, which the agent holding the failed result cannot read.
+
+    Pass `err` (a list) to get the detail back: status, Discord's message, and
+    the bot identity the call actually used. Identity matters most, because a
+    read authenticates as the CALLING agent's bot, so "works for one agent and
+    not another on the same channel" is the expected shape of a membership
+    problem rather than evidence of a broken tool.
+    """
+    auth = resolve_bot_token(vault, bot=bot)
+    if not auth.token:
+        if auth.error:
+            logger.warning(auth.error)
+            if err is not None:
+                err.append(auth.error)
         return None
+    headers = {
+        "Authorization": f"Bot {auth.token}",
+        "User-Agent": "DiscordBot (https://github.com/karvidsson/kbots, 1.0)",
+    }
+    who = auth.account or "the default bot"
 
     async with aiohttp.ClientSession() as session:
         async with session.get(f"{DISCORD_API}{endpoint}", headers=headers) as resp:
             if resp.status == 200:
                 return await resp.json()
-            else:
-                logger.error(f"Discord API {endpoint}: {resp.status} {await resp.text()}")
-                return None
+            body = (await resp.text())[:200]
+            logger.error(f"Discord API {endpoint}: {resp.status} {body}")
+            if err is not None:
+                err.append(
+                    f"HTTP {resp.status} as bot '{who}': {body}"
+                    + _status_hint(resp.status, who))
+            return None
+
+
+def _status_hint(status: int, who: str) -> str:
+    """What the owner would have to change, per status. Only the ones a
+    caller can act on; anything else keeps Discord's own message."""
+    if status in (401, 403):
+        return (f" — bot '{who}' is authenticated but not permitted here. "
+                "Add it to the channel with View Channel and Read Message "
+                "History.")
+    if status == 404:
+        return (f" — either the id does not exist, or bot '{who}' cannot see "
+                "it at all. A private channel the bot is not in reads as 404, "
+                "not 403.")
+    if status == 429:
+        return " — rate limited. Retry after the delay in the body."
+    return ""
 
 
 async def _discord_post(vault, endpoint: str, json: dict, bot: str = "") -> dict | None:
@@ -191,9 +234,12 @@ async def read_channel_history(
 
     limit = max(1, min(100, limit))
 
-    messages = await _discord_get(ctx.vault, f"/channels/{channel_id}/messages?limit={limit}")
+    err: list[str] = []
+    messages = await _discord_get(
+        ctx.vault, f"/channels/{channel_id}/messages?limit={limit}", err=err)
     if messages is None:
-        return f"Error: could not fetch messages from channel {channel_id}. Check the channel ID and bot permissions."
+        return (f"Error: could not read channel {channel_id}. "
+                + (err[0] if err else "no detail available."))
 
     if not messages:
         return f"No messages found in channel {channel_id}."
@@ -222,9 +268,12 @@ async def read_message(ctx: ToolContext, channel_id: str, message_id: str) -> st
     if not ctx.vault:
         return "Error: no vault access."
 
-    msg = await _discord_get(ctx.vault, f"/channels/{channel_id}/messages/{message_id}")
+    err: list[str] = []
+    msg = await _discord_get(
+        ctx.vault, f"/channels/{channel_id}/messages/{message_id}", err=err)
     if msg is None:
-        return f"Error: could not fetch message {message_id} from channel {channel_id}."
+        return (f"Error: could not read message {message_id} in channel "
+                f"{channel_id}. " + (err[0] if err else "no detail available."))
 
     return _format_message(msg)
 
@@ -310,9 +359,12 @@ async def search_channel_history(
 
     limit = max(1, min(100, limit))
 
-    messages = await _discord_get(ctx.vault, f"/channels/{channel_id}/messages?limit={limit}")
+    err: list[str] = []
+    messages = await _discord_get(
+        ctx.vault, f"/channels/{channel_id}/messages?limit={limit}", err=err)
     if messages is None:
-        return f"Error: could not fetch messages from channel {channel_id}."
+        return (f"Error: could not search channel {channel_id}. "
+                + (err[0] if err else "no detail available."))
 
     query_lower = query.lower()
     matches = [msg for msg in messages if query_lower in msg.get("content", "").lower()]
