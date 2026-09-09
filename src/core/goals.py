@@ -220,6 +220,10 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
     # restart, instead of each gateway client keeping its own tally.
     if "turns_since_human" not in cols:
         db.execute("ALTER TABLE goals ADD COLUMN turns_since_human INTEGER NOT NULL DEFAULT 0")
+    # The closing notice posted at retirement. Stored so a retry cannot post
+    # it twice, and so "was the user ever told" is a column, not a guess.
+    if "closing_message_id" not in cols:
+        db.execute("ALTER TABLE goals ADD COLUMN closing_message_id TEXT NOT NULL DEFAULT ''")
     db.commit()
 
 
@@ -362,7 +366,8 @@ def update_goal(goal_id: str, actor: str, **fields) -> dict:
         raise ValueError(f"unknown goal '{goal_id}'")
     allowed = {"status", "strategy", "title", "description", "turn_budget",
                "owner_agent", "pause_reason", "wake_condition", "wake_ref",
-               "blocked_brief", "card_message_id", "plan", "kickoff_message_id"}
+               "blocked_brief", "card_message_id", "plan", "kickoff_message_id",
+               "closing_message_id"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"cannot set field(s): {', '.join(sorted(unknown))}")
