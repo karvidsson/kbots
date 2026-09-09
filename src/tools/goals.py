@@ -279,6 +279,67 @@ async def _archive_channel(ctx: ToolContext, goal: dict) -> str:
     return "channel archived read-only"
 
 
+RETIRED = ("done", "abandoned")
+
+
+def _closing_text(goal: dict, reason: str = "") -> str:
+    """The message a reader of the channel sees last.
+
+    Editing the kickoff card to "done" left the transcript ending on
+    "approved": the card sits at the top, and nobody scrolls up to check a
+    status word. So retirement posts one closing message at the bottom with
+    the outcome, what was delivered or why it stopped, and what if anything
+    is still waiting on the reader.
+    """
+    done = store.list_tasks(goal["id"], statuses=("done",))
+    dropped = store.list_tasks(goal["id"], statuses=("dropped",))
+    open_ = store.list_tasks(goal["id"])
+    if goal["status"] == "abandoned":
+        head = f"🪦 **ABANDONED: {goal['title']}** (`{goal['id']}`)"
+        why = reason or goal.get("pause_reason") or ""
+        body = f"**Stopped because:** {why[:400]}" if why else "**Stopped.**"
+    else:
+        head = f"✅ **COMPLETED: {goal['title']}** (`{goal['id']}`)"
+        body = (f"**Outcome:** {goal['strategy'][:600]}" if goal["strategy"]
+                else "**Outcome:** done, no strategy was recorded.")
+    tally = f"{len(done)} task(s) done"
+    if dropped:
+        tally += f", {len(dropped)} dropped"
+    if open_:
+        tally += f", {len(open_)} left open: " + ", ".join(
+            f"#{t['id']} {t['title'][:40]}" for t in open_[:5])
+    tail = ("**Nothing is waiting on you.** The room is closed." if not open_
+            else "**Left open, see above.** The room is closed.")
+    return "\n".join([head, body, f"**Tasks:** {tally}", tail])
+
+
+async def _close_goal(ctx: ToolContext, goal: dict, reason: str = "") -> tuple[dict, str]:
+    """Post the closing notice, then close the room. Returns (goal, note).
+
+    Idempotent: a stored closing_message_id means it was already posted and
+    is not posted again. Best effort on Discord, loud on failure: the note
+    says the notice did NOT post and how to retry (goal_set status=<same>
+    again), because a retirement nobody was told about is the defect this
+    exists to remove.
+    """
+    notes = []
+    if goal.get("closing_message_id"):
+        notes.append("closing notice already posted")
+    else:
+        mid = await _post_to_channel(ctx, goal["channel_id"], _closing_text(goal, reason))
+        if mid:
+            goal = store.update_goal(goal["id"], ctx.agent_id, closing_message_id=mid)
+            store.log_event(goal["id"], ctx.agent_id, "closed", f"notice {mid}")
+            notes.append("closing notice posted")
+        else:
+            logger.warning(f"goal {goal['id']}: closing notice NOT posted to "
+                           f"{goal['channel_id']}")
+            notes.append(f"closing notice NOT posted to <#{goal['channel_id']}> — "
+                         f"retry with goal_set status={goal['status']}")
+    notes.append(await _archive_channel(ctx, goal))
+    return goal, "; ".join(n for n in notes if n)
+
+
 def _card_text(goal: dict) -> str:
     parts = [f"🎯 **GOAL: {goal['title']}** (`{goal['id']}`) — **{goal['status']}**",
              goal["description"][:500]]
@@ -579,6 +640,12 @@ async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> st
 
     leaving_proposed = (field == "status" and goal["status"] == "proposed"
                         and value != "proposed")
+    # Same terminal status again is the retry for a closing notice that did
+    # not post; nothing else about the goal changes.
+    if field == "status" and value == goal["status"] and value in RETIRED:
+        goal, note = await _close_goal(ctx, goal)
+        await _update_card(ctx, goal)
+        return f"✅ `{goal['id']}` already {value}. {note}"
     try:
         kwargs = {field: value}
         goal = store.update_goal(goal["id"], ctx.agent_id, **kwargs)
@@ -593,10 +660,10 @@ async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> st
     chan_note = ""
     if leaving_proposed and goal.get("anchored"):
         goal, chan_note = await _acquire_channel(ctx, goal, cfg)
-    # Retiring closes the room: nothing routes there any more, so nothing
-    # should be able to post there either.
-    if field == "status" and goal["status"] in ("done", "abandoned"):
-        chan_note = await _archive_channel(ctx, goal)
+    # Retiring tells the room, then closes it: nothing routes there any
+    # more, so nothing should be able to post there either.
+    if field == "status" and goal["status"] in RETIRED:
+        goal, chan_note = await _close_goal(ctx, goal)
 
     await _update_card(ctx, goal)
     return (f"✅ `{goal['id']}` {field} → {kwargs[field]}. Status: "
@@ -871,7 +938,7 @@ async def goal_decide(ctx: ToolContext, decision_id: int, outcome: str,
             lines.append("🪦 Goal abandoned.")
         except ValueError as e:
             return f"ERROR: decision recorded but abandon failed: {e}"
-        note = await _archive_channel(ctx, goal)
+        goal, note = await _close_goal(ctx, goal, reason=dec["reason"])
         if note:
             lines.append(note)
     await _update_card(ctx, goal)

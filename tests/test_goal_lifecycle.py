@@ -323,3 +323,109 @@ async def test_legacy_constructors_are_recognised_by_their_marks(tmp_path):
     assert AgentManager._turn_source(m) == "job"
     assert AgentManager._turn_source(_msg(source="user", _inter_agent_sender="a")) == "agent"
     assert AgentManager._turn_source(_msg(source="user")) == "user"
+
+
+# --- retirement tells the room (#57) ------------------------------------------
+
+async def _run_to_executing(world, title="Closing"):
+    t = world.tools
+    await t.goal_create(_ctx(), title=title, description="d", participants="beacon: why")
+    goal = store.list_goals()[0]
+    store.decide_nomination(goal["id"], "beacon", True, "user1")
+    for status in ("brainstorm", "strategy", "executing"):
+        await t.goal_set(_ctx(), goal["id"], "status", status)
+    return goal
+
+
+@pytest.mark.asyncio
+async def test_done_posts_a_closing_notice_before_archiving(world):
+    """The transcript used to end on 'approved' with the outcome only in an
+    edited card at the top. The last message must now say what happened."""
+    t = world.tools
+    goal = await _run_to_executing(world)
+    await t.goal_set(_ctx(), goal["id"], "strategy", "Defer submission: 28-48h exceeds the ceiling.")
+    await t.goal_task(_ctx(), goal["id"], "add", title="audit")
+    await t.goal_task(_ctx(), goal["id"], "done", task_id=1)
+    n_before = len(world.posts)
+
+    out = await t.goal_set(_ctx(), goal["id"], "status", "done")
+
+    assert "closing notice posted" in out and "archived read-only" in out
+    chan, text = world.posts[-1]
+    assert chan == "chan-1"
+    assert text.startswith("✅ **COMPLETED: Closing**")
+    assert "Defer submission" in text
+    assert "1 task(s) done" in text
+    assert "Nothing is waiting on you" in text
+    assert len(world.posts) == n_before + 1
+    assert store.get_goal(goal["id"])["closing_message_id"] == f"msg-{len(world.posts)}"
+    # posted before the room closed
+    assert world.archived == [goal["id"]]
+
+
+@pytest.mark.asyncio
+async def test_closing_notice_names_open_tasks(world):
+    t = world.tools
+    goal = await _run_to_executing(world)
+    await t.goal_task(_ctx(), goal["id"], "add", title="never started")
+    await t.goal_set(_ctx(), goal["id"], "status", "done")
+    text = world.posts[-1][1]
+    assert "1 left open: #1 never started" in text
+    assert "Left open, see above" in text
+
+
+@pytest.mark.asyncio
+async def test_abandon_by_decision_posts_the_reason(world):
+    t = world.tools
+    goal = await _run_to_executing(world, title="Doomed")
+    out = await t.goal_propose(_ctx("beacon"), goal["id"], kind="abandon", reason="market moved")
+    dec_id = int(out.split("#")[1].split()[0])
+    out = await t.goal_decide(_ctx(), dec_id, "adopted")
+    assert "closing notice posted" in out
+    text = world.posts[-1][1]
+    assert text.startswith("🪦 **ABANDONED: Doomed**")
+    assert "Stopped because:** market moved" in text
+    assert store.get_goal(goal["id"])["closing_message_id"]
+
+
+@pytest.mark.asyncio
+async def test_closing_notice_is_idempotent(world):
+    """Retiring an already retired goal is the retry; it must not post twice."""
+    t = world.tools
+    goal = await _run_to_executing(world)
+    await t.goal_set(_ctx(), goal["id"], "status", "done")
+    n = len(world.posts)
+    out = await t.goal_set(_ctx(), goal["id"], "status", "done")
+    assert "already done" in out and "closing notice already posted" in out
+    assert len(world.posts) == n
+
+
+@pytest.mark.asyncio
+async def test_closing_notice_failure_is_visible_and_retryable(world, monkeypatch):
+    t = world.tools
+    goal = await _run_to_executing(world)
+    calls = {"n": 0}
+
+    async def _flaky(ctx, channel_id, content):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ""                       # Discord said no
+        world.posts.append((channel_id, content))
+        return "msg-retry"
+
+    monkeypatch.setattr(t, "_post_to_channel", _flaky)
+    out = await t.goal_set(_ctx(), goal["id"], "status", "done")
+    assert "closing notice NOT posted" in out and "retry with goal_set status=done" in out
+    assert store.get_goal(goal["id"])["status"] == "done"          # retirement stands
+    assert store.get_goal(goal["id"])["closing_message_id"] == ""
+
+    out = await t.goal_set(_ctx(), goal["id"], "status", "done")   # the retry
+    assert "closing notice posted" in out
+    assert store.get_goal(goal["id"])["closing_message_id"] == "msg-retry"
+    assert world.posts[-1][1].startswith("✅ **COMPLETED")
+
+
+def test_closing_notice_is_a_system_notice():
+    """It goes through _post_to_channel, which marks it, so it costs no turns."""
+    from src.core.goal_notice import is_system_notice, mark
+    assert is_system_notice(mark("✅ **COMPLETED: x** (`g-x`)"))
