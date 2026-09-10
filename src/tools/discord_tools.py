@@ -3,6 +3,7 @@
 import logging
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 import aiohttp
 
@@ -154,7 +155,22 @@ def _format_message(msg: dict) -> str:
     msg_id = msg.get("id", "")
     id_str = f" (id {msg_id})" if msg_id else ""
 
-    return f"[{time_str}] {author}{id_str}: {content}{attachment_str}{embed_str}"
+    # Discord already sends this in the message object; it was simply never
+    # rendered. An approval loop where the owner marks a post with an emoji is
+    # invisible without it, and looks from the agent's side exactly like being
+    # ignored. Counts only — who reacted needs a second call, see
+    # discord_reactions.
+    reactions = msg.get("reactions") or []
+    reaction_str = ""
+    if reactions:
+        pairs = []
+        for r in reactions:
+            name = (r.get("emoji") or {}).get("name") or "?"
+            pairs.append(f"{name}x{r.get('count', 0)}")
+        reaction_str = "\n  Reactions: " + " ".join(pairs)
+
+    return (f"[{time_str}] {author}{id_str}: {content}"
+            f"{attachment_str}{embed_str}{reaction_str}")
 
 
 @tool(
@@ -211,6 +227,68 @@ async def read_message(ctx: ToolContext, channel_id: str, message_id: str) -> st
         return f"Error: could not fetch message {message_id} from channel {channel_id}."
 
     return _format_message(msg)
+
+
+def _emoji_key(reaction: dict) -> str:
+    """Discord's URL form for one reaction: 'name' or 'name:id' for customs."""
+    emoji = reaction.get("emoji") or {}
+    name = emoji.get("name") or ""
+    return f"{name}:{emoji['id']}" if emoji.get("id") else name
+
+
+@tool(
+    name="discord_reactions",
+    description=(
+        "List who reacted to a Discord message, with the emoji and the user "
+        "ids. Use for approval loops where someone marks a message with an "
+        "emoji instead of replying."
+    ),
+)
+async def discord_reactions(
+    ctx: ToolContext, channel_id: str, message_id: str
+) -> str:
+    """Who reacted to a message, per emoji.
+
+    read_channel_history reports reaction COUNTS, which is enough to see that
+    something was marked but not who marked it. A verdict is only a verdict
+    from the person entitled to give it, and every agent in a channel can add
+    the same emoji, so anything acting on a reaction needs the user ids.
+
+    Args:
+        channel_id: The Discord channel ID containing the message.
+        message_id: The message whose reactions to list.
+    """
+    if not ctx.vault:
+        return "Error: no vault access."
+
+    base = f"/channels/{channel_id}/messages/{message_id}"
+    msg = await _discord_get(ctx.vault, base, bot=ctx.agent_id or "")
+    if msg is None:
+        return f"Error: could not fetch message {message_id} from channel {channel_id}."
+
+    reactions = msg.get("reactions") or []
+    if not reactions:
+        return f"Message {message_id} has no reactions."
+
+    lines = [f"Reactions on message {message_id}:"]
+    for r in reactions:
+        name = (r.get("emoji") or {}).get("name") or "?"
+        count = r.get("count", 0)
+        # One call per emoji. Discord has no endpoint for "all reactors on
+        # this message", so the count above is the cheap read and this is the
+        # one that costs a request per distinct emoji.
+        key = quote(_emoji_key(r), safe="")
+        users = await _discord_get(
+            ctx.vault, f"{base}/reactions/{key}?limit=100",
+            bot=ctx.agent_id or "")
+        if users is None:
+            lines.append(f"  {name} x{count} — could not read who reacted")
+            continue
+        who = ", ".join(
+            f"{u.get('username', 'unknown')} ({u.get('id', '?')})"
+            for u in users)
+        lines.append(f"  {name} x{count}: {who or '(none returned)'}")
+    return "\n".join(lines)
 
 
 @tool(
@@ -306,7 +384,17 @@ async def send_discord_file(
             data=data,
         ) as resp:
             if resp.status == 200:
-                return f"File {path.name} sent to channel {channel_id}"
+                # Discord returns the created message; the id was being
+                # discarded. Without it, anything keyed to "the message I just
+                # posted" has to guess by timestamp, which picks the wrong one
+                # the moment two posts land close together.
+                try:
+                    created = await resp.json()
+                    msg_id = (created or {}).get("id", "")
+                except (aiohttp.ContentTypeError, ValueError):
+                    msg_id = ""
+                suffix = f" (message id {msg_id})" if msg_id else ""
+                return f"File {path.name} sent to channel {channel_id}{suffix}"
             error = await resp.text()
             hint = ""
             if resp.status in (403, 404):
