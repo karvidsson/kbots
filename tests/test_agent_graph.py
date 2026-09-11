@@ -187,7 +187,104 @@ def test_render_has_a_roster_card_per_agent(roster, overlay_cfg, monkeypatch):
     monkeypatch.setattr(agent_graph, "_overrides_for", lambda aid: {})
     html = agent_graph._render_html(agent_graph._gather_agents(), "atlas", "Agent Map")
     assert 'id="roster"' in html and "Roster" in html
-    for word in ("Codex CLI", "Claude Code", "Full CLI", "Read(./**)", "Reports to", "Harness"):
+    for word in ("Codex CLI", "Claude Code", "Full CLI", "Read(./**)", "reports to", "Harness"):
         assert word in html
     # still offline: no webfont link, no scripts, no fetch
     assert not re.search(r'(<script[^>]*\ssrc=|<link[^>]*href=|src="https?:|fetch\()', html)
+
+
+# --- avatars, rights summary, accordion panes ------------------------------
+
+def test_rights_are_summarised_by_what_they_grant():
+    s = agent_graph._summarize_rights([
+        "Read(./**)", "Write(./**)", "Edit(./**)", "MultiEdit(./**)", "Glob(./**)", "Grep(./**)",
+        "Read(//srv/app/**)", "Write(//srv/app/**)",
+        "Bash(pnpm:*)", "Bash(npm:*)", "Bash(git:*)",
+        "WebSearch(*)", "WebFetch(*)",
+        "mcp__kbots-tools", "mcp__hostinger-dns", "mcp__kbots-tools__*",
+        "Weird rule",
+    ])
+    assert s["files"] == ["./**", "//srv/app/**"]          # six verbs, one path each
+    assert s["shell"] == ["pnpm", "npm", "git"]
+    assert s["web"] == ["WebSearch", "WebFetch"]
+    assert s["mcp"] == ["kbots-tools", "hostinger-dns"]     # the __* alias folds in
+    assert s["other"] == ["Weird rule"] and s["count"] == 17
+    assert agent_graph._summarize_rights(["Bash(*)"])["shell"] == "everything"
+    assert agent_graph._summarize_rights([])["files"] == []
+
+
+def _tiny_png() -> bytes:
+    """A valid 2x2 opaque PNG, written by hand so the test needs no Pillow."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(
+            ">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + bytes([10, 10, 15]) * 2 for _ in range(2))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+def test_avatar_prefers_svg_then_png_then_initial(tmp_path):
+    d = tmp_path / "bot"
+    d.mkdir()
+    # nothing on disk: an initial on the identity mark, still a data URI
+    uri = agent_graph._avatar_data_uri(str(d), "Quill", "#ff4444")
+    assert uri.startswith("data:image/svg+xml;base64,")
+    import base64
+    assert ">Q<" in base64.b64decode(uri.split(",", 1)[1]).decode()
+    # a png gets inlined (shrunk when Pillow is importable, as-is otherwise)
+    (d / "avatar.png").write_bytes(_tiny_png())
+    uri = agent_graph._avatar_data_uri(str(d), "Quill", "#ff4444")
+    assert uri.startswith("data:image/png;base64,") and len(uri) < 20_000
+    # the agent's own svg wins over the png
+    (d / "avatar.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+    assert agent_graph._avatar_data_uri(str(d), "Quill", "#ff4444").startswith("data:image/svg+xml")
+    # no project dir at all
+    assert agent_graph._avatar_data_uri("", "", "#888").startswith("data:image/svg+xml")
+
+
+def test_gather_carries_avatar_and_rights_summary(roster, overlay_cfg, monkeypatch):
+    import yaml
+    cfg = yaml.safe_load((overlay_cfg / "config" / "agents.yaml").read_text())
+    d = overlay_cfg / "agents" / "atlas"
+    d.mkdir(parents=True)
+    (d / "avatar.svg").write_text('<svg xmlns="http://www.w3.org/2000/svg"/>')
+    cfg["agents"]["atlas"]["project_dir"] = str(d)
+    (overlay_cfg / "config" / "agents.yaml").write_text(yaml.dump(cfg))
+    _write(roster, [{"id": "atlas", "name": "Atlas", "agent_tier": "privileged",
+                     "rights": ["Bash(*)", "Read(./**)", "mcp__kbots-tools"]}])
+    monkeypatch.setattr(agent_graph, "_overrides_for", lambda aid: {})
+    n = agent_graph._gather_agents()[0]
+    assert n["avatar"].startswith("data:image/svg+xml;base64,")
+    assert n["rights_summary"]["shell"] == "everything"
+    assert n["rights_summary"]["files"] == ["./**"] and n["rights_summary"]["mcp"] == ["kbots-tools"]
+
+
+def test_render_has_accordion_panes_filters_and_avatars(roster, overlay_cfg, monkeypatch):
+    _write(roster, [
+        {"id": "atlas", "name": "Atlas", "agent_tier": "privileged", "role": "ops", "model": "opus"},
+        {"id": "quill", "name": "Quill", "agent_tier": "privileged", "model": "gpt-x", "reports_to": "atlas"},
+    ])
+    monkeypatch.setattr(agent_graph, "_overrides_for", lambda aid: {})
+    html = agent_graph._render_html(agent_graph._gather_agents(), "atlas", "Agent Map")
+    for word in ("<details", "<summary>", "Expand all", "Collapse all", 'id="q"', "Codex CLI",
+                 "Tools & skills", "Rights", "Schedules", "data:image/svg+xml;base64,", "clipPath"):
+        assert word in html, word
+    # still offline: no webfont link, no scripts, no fetch; data: URIs are not http
+    assert not re.search(r'(<script[^>]*\ssrc=|<link[^>]*href=|src="https?:|fetch\()', html)
+
+
+def test_png_avatar_is_inlined_without_pillow(tmp_path, monkeypatch):
+    """CI has no Pillow; the map must still carry the PNG, unshrunk."""
+    import sys
+    monkeypatch.setitem(sys.modules, "PIL", None)          # import PIL raises ImportError
+    d = tmp_path / "bot"
+    d.mkdir()
+    (d / "avatar.png").write_bytes(_tiny_png())
+    uri = agent_graph._avatar_data_uri(str(d), "Quill", "#ff4444")
+    assert uri.startswith("data:image/png;base64,")
+    # and one over the size cap falls back to the initial rather than bloating the page
+    (d / "avatar.png").write_bytes(_tiny_png() + b"\x00" * (agent_graph._AVATAR_MAX_BYTES + 1))
+    assert agent_graph._avatar_data_uri(str(d), "Quill", "#ff4444").startswith("data:image/svg+xml")
