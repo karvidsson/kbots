@@ -105,3 +105,89 @@ def test_gather_includes_enabled_schedules(roster, monkeypatch):
     node = {x["id"]: x for x in agent_graph._gather_agents()}["scout"]
     # only the enabled schedule, with humanized timing
     assert node["schedules"] == [{"id": "s1", "timing": "every 60min", "instruction": "check prices"}]
+
+
+# --- harness, access and roster cards (from config + runtime overrides) -----
+
+@pytest.fixture
+def overlay_cfg(tmp_path, monkeypatch):
+    import yaml
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "agents.yaml").write_text(yaml.dump({"agents": {
+        "atlas": {"tier": "privileged", "privileged": True,
+                  "llm": {"provider": "claude_code", "model": "opus"},
+                  "extra_dirs": ["/srv/dev"], "description": "Primary agent"},
+        "scout": {"tier": "assistant", "llm": {"provider": "claude_code", "model": "sonnet"},
+                  "disallow_builtins": ["Bash"], "skills": ["debrief"]},
+        "quill": {"tier": "privileged", "llm": {"provider": "codex_cli", "model": "gpt-x",
+                                                 "sandbox": "workspace-write"}},
+    }}))
+    monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
+    return tmp_path
+
+
+def test_gather_reads_harness_and_access_from_config(roster, overlay_cfg, monkeypatch):
+    _write(roster, [
+        {"id": "atlas", "name": "Atlas", "agent_tier": "privileged", "model": "opus"},
+        {"id": "scout", "name": "Scout", "agent_tier": "assistant", "model": "sonnet",
+         "reports_to": "atlas"},
+        {"id": "quill", "name": "Quill", "agent_tier": "privileged", "model": "gpt-x"},
+    ])
+    monkeypatch.setattr(agent_graph, "_overrides_for", lambda aid: {})
+    nodes = {n["id"]: n for n in agent_graph._gather_agents()}
+
+    assert nodes["atlas"]["harness"] == {"provider": "claude_code", "label": "Claude Code",
+                                         "model": "opus", "effort": "", "overridden": [],
+                                         "sandbox": ""}
+    assert nodes["atlas"]["access"]["privileged_scaffold"] is True
+    assert nodes["atlas"]["access"]["extra_dirs"] == ["/srv/dev"]
+    assert "Full CLI" in nodes["atlas"]["access"]["tier_means"]
+    assert nodes["atlas"]["purpose"] == "Primary agent"      # falls back to config description
+
+    assert nodes["scout"]["access"]["denied_builtins"] == ["Bash"]
+    assert nodes["scout"]["skills"] == "debrief"
+    assert "safe tools only" in nodes["scout"]["access"]["tier_means"]
+
+    assert nodes["quill"]["harness"]["label"] == "Codex CLI"
+    assert nodes["quill"]["harness"]["sandbox"] == "workspace-write"
+
+
+def test_runtime_overrides_win_over_config(roster, overlay_cfg, monkeypatch):
+    """agent_config can move an agent to another provider live; the map must
+    show what runs now, not what agents.yaml says."""
+    _write(roster, [{"id": "scout", "name": "Scout", "agent_tier": "assistant", "model": "sonnet"}])
+    monkeypatch.setattr(agent_graph, "_overrides_for",
+                        lambda aid: {"provider": "codex_cli", "effort": "high"})
+    h = agent_graph._gather_agents()[0]["harness"]
+    assert h["provider"] == "codex_cli" and h["label"] == "Codex CLI"
+    assert h["model"] == "default of codex_cli"        # no model override: provider default
+    assert h["effort"] == "high"
+    assert h["overridden"] == ["effort", "provider"]
+
+    monkeypatch.setattr(agent_graph, "_overrides_for", lambda aid: {"model": "gpt-y"})
+    h = agent_graph._gather_agents()[0]["harness"]
+    assert h["model"] == "gpt-y" and h["provider"] == "claude_code"
+
+
+def test_gather_without_an_overlay_still_works(roster, monkeypatch):
+    monkeypatch.delenv("KBOTS_OVERLAY", raising=False)
+    monkeypatch.setattr(agent_graph, "_overrides_for", lambda aid: {})
+    _write(roster, [{"id": "atlas", "name": "Atlas", "agent_tier": "privileged", "model": "opus"}])
+    n = agent_graph._gather_agents()[0]
+    assert n["harness"]["label"] == "Claude Code" and n["harness"]["model"] == "opus"
+    assert n["access"]["denied_builtins"] == []
+
+
+def test_render_has_a_roster_card_per_agent(roster, overlay_cfg, monkeypatch):
+    _write(roster, [
+        {"id": "atlas", "name": "Atlas", "agent_tier": "privileged", "role": "ops", "model": "opus"},
+        {"id": "quill", "name": "Quill", "agent_tier": "privileged", "model": "gpt-x",
+         "reports_to": "atlas", "rights": ["Read(./**)"]},
+    ])
+    monkeypatch.setattr(agent_graph, "_overrides_for", lambda aid: {})
+    html = agent_graph._render_html(agent_graph._gather_agents(), "atlas", "Agent Map")
+    assert 'id="roster"' in html and "Roster" in html
+    for word in ("Codex CLI", "Claude Code", "Full CLI", "Read(./**)", "Reports to", "Harness"):
+        assert word in html
+    # still offline: no webfont link, no scripts, no fetch
+    assert not re.search(r'(<script[^>]*\ssrc=|<link[^>]*href=|src="https?:|fetch\()', html)
