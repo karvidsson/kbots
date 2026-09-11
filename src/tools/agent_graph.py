@@ -338,9 +338,10 @@ code{font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:12px;ba
 .card .who{cursor:pointer}
 .card .who img{width:44px;height:44px}
 .card .who h4{margin:0;font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:15px}
-.card .meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:3px}
-.card .meta .rt{font-size:12px;color:var(--fg3)}
-.card .meta .rt b{color:var(--fg2);font-weight:600;font-family:"JetBrains Mono",ui-monospace,Menlo,monospace}
+.meta{margin-top:2px;font-family:"JetBrains Mono",ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--fg3);letter-spacing:.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.meta .tier{color:var(--c)}.meta .tier::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%%;background:var(--c);margin-right:6px;vertical-align:1px}
+.meta .sep{color:var(--line);margin:0 7px}
+.meta b{color:var(--fg2);font-weight:600}
 @media(max-width:700px){aside{flex-basis:100%%;border-left:0;border-top:1px solid var(--line);max-height:none}}
 </style></head><body>
 <header>
@@ -387,7 +388,8 @@ function schedPane(n){return (n.schedules||[]).map(s=>`<div style="margin:4px 0"
 function kv(rows){return `<dl class="kv">${rows.map(([k,v])=>`<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>`;}
 function pane(title,line,body,open){return `<details${open?' open':''}><summary>${title}<span class="n">${line}</span></summary><div class="pane">${body}</div></details>`;}
 function panes(n,open){return pane('Harness',harnessLine(n),harnessPane(n),open)+pane('Access',accessLine(n),accessPane(n),open)+pane('Tools & skills',toolsLine(n),toolsPane(n),open)+pane('Rights',rightsLine(n),rightsPane(n),open)+pane(`Schedules (${(n.schedules||[]).length})`,(n.schedules||[]).map(s=>s.timing).join(', ')||'none',schedPane(n),open&&(n.schedules||[]).length>0);}
-function who(n,tag){return `<div class="who"><img src="${n.avatar}" alt=""><div><${tag}>${esc(n.name)}</${tag}><div class="meta"><span class="chip tier" style="--c:${TIER_C[n.tier]||'#888'}">${esc(n.tier)}</span><span class="chip h">${esc((n.harness&&n.harness.label)||'?')}</span><span class="rt">${n.reports_to?`reports to <b>${esc(n.reports_to)}</b>`:'hub'}</span></div></div></div>`;}
+function who(n,tag){const h=(n.harness&&n.harness.label)||'?';const rt=n.reports_to?`reports to <b>${esc(n.reports_to)}</b>`:'hub';
+  return `<div class="who"><img src="${n.avatar}" alt=""><div><${tag}>${esc(n.name)}</${tag}><div class="meta"><span class="tier" style="--c:${TIER_C[n.tier]||'#888'}">${esc(n.tier)}</span><span class="sep">·</span>${esc(h)}<span class="sep">·</span>${rt}</div></div></div>`;}
 function layout(){
   const g=document.getElementById('graph'), W=g.clientWidth||600, H=g.clientHeight||500;
   svg.setAttribute('viewBox',`0 0 ${W} ${H}`); svg.innerHTML='';
