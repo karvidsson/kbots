@@ -121,6 +121,13 @@ class DiscordConnector(Connector):
             logger.info(f"Reply shortening: ON (default over "
                         f"{self._shortener.threshold_for(None)} chars, "
                         f"expand with {self._shortener.emoji})")
+        # An emoji on a bot's own message wakes that bot. On by default: a
+        # reaction the fixed handlers do not claim was previously dropped in
+        # silence. `defaults.reply.reaction_wake: false` turns it off for
+        # deployments where reactions are decoration rather than signal.
+        self._reaction_wake = bool(reply_cfg.get("reaction_wake", True))
+        if not self._reaction_wake:
+            logger.info("Reaction wake: OFF (unhandled reactions are ignored)")
 
     def set_agent_configs(self, agent_configs: dict[str, dict]) -> None:
         """Set agent configs so the connector knows which agents route to which bots."""
@@ -1342,8 +1349,12 @@ class DiscordBot:
             await self._handle_schedule_cancel(payload)
             return
 
-        # Only process HITL reactions (checkmark or X)
+        # Everything past here is the ✅/❌ control path. Any other emoji
+        # has no owner, so it goes straight to the fallback rather than being
+        # dropped: an unhandled reaction used to vanish with nothing logged,
+        # which from the reactor's side is indistinguishable from being ignored.
         if emoji not in ("✅", "❌"):
+            await self._wake_on_reaction(payload, emoji)
             return
 
         # Goal staffing: ✅/❌ on a nomination card adds or skips that agent,
@@ -1353,9 +1364,13 @@ class DiscordBot:
         if await self._handle_goal_reaction(payload, emoji):
             return
 
-        # Check if there's a HITL gate with pending requests for this message
+        # Check if there's a HITL gate with pending requests for this message.
+        # A ✅ that matches no goal card and no pending gate is an ordinary
+        # approval of whatever the bot last said, so it wakes rather than
+        # falling off the end of the function.
         hitl = getattr(self.connector, '_hitl', None)
         if not hitl:
+            await self._wake_on_reaction(payload, emoji)
             return
 
         message_id = str(payload.message_id)
@@ -1370,6 +1385,7 @@ class DiscordBot:
                 row = await cursor.fetchone()
 
             if not row:
+                await self._wake_on_reaction(payload, emoji)
                 return
 
             hitl_id = row[0]
@@ -1384,6 +1400,78 @@ class DiscordBot:
                     logger.info(f"HITL {hitl_id} denied by {user_id}")
         except Exception as e:
             logger.error(f"HITL reaction handling failed: {e}", exc_info=True)
+
+    async def _wake_on_reaction(self, payload, emoji: str) -> None:
+        """Hand an otherwise-unhandled reaction to the bot that was reacted to.
+
+        Reactions used to reach an agent only through the fixed set above
+        (HITL, lesson feedback, the shortener, schedule cancel). Anything else
+        was dropped with nothing logged, so an owner marking a post ✅ looked,
+        from the agent's side, exactly like being ignored.
+
+        Two guards, both load-bearing:
+
+        * the reactor must be human. Agents react to each other's posts, and
+          waking on that is an echo loop that costs a turn every time.
+        * the message must be OURS. on_raw_reaction_add fires on every gateway
+          client in the process, so without this one reaction would wake all
+          of them; comparing the author also picks the right agent rather than
+          guessing from the channel.
+        """
+        if not getattr(self.connector, "_reaction_wake", True):
+            return
+        # Not every payload carries one (DMs, and some library paths
+        # build a partial). Reaching for it directly raised inside the
+        # handler, which would have killed the reaction path entirely.
+        member = getattr(payload, "member", None)
+        if member is not None and member.bot:
+            return
+        try:
+            channel = (self.client.get_channel(payload.channel_id)
+                       or await self.client.fetch_channel(payload.channel_id))
+            message = await channel.fetch_message(payload.message_id)
+        except Exception as e:
+            # A channel this bot cannot see is the normal case, not a fault:
+            # every other gateway client is also running this handler.
+            logger.debug(f"[{self.account_name}] reaction wake skipped "
+                         f"({type(e).__name__}): {e}")
+            return
+        if message.author.id != self.client.user.id:
+            return
+
+        if member is None:                      # DMs carry no member object
+            try:
+                user = (self.client.get_user(payload.user_id)
+                        or await self.client.fetch_user(payload.user_id))
+            except Exception:
+                return
+            if user.bot:
+                return
+            who = user.display_name
+        else:
+            who = member.display_name
+
+        logger.info(f"[{self.account_name}] reaction {emoji} by {who} on "
+                    f"{payload.message_id} — waking agent")
+        preview = (message.content or "").strip().replace("\n", " ")[:180]
+        await self.connector.emit(IncomingMessage(
+            connector="discord",
+            channel_id=str(payload.channel_id),
+            channel_name=getattr(channel, "name", None),
+            user_id=str(payload.user_id),
+            user_name=who,
+            # Stated as an event rather than as speech, so the agent does not
+            # read it as the user having typed an emoji at it.
+            content=(f"[reaction] {who} reacted {emoji} to your message "
+                     f"{payload.message_id}"
+                     + (f' ("{preview}")' if preview else "")
+                     + ". Act on it if it is a verdict you were waiting for; "
+                       "otherwise acknowledge briefly or reply NO_REPLY."),
+            reply_to=str(payload.message_id),
+            raw=message,
+            bot_account=self.account_name,
+            source="user",
+        ))
 
     async def _send_overflow(self, channel_id: str, entry, trigger: str) -> None:
         """Post a held-back remainder as the bot that owes it.
