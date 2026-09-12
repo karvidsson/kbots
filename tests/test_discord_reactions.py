@@ -30,7 +30,7 @@ def _ctx():
 
 
 def _get(routes):
-    async def get(vault, endpoint, bot=""):
+    async def get(vault, endpoint, bot="", err=None):
         for suffix, value in routes.items():
             if endpoint.endswith(suffix):
                 return value
@@ -95,7 +95,7 @@ async def test_custom_emoji_are_addressed_by_name_and_id():
     the name alone 404s and reads as 'nobody reacted'."""
     seen = []
 
-    async def get(vault, endpoint, bot=""):
+    async def get(vault, endpoint, bot="", err=None):
         seen.append(endpoint)
         if endpoint.endswith("/messages/m1"):
             return {**MSG_WITH_REACTIONS, "reactions": [
@@ -117,7 +117,7 @@ async def test_no_reactions_is_stated_not_faked():
 async def test_unreadable_reactor_list_says_so_rather_than_claiming_nobody():
     """Silently reporting an empty list would read as 'not approved yet' and
     strand the post."""
-    async def get(vault, endpoint, bot=""):
+    async def get(vault, endpoint, bot="", err=None):
         return MSG_WITH_REACTIONS if endpoint.endswith("/messages/m1") else None
 
     with patch("src.tools.discord_tools._discord_get", side_effect=get):

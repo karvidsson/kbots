@@ -311,9 +311,14 @@ async def discord_reactions(
         return "Error: no vault access."
 
     base = f"/channels/{channel_id}/messages/{message_id}"
-    msg = await _discord_get(ctx.vault, base, bot=ctx.agent_id or "")
+    err: list[str] = []
+    msg = await _discord_get(ctx.vault, base, bot=ctx.agent_id or "", err=err)
     if msg is None:
-        return f"Error: could not fetch message {message_id} from channel {channel_id}."
+        # Missed when the other read tools gained this. It matters most here:
+        # a receipt that binds an upload to an owner's reaction has to tell
+        # "the bot cannot see this channel" apart from "nobody approved it".
+        return (f"Error: could not read message {message_id} in channel "
+                f"{channel_id}. " + (err[0] if err else "no detail available."))
 
     reactions = msg.get("reactions") or []
     if not reactions:
