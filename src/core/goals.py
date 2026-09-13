@@ -750,12 +750,45 @@ def routed_participants_for_channel(channel_id: str) -> list[str]:
     return _cached(f"routed:{channel_id}", compute)
 
 
+ALL_STATUSES = ROUTED_STATUSES + ("done", "abandoned")
+
+
+def goal_audience_for_channel(channel_id: str) -> dict | None:
+    """Who a goal room belongs to, whatever the goal's status.
+
+    {"goal_id", "status", "owner", "participants"} for the goal that owns
+    this channel (the most recently updated one, should a channel ever be
+    reused), or None for an ordinary channel.
+
+    This exists because a human talking in a goal room expects the agent
+    that set the goal up to answer, without an @mention, and that must hold
+    after the goal is done as much as before it starts: "why was this
+    closed?" is the commonest question a finished room gets. The live-only
+    lookup above decides who is WATCHING the room; this decides who ANSWERS
+    a human in it.
+    """
+    channel_id = str(channel_id)
+
+    def compute() -> dict | None:
+        goal = get_goal_by_channel(channel_id, ALL_STATUSES)
+        if not goal:
+            return None
+        return {"goal_id": goal["id"], "status": goal["status"],
+                "owner": goal["owner_agent"],
+                "participants": [p["agent_id"] for p in list_participants(goal["id"])]}
+
+    return _cached(f"audience:{channel_id}", compute)
+
+
 # --- context injection ---
 
 _PHASE_PROTOCOL = {
     "proposed": (
         "Proposed — not yet started. A coordinator-tier agent or a human must "
-        "advance it (goal_set status=brainstorm). Do not start working on it yet."),
+        "advance it (goal_set status=brainstorm). Do not start working on it yet. "
+        "A human's question here is only a question: answer it, and do not "
+        "treat it as approval of any nominee or of the kickoff, which happens "
+        "only by ✅ on the cards."),
     "brainstorm": (
         "Brainstorm phase: free discussion toward a strategy is welcome within "
         "the turn budget. Owner: when a direction has emerged, record it with "
@@ -779,16 +812,40 @@ _PHASE_PROTOCOL = {
         "items and calls goal_resume; everyone else replies exactly NO_REPLY "
         "unless directly addressed. If the user has not replied, reply exactly "
         "NO_REPLY."),
+    "done": (
+        "CLOSED (done). This room is the record of a finished goal. Answer a "
+        "human's questions about it from the record (goal_status, the tasks "
+        "and events above, the channel history); do not reopen it, start "
+        "work, or add tasks. A question does not reopen a goal — if new work "
+        "is wanted, say so and propose a new goal."),
+    "abandoned": (
+        "CLOSED (abandoned). This room is the record of a goal that was "
+        "stopped. Answer a human's questions about why from the record; do "
+        "not reopen it, start work, or add tasks. If the work is wanted after "
+        "all, say so and propose a new goal."),
 }
+
+# What the owner is told about the room's human traffic. The connector routes
+# an unmentioned human message in a goal room to the owner alone, so the
+# owner must know it is being addressed and the other participants must know
+# they were not.
+_OWNER_ANSWERS = ("Human messages here that mention nobody reach only you, the "
+                  "owner: answer them in this room.")
+_MEMBER_HEARS = ("Human messages here that mention nobody are answered by the "
+                 "owner; you hear them only when @mentioned or when a bot posts.")
 
 
 def build_goal_context(agent_id: str, channel_id: str) -> str | None:
     """The per-turn <goal-context> block for a participating agent. Short by
-    design (~350 tokens max) — built from columns, no LLM call."""
+    design (~350 tokens max) — built from columns, no LLM call.
+
+    Built for a retired goal too: its room stays, its owner still answers
+    there, and "why was this closed?" needs the record in front of it.
+    """
     channel_id = str(channel_id)
 
     def compute() -> dict | None:
-        return get_goal_by_channel(channel_id, ROUTED_STATUSES)
+        return get_goal_by_channel(channel_id, ALL_STATUSES)
 
     goal = _cached(f"ctx:{channel_id}", compute)
     if not goal:
@@ -852,6 +909,10 @@ def build_goal_context(agent_id: str, channel_id: str) -> str | None:
     if goal["status"] in ACTIVE_STATUSES:
         protocol += (f" Turn budget: {goal['turn_budget']} agent turns between "
                      f"human check-ins.")
+    if goal["owner_agent"] == agent_id:
+        protocol += " " + _OWNER_ANSWERS
+    elif agent_id in part_ids:
+        protocol += " " + _MEMBER_HEARS
     lines.append(f"Protocol: {protocol}")
     lines.append("</goal-context>")
     return "\n".join(lines)

@@ -242,7 +242,25 @@ async def _update_card(ctx: ToolContext, goal: dict) -> None:
 # Discord permission bits denied on a retired goal's channel: SEND_MESSAGES,
 # CREATE_PUBLIC_THREADS, CREATE_PRIVATE_THREADS, SEND_MESSAGES_IN_THREADS.
 # Reading stays: the room is the record of the work.
-_ARCHIVE_DENY = (1 << 11) | (1 << 35) | (1 << 36) | (1 << 38)
+_SEND_MESSAGES = 1 << 11
+_ARCHIVE_DENY = _SEND_MESSAGES | (1 << 35) | (1 << 36) | (1 << 38)
+
+
+async def _owner_bot_user_id(ctx: ToolContext, goal: dict) -> str:
+    """The Discord user id of the bot the goal's owner posts as, or ''."""
+    try:
+        from src.lib.discord_auth import resolve_bot_token
+        from src.tools.discord_tools import _discord_get
+        auth = resolve_bot_token(ctx.vault, agent_id=goal.get("owner_agent", ""))
+        if not auth.token:
+            return ""
+        me = await _discord_get(ctx.vault, "/users/@me", bot=auth.account or "")
+    except Exception:
+        logger.debug("owner bot lookup failed", exc_info=True)
+        return ""
+    if not me or not isinstance(me, dict) or me.get("error"):
+        return ""
+    return str(me.get("id", ""))
 
 
 async def _archive_channel(ctx: ToolContext, goal: dict) -> str:
@@ -251,6 +269,11 @@ async def _archive_channel(ctx: ToolContext, goal: dict) -> str:
     Retiring used to leave the room writable, so agents kept posting into a
     goal nobody was routed to. A borrowed (anchored) home channel is never
     touched: it belongs to the proposer, not to the goal.
+
+    Read-only for everyone except the owner's bot: the room still takes
+    questions ("why was this closed?"), the connector routes them to the
+    owner, and an owner that cannot post is a question that looks ignored.
+    Admin-role bots bypass the deny anyway; this is for the ones that do not.
     """
     if goal.get("anchored"):
         return ""
@@ -263,10 +286,14 @@ async def _archive_channel(ctx: ToolContext, goal: dict) -> str:
             if isinstance(chan, dict) else "could not read the channel"
         return f"channel not archived: {detail}"
     guild_id = str(chan["guild_id"])
+    owner_bot = await _owner_bot_user_id(ctx, goal)
     overwrites = [o for o in (chan.get("permission_overwrites") or [])
-                  if str(o.get("id")) != guild_id]
+                  if str(o.get("id")) not in (guild_id, owner_bot)]
     overwrites.append({"id": guild_id, "type": 0, "allow": "0",
                        "deny": str(_ARCHIVE_DENY)})
+    if owner_bot:
+        overwrites.append({"id": owner_bot, "type": 1,
+                           "allow": str(_SEND_MESSAGES), "deny": "0"})
     topic = (chan.get("topic") or "")
     if not topic.startswith("["):
         topic = f"[{goal['status']}] {topic}".strip()
@@ -275,8 +302,10 @@ async def _archive_channel(ctx: ToolContext, goal: dict) -> str:
         {"permission_overwrites": overwrites, "topic": topic[:1000]})
     if not result or result.get("error"):
         return f"channel not archived: {(result or {}).get('detail', 'edit failed')}"
-    store.log_event(goal["id"], ctx.agent_id, "archived", "channel read-only")
-    return "channel archived read-only"
+    who = f"; owner bot {goal['owner_agent']} may still post" if owner_bot \
+        else f"; owner bot for {goal['owner_agent']} not resolved, no allow set"
+    store.log_event(goal["id"], ctx.agent_id, "archived", f"channel read-only{who}")
+    return "channel archived read-only" + who
 
 
 RETIRED = ("done", "abandoned")
@@ -308,8 +337,10 @@ def _closing_text(goal: dict, reason: str = "") -> str:
     if open_:
         tally += f", {len(open_)} left open: " + ", ".join(
             f"#{t['id']} {t['title'][:40]}" for t in open_[:5])
-    tail = ("**Nothing is waiting on you.** The room is closed." if not open_
-            else "**Left open, see above.** The room is closed.")
+    tail = ("**Nothing is waiting on you.**" if not open_
+            else "**Left open, see above.**")
+    tail += (f" The room is closed to new work; questions are welcome here and "
+             f"**{goal['owner_agent']}** answers them, no mention needed.")
     return "\n".join([head, body, f"**Tasks:** {tally}", tail])
 
 

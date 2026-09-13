@@ -607,22 +607,35 @@ class DiscordConnector(Connector):
         return category_agent or wildcard_agent or dm_fallback_agent
 
     def is_goal_channel(self, channel_id: str) -> bool:
-        """True if a live goal owns this channel."""
+        """True if a goal owns this channel, live or retired."""
         return bool(self._goal_participants(channel_id))
 
     @staticmethod
-    def _goal_participants(channel_id: str) -> list[str]:
-        """Agents routed into this channel by a live goal.
+    def _goal_audience(channel_id: str) -> dict | None:
+        """The goal that owns this channel, in any status, or None.
 
-        Empty for an ordinary channel, and empty when the goals store cannot
+        None for an ordinary channel, and None when the goals store cannot
         be read — a store that is down must not take every channel offline.
         """
         try:
             from src.core import goals
-            return goals.routed_participants_for_channel(channel_id)
+            return goals.goal_audience_for_channel(channel_id)
         except Exception:
             logger.debug("goal routing lookup failed", exc_info=True)
-            return []
+            return None
+
+    @classmethod
+    def _goal_participants(cls, channel_id: str) -> list[str]:
+        """Agents a goal has staffed into this channel, live or retired.
+
+        A retired goal's room used to fall back to ordinary routing, so a
+        mention there reached whichever agent was the bot's wildcard, and an
+        unmentioned question reached nobody at all. The room belongs to the
+        goal for as long as it exists, so its participants are its audience
+        for as long as it exists.
+        """
+        audience = cls._goal_audience(channel_id)
+        return list(audience["participants"]) if audience else []
 
 
 class DiscordBot:
@@ -1240,6 +1253,33 @@ class DiscordBot:
             except Exception:
                 logger.debug("goal watch lookup failed", exc_info=True)
 
+        # A human who mentions nobody in a goal room is talking to the agent
+        # that set the goal up. Every participant used to take a turn on such
+        # a message (they all watch the room) and be told by the phase
+        # protocol to reply NO_REPLY, which spent the whole team's turns to
+        # answer nothing; and once the goal was retired nobody was routed at
+        # all, so a "why was this closed?" went unanswered. Now exactly the
+        # owner hears it, as a message addressed to it rather than as a
+        # watched one, and the others stay quiet. Mentions and bot posts keep
+        # their audience: this only decides who answers a human.
+        goal_addressed = False
+        if not message.author.bot and not is_mentioned and not is_dm:
+            responder = None
+            try:
+                from src.core import goals
+                audience = goals.goal_audience_for_channel(str(message.channel.id))
+                responder = audience["owner"] if audience else None
+            except Exception:
+                logger.debug("goal owner lookup failed", exc_info=True)
+            if responder is not None:
+                if agent_id != responder:
+                    logger.debug(f"[{self.account_name}] goal room: unmentioned "
+                                 f"human message goes to owner '{responder}', "
+                                 f"not '{agent_id}'")
+                    return
+                goal_addressed = True
+                is_watched = False
+
         # Ignore bot messages unless this bot was @mentioned (user or role)
         # or the channel is explicitly watched
         if message.author.bot:
@@ -1276,8 +1316,10 @@ class DiscordBot:
             # A human spoke — the bot-to-bot chain in this channel is over.
             self._bot_chain_check(message.channel.id, from_bot=False, now=now)
 
-        # Check mentions-only routing (watched channels are exempt)
-        if mentions_only and not is_mentioned and not is_dm and not is_watched:
+        # Check mentions-only routing (watched channels and a goal room's
+        # owner, who is addressed by every human there, are exempt)
+        if (mentions_only and not is_mentioned and not is_dm and not is_watched
+                and not goal_addressed):
             logger.debug(f"[{self.account_name}] Skipping — mentions_only and not mentioned")
             return
 
@@ -1536,11 +1578,24 @@ class DiscordBot:
         """
         try:
             from src.core.goal_notice import mark
+            audience: dict = {}
+            try:
+                from src.core import goals
+                audience = goals.goal_audience_for_channel(str(message.channel.id)) or {}
+            except Exception:
+                logger.debug("goal audience lookup failed", exc_info=True)
+            owner = audience.get("owner", "")
+            if audience.get("status") in ("done", "abandoned"):
+                # A closed room takes questions, not new staff.
+                how = (f"This goal is closed; ask **{owner}**, its owner, who "
+                       f"answers here without a mention." if owner
+                       else "This goal is closed.")
+            else:
+                how = ("Ask the goal's owner to add it with `goal_add_member`, "
+                       "which needs a reason and the owner's approval.")
             await message.channel.send(mark(
                 f"<@{message.author.id}> **{self.account_name}** is not on this "
-                f"goal, so it will not answer here. Ask the goal's owner to add "
-                f"it with `goal_add_member`, which needs a reason and the "
-                f"owner's approval."
+                f"goal, so it will not answer here. {how}"
             ))
         except Exception as e:
             logger.error(f"[{self.account_name}] goal outsider notice failed: {e}")
