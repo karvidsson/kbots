@@ -176,7 +176,8 @@ class HITLGate:
                     f"ID: `{hitl_id}`\n\n"
                     f"React ✅ to approve or ❌ to deny."
                 )
-                sent_msg = await self.connector.send(self.channel_id, msg_text)
+                # This card seeds its own choices after persisting its id.
+                sent_msg = await self.connector.send(self.channel_id, msg_text, seed_decisions=False)
 
                 # Store message_id and add reactions
                 if sent_msg and hasattr(sent_msg, 'id'):

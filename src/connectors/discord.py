@@ -13,6 +13,7 @@ import discord
 from discord import app_commands
 
 from src.core.base import Attachment, Connector, IncomingMessage, VaultBackend
+from src.core.decision_reactions import decision_reactions
 from src.core.reply_shorten import ReplyShortener, wants_more
 
 logger = logging.getLogger(__name__)
@@ -263,10 +264,11 @@ class DiscordConnector(Connector):
         # other way round would footer a fragment.
         # Skipped when files are attached — an artefact and its explanation
         # arrive together or the attachment reads as unexplained.
+        decision_emojis = decision_reactions(content) if kwargs.get("seed_decisions", True) else ()
         rest = None
         if not kwargs.get("no_shorten") and not discord_files:
             shortened = self._shortener.shorten(content, agent_id=kwargs.get("agent_id"))
-            if shortened:
+            if shortened and (not decision_emojis or decision_reactions(shortened[0]) == decision_emojis):
                 content, rest = shortened
 
         # Split long messages (Discord 2000 char limit)
@@ -300,6 +302,17 @@ class DiscordConnector(Connector):
             except discord.HTTPException as e:
                 logger.warning(f"reply-shorten: could not add {self._shortener.emoji}: {e} "
                                f"(the footer still says 'more' works)")
+
+        if first_msg is not None:
+            # Use the returned message (and attachment), never "the latest"
+            # message in the channel. Seeds are shortcuts, not approval.
+            for emoji in decision_emojis:
+                try:
+                    await asyncio.wait_for(first_msg.add_reaction(emoji), timeout=5)
+                except (discord.HTTPException, OSError, TimeoutError) as e:
+                    # The message was delivered. Do not fail the send and
+                    # cause a retry/duplicate merely because a shortcut failed.
+                    logger.warning("decision-reactions: could not add %s to %s: %s", emoji, first_msg.id, e)
 
         return first_msg
 

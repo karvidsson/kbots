@@ -41,7 +41,7 @@ or terminal scrollback.
 | View Channels | see the channels it serves |
 | Send Messages | reply |
 | Read Message History | thread context, catching up after a restart |
-| Add Reactions | HITL approval cards (✅/❌), reply-shortener "show more" |
+| Add Reactions | Approval shortcuts (✅/🔴), HITL cards (✅/❌), reply-shortener "show more" |
 | Attach Files | send charts, PDFs, screenshots |
 | Embed Links | rich links in replies |
 | Change Nickname | identity boot — the agent sets its own server nickname |
@@ -55,6 +55,40 @@ That is the complete list. In particular:
 > action away from full server control — banning members, deleting channels,
 > editing every role. If Administrator is checked, every other checkbox on the
 > authorize screen is decoration.
+
+## One-tap go/no-go requests
+
+Explicit approval prompts in bot replies, tool-sent messages and file captions get reactions
+added by the sending bot, so the reader can tap an existing emoji. For example:
+
+> React ✅ to approve or 🔴 to reject.
+
+`Go/no-go?` uses ✅/🔴. Explicit ✅/❌ and 🟢/🔴 pairs keep the author's
+vocabulary. English and Swedish reaction instructions and paired
+approve/reject legends are recognised. Status reports, quoted/code examples,
+and inter-agent relays do not create new approval shortcuts.
+
+On a split reply the controls stay on the first message, alongside any
+attachment. An approval instruction is never hidden behind the long-message
+expander. If the instruction fits in the visible head, both decision controls
+and 🔍 can appear together. Existing HITL cards still seed their own choices
+after registering the approval request.
+
+These reactions are a convenience, not a grant of authority. Bot seeds do not
+count as human consent; consumers must check the approving user's identity,
+not reaction totals. Existing approval and reaction-wake handlers are unchanged.
+
+A fresh unanswered prompt can show **✅×1 and 🔴×1**, both added by the bot.
+Counts alone cannot establish a user's verdict. Read `discord_reactions` for
+the exact message and match the authorized user's ID on the required emoji.
+Neither bot seeds nor other users' reactions substitute for that identity.
+
+If Discord denies Add Reactions or the request times out, the message/file
+remains sent. Readers can still add reactions manually. File tools report the
+missing shortcuts without reporting a failed upload or uploading a duplicate.
+The message tool's direct API path likewise reports a delivered message with
+unavailable shortcuts instead of asking the caller to resend it.
+This applies to new messages; it does not backfill earlier requests.
 
 ## Install links
 
