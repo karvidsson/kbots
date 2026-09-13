@@ -162,7 +162,11 @@ async def test_full_lifecycle(world):
     assert store.active_goal_for_channel("chan-1") is None
     assert store.routed_participants_for_channel("chan-1") == []
     assert store.record_turn("chan-1", "beacon", "bot") is None
-    assert store.build_goal_context("beacon", "chan-1") is None
+    # #58: the room still takes questions after it closes, so its owner still
+    # gets the record, with a protocol that says answer, do not reopen.
+    ctx = store.build_goal_context("beacon", "chan-1")
+    assert 'status="done"' in ctx and "CLOSED" in ctx and "do not reopen" in ctx
+    assert store.goal_audience_for_channel("chan-1")["owner"] == "atlas"
     assert "illegal transition" in await t.goal_set(_ctx(), goal["id"], "status", "executing")
 
 
@@ -223,7 +227,7 @@ async def test_archive_denies_posting_for_everyone_and_keeps_other_overwrites(mo
     monkeypatch.setattr("src.tools.discord_tools._discord_patch", _patch)
     goal = store.create_goal("X", "", "atlas", "chan-1", "u")
     goal = store.update_goal(goal["id"], "atlas", status="abandoned")
-    assert await tools._archive_channel(_ctx(), goal) == "channel archived read-only"
+    assert (await tools._archive_channel(_ctx(), goal)).startswith("channel archived read-only")
     endpoint, payload = patched[0]
     assert endpoint == "/channels/chan-1"
     by_id = {o["id"]: o for o in payload["permission_overwrites"]}
