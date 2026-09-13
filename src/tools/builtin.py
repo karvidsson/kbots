@@ -4,7 +4,9 @@ import logging
 import os
 
 from src.core.base import IncomingMessage, ToolContext
+from src.core.decision_reactions import decision_reactions
 from src.core.tools import tool
+from src.lib.discord_reactions import seed_reactions_rest
 
 logger = logging.getLogger(__name__)
 
@@ -138,8 +140,11 @@ async def send_message(ctx: ToolContext, channel_id: str, content: str, bot: str
             }
             # Split long messages (Discord 2000 char limit)
             chunks = [content[i:i+2000] for i in range(0, len(content), 2000)]
+            emojis = decision_reactions(content)
+            first_id = ""
+            suffix = ""
             async with aiohttp.ClientSession() as session:
-                for chunk in chunks:
+                for index, chunk in enumerate(chunks):
                     async with session.post(
                         f"https://discord.com/api/v10/channels/{channel_id}/messages",
                         headers=headers,
@@ -148,7 +153,19 @@ async def send_message(ctx: ToolContext, channel_id: str, content: str, bot: str
                         if resp.status != 200:
                             err = await resp.text()
                             return f"Discord API error ({resp.status}): {err[:200]}"
-            return f"Message sent to {channel_id}"
+                        if emojis and index == 0:
+                            try:
+                                created = await resp.json()
+                                first_id = (created or {}).get("id", "")
+                            except (aiohttp.ContentTypeError, ValueError):
+                                pass
+                failed = await seed_reactions_rest(session, headers, channel_id, first_id, emojis)
+                if first_id:
+                    suffix = f" (message id {first_id})"
+                if failed:
+                    suffix += (f"; reaction shortcuts unavailable: {' '.join(failed)}. "
+                               "The message was sent; do not resend it. Reactions can be added manually.")
+            return f"Message sent to {channel_id}{suffix}"
 
     return "No connector available to send messages"
 

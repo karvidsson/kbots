@@ -8,8 +8,10 @@ from urllib.parse import quote
 import aiohttp
 
 from src.core.base import ToolContext
+from src.core.decision_reactions import decision_reactions
 from src.core.tools import tool
 from src.lib.discord_auth import resolve_bot_token
+from src.lib.discord_reactions import seed_reactions_rest
 
 logger = logging.getLogger(__name__)
 
@@ -451,6 +453,11 @@ async def send_discord_file(
                 except (aiohttp.ContentTypeError, ValueError):
                     msg_id = ""
                 suffix = f" (message id {msg_id})" if msg_id else ""
+                emojis = decision_reactions(message)
+                failed = await seed_reactions_rest(session, headers, channel_id, msg_id, emojis)
+                if failed:
+                    suffix += (f"; reaction shortcuts unavailable: {' '.join(failed)}. "
+                               "The file was sent; do not upload it again. Reactions can be added manually.")
                 return f"File {path.name} sent to channel {channel_id}{suffix}"
             error = await resp.text()
             hint = ""
