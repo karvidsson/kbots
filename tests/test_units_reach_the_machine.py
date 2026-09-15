@@ -21,6 +21,7 @@ deploy-blocked report on a fresh VPS, 2026-08-26.
 import importlib.util
 import plistlib
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -211,10 +212,10 @@ def test_the_working_directory_is_read_back_out_of_the_unit():
 
 
 def test_a_hand_edited_live_unit_is_left_alone(tmp_path, monkeypatch, capsys):
-    """install-systemd.sh makes /etc/systemd/system/kbots.service a SYMLINK
-    into the overlay, so writing the overlay copy IS the install. `sed -i`
-    replaces that symlink with a regular file and orphans the overlay copy.
-    Overwriting the local edit to fix that is not this script's call.
+    """A regular file at the live path whose content does NOT match the overlay
+    copy is a local edit — `sed -i` leaves exactly this. Publishing the new
+    render over it would destroy it silently, and overwriting someone's local
+    change is not this script's call.
     """
     overlay = tmp_path / "overlay"
     (overlay / "systemd").mkdir(parents=True)
@@ -237,6 +238,81 @@ def test_a_hand_edited_live_unit_is_left_alone(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "regular file" in out and "Not touching" in out
     assert live.read_text() == "hand edited\n"
+
+
+def test_a_copied_live_unit_is_refreshed_rather_than_called_a_hand_edit(
+        tmp_path, monkeypatch, capsys):
+    """install-systemd.sh COPIES units into /etc now, because a symlink into a
+    not-yet-mounted /home reads as "not-found" when systemd loads units early
+    at boot. That makes a regular file the normal state, so the old
+    "regular file => hand edit" check refused to refresh every correctly
+    installed machine — and told the operator to re-symlink, reintroducing the
+    boot bug. A copy that still matches the overlay is refreshed and published.
+    """
+    overlay = tmp_path / "overlay"
+    (overlay / "systemd").mkdir(parents=True)
+    generated = overlay / "systemd" / "kbots.service"
+    generated.write_text(
+        f"WorkingDirectory={refresh.ENGINE_ROOT}\n"
+        f"Environment=KBOTS_OVERLAY={overlay}\n")
+    monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
+
+    live = tmp_path / "etc" / "kbots.service"
+    live.parent.mkdir()
+    live.write_text(generated.read_text())  # a faithful copy, not an edit
+
+    orig = refresh.Path
+    monkeypatch.setattr(refresh, "Path",
+                        lambda *a: live if a == ("/etc/systemd/system/kbots.service",)
+                        else orig(*a))
+    assert refresh.refresh_systemd(dry_run=True, reload=False) == refresh.CHANGED
+    out = capsys.readouterr().out
+    assert "Not touching" not in out
+    assert "would publish" in out
+
+
+def test_publishing_tells_the_two_install_conventions_apart(tmp_path):
+    overlay = tmp_path / "systemd"
+    overlay.mkdir()
+    generated = overlay / "kbots.service"
+    generated.write_text("[Service]\n")
+
+    missing = tmp_path / "etc" / "kbots.service"
+    assert refresh.live_unit_state(missing, generated) == "absent"
+
+    missing.parent.mkdir()
+    link = tmp_path / "etc" / "linked.service"
+    link.symlink_to(generated)
+    assert refresh.live_unit_state(link, generated) == "symlink"
+
+    copy = tmp_path / "etc" / "copied.service"
+    copy.write_text(generated.read_text())
+    assert refresh.live_unit_state(copy, generated) == "copy"
+
+    copy.write_text("[Service]\nExecStart=/local/edit\n")
+    assert refresh.live_unit_state(copy, generated) == "edited"
+
+
+def test_a_unit_that_cannot_reach_etc_is_not_reported_as_a_success(
+        tmp_path, monkeypatch, capsys):
+    """The overlay copy is written before the copy into /etc can fail. Reporting
+    success there would leave the manager loading the old unit with nothing in
+    the log saying so — the one state this script exists to prevent.
+    """
+    generated = tmp_path / "kbots.service"
+    generated.write_text("[Service]\n")
+    live = tmp_path / "etc-kbots.service"
+    live.write_text("[Service]\n")
+
+    orig = refresh.Path
+    monkeypatch.setattr(refresh, "Path",
+                        lambda *a: live if a == ("/etc/systemd/system/kbots.service",)
+                        else orig(*a))
+    monkeypatch.setattr(refresh.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=1))
+
+    assert refresh.publish(generated, dry_run=False) is False
+    assert "could not be copied" in capsys.readouterr().out
 
 
 def test_the_plist_reload_is_a_real_reload_not_a_kickstart():
