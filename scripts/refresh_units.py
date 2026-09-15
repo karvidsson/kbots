@@ -39,13 +39,24 @@ skills changed, and a new unit that is never restarted into is not installed.
 
 WHAT IT DELIBERATELY WILL NOT DO
 
-Overwrite a hand-edited live unit. install-systemd.sh makes /etc/systemd/system/
-kbots.service a SYMLINK into <overlay>/systemd/, so writing the overlay copy is
-the whole install. If that path has been replaced by a regular file — `sed -i`
-does this, silently orphaning the overlay copy — this reports it and stops,
-because the local edit is likelier to be load-bearing than not. Drop-ins under
-kbots.service.d/ are the supported way to keep a local override; they survive
-this and are reported so the difference is never a mystery.
+Overwrite a hand-edited live unit. Two install conventions exist and this
+tells them apart by content, not by guesswork:
+
+  symlink  older installs pointed /etc/systemd/system/kbots.service at
+           <overlay>/systemd/, so writing the overlay copy was the whole
+           install.
+  copy     install-systemd.sh now COPIES units into /etc, because a symlink
+           into a not-yet-mounted /home reads as "not-found" when systemd
+           loads units early at boot. The overlay copy is still the source,
+           but a refresh only reaches the manager once it is published to
+           /etc as well.
+
+So a regular file at the live path is the normal state now, not evidence of a
+hand-edit. What still stops this script is a regular file whose content differs
+from the overlay copy: that is a local edit, publishing over it would destroy
+it silently, and the edit is likelier to be load-bearing than not. Drop-ins
+under kbots.service.d/ are the supported way to keep a local override; they
+survive this and are reported so the difference is never a mystery.
 
 Run it from a shell, not from inside the service: a hardened unit mounts the
 engine root and the overlay read-only, so the service cannot rewrite its own
@@ -236,6 +247,57 @@ def write_if_changed(path: Path, content: str, dry_run: bool) -> bool:
     return True
 
 
+def live_unit_state(live: Path, generated: Path) -> str:
+    """How the unit at /etc relates to the generated copy in the overlay.
+
+    "absent"   nothing installed at that path yet.
+    "symlink"  older install: the live path points into the overlay, so writing
+               the generated copy IS the install and nothing needs publishing.
+    "copy"     install-systemd.sh copied the unit in and the copy still matches
+               the overlay. A refresh has to publish the new render to /etc for
+               the manager to ever see it.
+    "edited"   a regular file whose content differs from the overlay copy — a
+               local edit that publishing would silently destroy.
+    """
+    if not live.exists() and not live.is_symlink():
+        return "absent"
+    if live.is_symlink():
+        return "symlink"
+    try:
+        if generated.exists() and live.read_text() == generated.read_text():
+            return "copy"
+    except OSError:
+        pass
+    return "edited"
+
+
+def publish(generated: Path, dry_run: bool) -> bool:
+    """Copy a refreshed unit from the overlay into /etc/systemd/system.
+
+    A no-op for symlink installs, where the live path already resolves to the
+    file just written. Needs root, so it tries passwordless sudo first and
+    falls back to a direct copy for the case where this runs as root already.
+    Returns False only when the unit changed and could NOT be made live, which
+    is the one state where the overlay and the manager disagree.
+    """
+    live = Path(f"/etc/systemd/system/{generated.name}")
+    if live.is_symlink() or not live.exists():
+        return True
+    if dry_run:
+        log(f"would publish {generated.name} to {live}")
+        return True
+    for cmd in (["sudo", "-n", "install", "-m", "644", "-o", "root", "-g", "root",
+                 str(generated), str(live)],
+                ["install", "-m", "644", str(generated), str(live)]):
+        if subprocess.run(cmd, capture_output=True).returncode == 0:
+            log(f"published {generated.name} -> {live}")
+            return True
+    log(f"ERROR: {generated.name} was re-rendered but could not be copied to {live}.")
+    log("  The overlay and the running manager now disagree. Run:")
+    log(f"    sudo install -m 644 {generated} {live}")
+    return False
+
+
 def ensure_writable_dirs(overlay: Path) -> None:
     """Every ReadWritePaths entry must exist before the unit starts.
 
@@ -267,13 +329,13 @@ def refresh_systemd(dry_run: bool, reload: bool) -> int:
     overlay = resolve_overlay(unit) or env_overlay
 
     live = Path("/etc/systemd/system/kbots.service")
-    if live.exists() and not live.is_symlink():
-        log(f"WARNING: {live} is a regular file, not a symlink into {generated_dir}.")
-        log("  A hand-edit replaced the symlink, so the generated unit is orphaned and")
-        log("  refreshing it would change nothing. Not touching the local edit.")
-        log("  To adopt the generated unit again, or better, move the local change into")
-        log(f"  a drop-in:  sudo ln -sfn {unit} {live}")
-        log("              /etc/systemd/system/kbots.service.d/10-local.conf")
+    if live_unit_state(live, unit) == "edited":
+        log(f"WARNING: {live} is a regular file whose content differs from {unit}.")
+        log("  That is a local edit rather than the copy install-systemd.sh makes,")
+        log("  and publishing over it would destroy it. Not touching the local edit.")
+        log("  To adopt the generated unit again, or better, move the local change")
+        log(f"  into a drop-in:  sudo install -m 644 {unit} {live}")
+        log("                   /etc/systemd/system/kbots.service.d/10-local.conf")
         return 0
 
     dropins = Path("/etc/systemd/system/kbots.service.d")
@@ -288,11 +350,11 @@ def refresh_systemd(dry_run: bool, reload: bool) -> int:
         log(f"template missing: {template}")
         return 0
 
-    changed = False
+    updated: list[Path] = []
     rendered = setup.build_service_unit(
         template.read_text(), overlay, env_lines, uv_path)
     if write_if_changed(unit, rendered, dry_run):
-        changed = True
+        updated.append(unit)
 
     rescue_template = ENGINE_ROOT / "config" / "kbots-rescue.service"
     rescue_unit = generated_dir / "kbots-rescue.service"
@@ -301,7 +363,7 @@ def refresh_systemd(dry_run: bool, reload: bool) -> int:
         rendered_rescue = setup.render_rescue_unit(
             rescue_template.read_text(), overlay, r_env, r_uv)
         if write_if_changed(rescue_unit, rendered_rescue, dry_run):
-            changed = True
+            updated.append(rescue_unit)
 
     timers_dir = ENGINE_ROOT / "config" / "timers"
     if timers_dir.is_dir():
@@ -314,11 +376,20 @@ def refresh_systemd(dry_run: bool, reload: bool) -> int:
             if not out.exists():
                 continue
             if write_if_changed(out, setup.build_timer_unit(f.read_text(), overlay), dry_run):
-                changed = True
+                updated.append(out)
 
-    if not changed:
+    if not updated:
         log("units already current")
         return 0
+
+    # Units are copied into /etc, so writing the overlay copy is only half the
+    # install: without this the refresh reports success and the manager keeps
+    # loading the old unit forever.
+    # Not short-circuited: one unpublishable unit must not hide the state of
+    # the rest, which is what the operator has to fix by hand.
+    published = [publish(u, dry_run) for u in updated]
+    if not all(published):
+        return 1
     if dry_run:
         return CHANGED
 
