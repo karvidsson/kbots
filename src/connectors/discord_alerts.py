@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import re
+import unicodedata
 from pathlib import Path
 
 import discord
@@ -14,6 +15,14 @@ from src.core.alert_channels import AlertError, AlertStore, ensure_operation
 from src.core.alert_credentials import CredentialEntry
 from src.core.alert_diagnosis import AlertWorker, public_text
 from src.core.alert_lifecycle import AlertLifecycle
+from src.core.alert_repositories import resolve_repository
+
+
+def channel_app_name(text):
+    """Convert a human app name to the bounded channel suffix used in setup."""
+    folded = unicodedata.normalize("NFKD", text.casefold())
+    folded = "".join(c for c in folded if unicodedata.category(c) not in {"Mn", "Cf"})
+    return re.sub(r"[^a-z0-9]+", "-", folded).strip("-")[:41].rstrip("-") or "app"
 
 
 class AlertChannelState(ConnectionState):
@@ -383,9 +392,15 @@ class DiscordAlerts:
         config = source["config"]
         adapter = self.adapters[config["service"]]
         if "app" not in config:
-            return "What app should I monitor? Use a short name for its alert channel. Type CANCEL to stop setup."
+            return (
+                "What is the app called? Spaces and capitals are fine; I will format its alert channel name. "
+                "Type CANCEL to stop setup."
+            )
         if "repo" not in config:
-            return "Where is the app's Git repository on this machine?"
+            return (
+                "Send the app's Git repository URL (for example https://github.com/owner/repo.git), "
+                "or its local filesystem path."
+            )
         if "project" not in config:
             return adapter.project_prompt
         if "api_key" not in config:
@@ -420,14 +435,12 @@ class DiscordAlerts:
         config = dict(source["config"])
         text = text.strip()
         if "app" not in config:
-            if not re.fullmatch(r"[a-z][a-z0-9-]{1,40}", text):
-                raise AlertError("Use 2 to 41 lowercase letters, digits or hyphens for the app name")
-            config["app"] = text
+            config["app"] = channel_app_name(text)
         elif "repo" not in config:
-            root = Path(text).expanduser().resolve(strict=True)
-            roots = [Path(p).expanduser().resolve() for p in self.config.get("repository_roots", [])]
-            if not roots or not any(root.is_relative_to(p) for p in roots) or not (root / ".git").exists():
-                raise AlertError("Choose a Git repository inside a configured alerts.repository_roots directory")
+            root = await asyncio.to_thread(resolve_repository, text, self.config.get("repository_roots", []))
+            current = self.store.get(source["id"])
+            if not current or current["state"] != "draft" or current["config"] != config:
+                raise AlertError("Setup changed during repository lookup; continue from its current prompt")
             config["repo"] = str(root)
         elif "project" not in config:
             config.update(self.adapters[config["service"]].parse_project(text))
