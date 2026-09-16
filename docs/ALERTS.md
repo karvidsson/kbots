@@ -131,6 +131,109 @@ but cannot wake a diagnosis. Manual cleanup can remove them after review.
 There is no transfer or automatic retry of an uncertain test invocation in
 Phase 1. Inspect the recorded setup rather than deleting its journal.
 
+## Local operator setup rehearsal
+
+A machine operator can exercise the real setup conversation without a human DM
+or a second Discord gateway. This optional bridge runs inside the existing alert
+service. It shares that service's store, encrypted vault, bot REST client,
+provisioning locks, receipt worker and teardown. The terminal client opens neither
+a vault nor a database. It is not registered as a chat command, model tool or HTTP
+endpoint. Like local credential entry, this does not restrict an administrator
+who already controls the service's OS account and key file.
+
+After reviewing the deployment, enable `operator_rehearsal: true` inside the
+`alerts` configuration and restart normally. The default is off. The service
+binds `operator.sock` beside `credentials.sock`, with mode 0600 in an owned 0700
+directory. Both peers must have the service UID; each request additionally proves
+read access to the same private, owned vault key file using a fresh challenge.
+The key is never transmitted. Missing, public, symlinked, non-regular or oversized
+key files are refused. Failure to start this optional listener is logged and
+leaves normal monitoring running. Disabling the listener stops new operator
+connections; the running lifecycle still expires existing rehearsals.
+
+Create a private JSON file containing the literal answers, one string per step.
+For example, when the vault presents more than one matching name:
+
+```json
+[
+  "Example App",
+  "the repository is https://code.example/team/example.git",
+  "https://eu.posthog.com/project/123/home",
+  "use existing one",
+  "secrets/posthog-api-key",
+  "all",
+  "CREATE"
+]
+```
+
+Choices depend on the real vault and server inventory. Inspect the prompts and
+use their actual names; this example does not assert that a credential exists.
+The file accepts at most 32 answers of 2,000 characters and is capped at 128 KiB.
+The final `CREATE` runs real provisioning, including a vendor test and a metered
+restricted diagnosis. Rehearsal is not a dry run.
+
+```sh
+python scripts/alert-setup-rehearsal.py \
+  --socket /srv/state/application-alerts/operator.sock \
+  --parent FULL_ACTIVE_REGISTRATION_UUID --account example-bot \
+  --inputs /srv/operator/answers.json --journal /srv/operator/rehearsal.json
+
+python scripts/alert-setup-rehearsal.py \
+  --socket /srv/state/application-alerts/operator.sock \
+  --journal /srv/operator/rehearsal.json --action status
+```
+
+The default key path uses the installation's vault-key resolver; `--key-file`
+can select the same file used by the service. The client refuses before any
+socket connection or journal change unless that key file passes its local gate.
+A new journal is exclusively created with mode 0600 before the first request.
+Keep it. The terminal prints prompts and replies and retains them in the journal.
+Activation and held notices are stored by the real lifecycle in the local status
+transcript, not sent to a fabricated human DM. Use `--action status` after the
+worker runs: finishing the input list does not establish activation.
+
+A rehearsal is explicitly bound to one active parent registration, account,
+responsible agent and revision. It can provision only the parent's exact service,
+API host, project, resolved repository and server. Its normalized name gains
+`-rehearsal` and its initiating identity is the selected bot, labelled as a local
+operator in the journal. The resulting private channel permits that bot and
+server administrators; no human's identity or access is borrowed. The ordinary
+DM duplicate guard remains intact. The sole exception allows one retained
+rehearsal alongside its explicitly selected parent. The parent is never changed.
+
+Answers call `DiscordAlerts.answer()` under the existing source lock. Completed
+steps with identical inputs replay their recorded response. Changed inputs,
+out-of-order steps and uncertain outcomes refuse automatic replay. After a lost
+connection or restart, inspect `status`, then use `--action resume` explicitly.
+Resume reconciles existing provisioning intents through the normal code. For an
+interrupted draft answer, it presents the current prompt instead of guessing
+whether to repeat that answer. Read it and append the next intended answer to
+the input list. An interrupted draft `CREATE` can therefore require a new,
+explicit `CREATE` after resume; an uncertain vendor invocation remains subject
+to the normal no-blind-retry rule.
+
+Sessions last one hour without renewal. The lifecycle revokes only that
+rehearsal's monitoring at expiry and schedules the normal owned-destination
+disable. This occurs when the lifecycle next runs, not at a guaranteed exact
+second. `--action stop` requests the same revocation early. Neither action deletes
+the channel. Keep it for inspection, then delete the rehearsal channel through
+the normal authorized Discord path to exercise the real teardown. Confirm the
+owned vendor destination is absent with an exact GET and a complete list before
+claiming cleanup. A new rehearsal is refused while a prior one retains resources.
+The local step and notice journal remains available after source teardown.
+
+The bridge creates no second SQLite writer process. All database work is short,
+synchronous work on the service connection, using its existing WAL mode and
+5-second busy timeout; no transaction spans an awaited network call. Session
+locks serialize terminal retries and source locks coordinate provisioning with
+normal cleanup. Shutdown cancels in-flight answers, retaining their uncertain
+step and existing provisioning journal for explicit recovery.
+
+This exercises the production conversation logic and downstream pipeline. It
+does not impersonate or test Discord's human DM transport, command authorization
+or the delivery of a success notice to an actual person's DM. Those require a
+separate human-originated acceptance check.
+
 ## Execution and recovery boundaries
 
 - An alert room has one responsible agent/account. Admission binds guild,

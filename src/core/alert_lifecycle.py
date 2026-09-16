@@ -18,6 +18,7 @@ class AlertLifecycle:
         self.wake = asyncio.Event()
         self.reconcile_lock = asyncio.Lock()
         self.cleanup_lock = asyncio.Lock()
+        self.expire_rehearsals = lambda: None
 
     def request(self, source_id, kind):
         # Never wait for the provisioning lock before revoking local work.
@@ -142,8 +143,7 @@ class AlertLifecycle:
                         else:
                             await adapter.disable(owned, destination_id)
                 self.store.db.execute(
-                    "UPDATE alert_revisions SET cleaned=1,removed=MAX(removed,?) "
-                    "WHERE source_id=? AND revision=?",
+                    "UPDATE alert_revisions SET cleaned=1,removed=MAX(removed,?) WHERE source_id=? AND revision=?",
                     (int(kind == "deleted"), source["id"], revision),
                 )
             job = self.store.db.execute("SELECT * FROM teardowns WHERE source_id=?", (source["id"],)).fetchone()
@@ -241,6 +241,7 @@ class AlertLifecycle:
         next_reconcile = 0
         while True:
             try:
+                self.expire_rehearsals()
                 if time.monotonic() >= next_reconcile:
                     for account in tuple(self.accounts):
                         await self.reconcile(account)

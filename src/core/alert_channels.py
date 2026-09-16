@@ -271,6 +271,8 @@ class AlertStore:
                     revision=source["revision"],
                     outcome=condition.rsplit(":", 1)[-1],
                 )
+            if source.get("dm_id", "").startswith("operator:"):
+                context["target"] = "operator"
             self.db.execute(
                 "INSERT INTO lifecycle_notices(id,context,text) VALUES(?,?,?)",
                 (str(uuid.uuid4()), json.dumps(context), text),
