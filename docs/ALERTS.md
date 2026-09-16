@@ -34,8 +34,11 @@ acceptance checks below on the exact deployed version.
 
 As a configured Discord administrator, DM the responsible bot and run
 `/alerts create service:posthog` or `/alert posthog`. Supply the application
-name, Git repository URL or local path, private API project URL, one existing credential reference,
-server and lifecycle events. The bot shows the concrete resources and event
+name, Git repository URL or local path, and private API project URL. A URL inside
+a sentence is accepted. The bot finds existing vault key names, choosing a sole
+match or offering a numbered list. A sole server is selected automatically;
+multiple servers accept a number, name or ID. Event selection defaults to all
+three; reply `yes`, `all`, an empty message or a comma-separated subset. The bot shows the concrete resources and event
 selection and requires `CREATE` before any provisioning. `CANCEL` stops setup.
 
 Enter the app's natural name, including spaces and capitals. For example,
@@ -45,12 +48,13 @@ turns separators into hyphens and shortens it to 41 characters. A name with no
 usable ASCII letters or digits uses `alerts-app`. The creation confirmation shows the
 resulting channel name before any resources are created.
 
-Supply the existing vault reference for both provisioning and incident reads,
+The selected vault reference supplies both provisioning and incident reads,
 for example `secrets/posthog-api-key`. Existing plain tokens are accepted without
 rewriting the vault or requiring the key to be entered again. The final setup
 confirmation includes the API host and reference. Credential names do not prove
 scopes; an all-access key remains all-access, while the incident path permits
-only fixed issue GETs and never gives that key to the model.
+only fixed issue reads and one strictly shaped read-only sample POST, and
+never gives that key to the model.
 
 For a repository URL, setup finds local clones under `repository_roots` by
 reading their local Git remote URLs. HTTPS and SSH forms, optional `.git`,
@@ -70,8 +74,8 @@ aliases. Overlapping roots and aliases of the same clone are deduplicated.
 Git configuration includes and inherited Git environment overrides are ignored;
 use an explicit local path if a remote exists only in an included configuration.
 
-For a new key, use hidden terminal input instead of Discord. The setup prompt
-gives the running service's socket path:
+For a new key, use hidden terminal input instead of Discord. Only when no matching vault name exists does the setup prompt
+give the running service's socket path:
 
 ```sh
 python scripts/alert-credential.py \
@@ -98,9 +102,22 @@ then a webhook and service destination. The listener is provisionally
 registered before the destination is enabled and the test is sent. Setup
 becomes active only after the exact test event has been received, its issue
 fetched, a restricted diagnosis produced and the result delivered to Discord.
-A successful vendor HTTP response alone leaves setup provisional.
+A successful vendor HTTP response alone leaves setup provisional. Activation queues
+one durable success notice to the initiating DM with the channel link. Failed
+test diagnoses and held provisioning/result delivery also report a safe reason
+there. Notices survive restart and reconcile lost send acknowledgements.
 
-Use `/alerts status source_id:<id>` to see setup state and receipt counts.
+Only a draft awaiting an answer consumes setup DM messages. During local lookup,
+provisioning, provisional monitoring, or a paused registration, ordinary messages
+continue to the agent. A resource-free draft idle for 30 minutes is cancelled
+on the next DM, with one expiry notice; that same message reaches the agent.
+Exceptions log their type and stack locations, excluding exception values,
+source lines, locals and vendor payloads. User-facing errors distinguish invalid
+input, missing access, missing resources and timeouts.
+
+Use `/alerts status` to see setup state and pending diagnoses. Commands select a
+sole registration automatically. With several, supply its app name, channel ID
+or the existing registration ID in `source_id`.
 `/alerts resume` reconciles a previously confirmed interrupted setup; it does
 not blindly repeat a create request whose result is unknown. It can also
 resume a full queue after review. `unsubscribe` immediately revokes local
@@ -122,7 +139,8 @@ Phase 1. Inspect the recorded setup rather than deleting its journal.
   database when disabling it. Mentions and reactions cannot enter a normal
   coding session in these rooms. Human messages return status in Phase 1.
   Diagnosis text is bounded to 1,600 characters and delivered directly in one
-  Discord message with its receipt marker. This path does not call the reply
+  Discord message with its receipt marker in an embed footer, or a spoiler
+  when the channel lacks Embed Links permission. This path does not call the reply
   shortener or retain an expandable remainder; output above the bound is
   truncated. All reactions, including expansion reactions on older or unrelated
   messages, are intentionally ignored in reserved rooms in Phase 1.
@@ -131,7 +149,7 @@ Phase 1. Inspect the recorded setup rather than deleting its journal.
   Trusted code fetches only the selected issue from the registered API project.
 - The diagnostic call uses the responsible agent's configured provider/model,
   a fresh temporary directory and no ordinary session, identity files, memory,
-  coding tools or MCP credential context. It receives a bounded scalar issue
+  coding tools or MCP credential context. It receives a bounded issue and exception-frame
   projection and tracked source sample. Source files are read, not executed;
   configuration files and symlinks outside the repository are excluded. This
   is a diagnostic sample, not a complete source review or test run.
@@ -164,8 +182,9 @@ Phase 1. Inspect the recorded setup rather than deleting its journal.
   queued and visible, instead of falling into the normal bot-chain suppression.
   A queue at 1,000 outstanding receipts pauses intake and reports overflow.
   Events arriving while paused are not queued; review the vendor for that gap.
-  The worker posts a start notice, periodic progress and a final diagnosis or
-  held result. API request budgets are shared across sources on the same host.
+  The worker edits one status message through queued, investigating, progress and
+  the final diagnosis or held result. A rate-limit notice appears only after
+  actual deferral. API request budgets are shared across sources on the same host.
 
 ## Channel deletion and durable cleanup
 
@@ -288,3 +307,46 @@ write scopes, real Discord permissions, successful delivery or actual CLI
 enforcement. Those remain installation acceptance requirements.
 
 Adapter contract and verified source references: [PostHog extra](../extras/posthog/README.md).
+
+## Presentation compatibility
+
+New registrations store `message_format: 2` before provisioning. Their webhook
+shows an issue title, lifecycle event and PostHog link, followed by a spoiler
+containing the machine envelope. Registrations without that setting keep the
+exact v1 template for all ownership checks and subsequent cleanup; no existing
+vendor object is rewritten by this upgrade. New format markers are not accepted
+for old revisions, and old markers are not accepted for new ones.
+
+Bot status messages use the same persisted message ID for updates. Recovery
+still needs a remote marker to find a send whose acknowledgement was lost; an ID
+alone cannot recover that case. Embed footers carry it where the bot has Embed
+Links. Other rooms use a spoiler and require no permission changes. Provisioning
+only adds an embed permission overwrite if the bot already has that permission
+in the guild. Legacy start/result markers remain recoverable.
+
+The deterministic delivery test is labelled as a setup test. New PostHog
+created/reopened notifications carry an explicit drill bit derived only from
+`event.properties.test == true`; names containing "test" are not evidence.
+Spiking and manual transitions can lack exception properties and remain unknown.
+The diagnostic prompt distinguishes a marked drill from a production fault and
+asks for verification of the reporting path. It never authorizes execution,
+fixes, resolving an issue or changing the debug route.
+
+## Selecting diagnostic source evidence
+
+Exception frames take precedence over issue-title keywords. The adapter reads
+one recent event through the narrowly allowed sample endpoint documented in the
+[PostHog extra](../extras/posthog/README.md#exception-evidence). Source selection
+matches frame path stems against the tracked file inventory, including beyond
+the first 300 files. Known build prefixes such as `.output/server/chunks/routes/`,
+`dist/` and `build/` are stripped for matching; generated `.mjs`/`.js` stems may
+match a tracked TypeScript file. For example, `api/debug/boom.get.mjs` can select
+`server/api/debug/boom.get.ts`.
+
+A path with multiple matches is not guessed. Parent traversal, untracked files,
+hidden/dependency paths, symlinks and escapes from the registered root cannot
+supply snippets. At most four files and 5,000 characters per file are included.
+Compiled line numbers are explicitly not presented as source-map resolutions.
+When no frame resolves, the old bounded keyword fallback remains, labelled as a
+fallback with the unresolved frames exposed. The sample is recent evidence, not
+proof that it is the exact lifecycle-triggering exception.

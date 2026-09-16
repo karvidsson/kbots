@@ -33,11 +33,28 @@ def destination_summary(value):
     return {key: value.get(key) for key in ("id", "name", "type", "enabled", "template_id")}
 
 
+def alert_heading(source):
+    app = re.sub(r"[^a-z0-9-]", "", source["config"].get("app", "app"))[:41] or "app"
+    return f"**{app}: issue alert**"
+
+
+def issue_link(source, issue_id):
+    config = source["config"]
+    return f"[Open issue]({config['host']}/project/{config['project']}/error_tracking/{issue_id})"
+
+
 def parse_event(source, text):
+    modern = source["config"].get("message_format", 1) == 2
+    original = text.strip()
+    if modern:
+        body, separator, envelope = original.rpartition("\n||")
+        if not separator or not envelope.endswith("||") or not body.startswith(alert_heading(source) + "\n"):
+            raise AlertError("Alert envelope is invalid")
+        text = envelope[:-2]
     parts = text.strip().split()
-    if len(parts) != 6 or parts[0] != MARKER:
+    if len(parts) != (7 if modern else 6) or parts[0] != ("KBOTS_ALERT_V2" if modern else MARKER):
         raise AlertError("Alert envelope is invalid")
-    _, source_id, nonce, kind, event_id, issue_id = parts
+    _, source_id, nonce, kind, event_id, issue_id = parts[:6]
     if source_id != source["id"] or nonce != source["nonce"]:
         raise AlertError("Alert belongs to a different registration")
     if kind not in EVENTS.values():
@@ -48,7 +65,87 @@ def parse_event(source, text):
         event_id, issue_id = str(uuid.UUID(event_id)), str(uuid.UUID(issue_id))
     except (ValueError, AttributeError):
         raise AlertError("Alert identifiers are invalid") from None
-    return {"event_id": event_id, "issue_id": issue_id, "kind": kind}
+    result = {"event_id": event_id, "issue_id": issue_id, "kind": kind}
+    if modern:
+        if parts[6] not in {"drill", "unknown"} or not body.endswith("\n" + issue_link(source, issue_id)):
+            raise AlertError("Alert heading or drill marker is invalid")
+        result["drill"] = parts[6] == "drill"
+    return result
+
+
+def sampled_exception(data):
+    """Positive projection of one sampled event. No identities or captured locals."""
+    if not isinstance(data, dict) or not isinstance(data.get("results"), list) or len(data["results"]) > 1:
+        raise AlertError("PostHog sampled-event response changed; diagnosis has no verified stack")
+    if not data["results"]:
+        return {"exceptions": [], "status": "No sampled event in the endpoint's default seven-day window"}
+    event = data["results"][0]
+    if not isinstance(event, dict) or not isinstance(event.get("properties"), dict):
+        raise AlertError("PostHog sampled-event properties are unavailable")
+    raw = event["properties"].get("$exception_list", [])
+    if not isinstance(raw, list):
+        raise AlertError("PostHog sampled exception list is invalid")
+    exceptions, remaining = [], 24
+    for item in raw[:3]:
+        if not isinstance(item, dict):
+            continue
+        summary = {
+            k: clean_text(item[k], 120 if k == "type" else 1200)
+            for k in ("type", "value")
+            if isinstance(item.get(k), str)
+        }
+        stack = item.get("stacktrace")
+        frames = stack.get("frames", []) if isinstance(stack, dict) else []
+        selected = []
+        if isinstance(frames, list):
+            # Deepest application frames are usually closest to the throw site.
+            for frame in reversed(frames[-100:]):
+                if not isinstance(frame, dict) or frame.get("in_app") is not True or not remaining:
+                    continue
+                projected = {
+                    k: clean_text(frame[k], 500 if k == "source" else 200)
+                    for k in ("source", "resolved_name")
+                    if isinstance(frame.get(k), str)
+                }
+                if "source" in projected:
+                    value = projected["source"]
+                    try:
+                        value = urlparse(value).path if "://" in value else value.split("?", 1)[0].split("#", 1)[0]
+                    except ValueError:
+                        value = ""
+                    projected["source"] = value
+                if type(frame.get("line")) is int and 0 < frame["line"] < 10_000_000:
+                    projected["line"] = frame["line"]
+                if projected:
+                    selected.append(projected)
+                    remaining -= 1
+        summary["frames"] = selected
+        exceptions.append(summary)
+    raw_releases = event["properties"].get("$exception_releases", [])
+    records = (
+        list(raw_releases.values())[:3]
+        if isinstance(raw_releases, dict)
+        else raw_releases[:3]
+        if isinstance(raw_releases, list)
+        else []
+    )
+    releases = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        release = {"version": clean_text(record["version"], 120)} if isinstance(record.get("version"), str) else {}
+        metadata = record.get("metadata")
+        git = metadata.get("git") if isinstance(metadata, dict) else None
+        commit = git.get("commit_id") if isinstance(git, dict) else None
+        if isinstance(commit, str) and re.fullmatch(r"[a-fA-F0-9]{7,64}", commit):
+            release["commit_id"] = commit
+        if release:
+            releases.append(release)
+    return {
+        "exceptions": exceptions,
+        "releases": releases,
+        "status": "One recent sampled exception event; not necessarily the triggering event",
+    }
 
 
 class DestinationNotFoundError(AlertError):
@@ -64,15 +161,13 @@ class PostHogAdapter:
     @staticmethod
     def parse_project(text):
         url = urlparse(text)
-        match = re.fullmatch(r"/project/([1-9][0-9]{0,11})/?", url.path)
-        if (
-            not match
-            or url.query
-            or url.fragment
-            or url.netloc not in PostHogAdapter.credential_hosts
-            or url.scheme != "https"
-        ):
-            raise AlertError("Use the private PostHog project URL, not the ingestion host")
+        match = re.fullmatch(r"/project/([1-9][0-9]{0,11})(?:/.*)?", url.path)
+        if url.netloc not in PostHogAdapter.credential_hosts or url.scheme != "https":
+            raise AlertError(
+                "Use an https://eu.posthog.com or https://us.posthog.com project URL, not the ingestion host"
+            )
+        if not match:
+            raise AlertError("The PostHog URL needs a numeric project ID, for example /project/123/home")
         return {"host": f"https://{url.netloc}", "project": match[1]}
 
     parse_event = staticmethod(parse_event)
@@ -141,13 +236,38 @@ class PostHogAdapter:
         except ValueError:
             return False
 
+    @staticmethod
+    def sample_request(issue_id):
+        return {
+            "issueId": str(uuid.UUID(issue_id)),
+            "limit": 1,
+            "onlyAppFrames": True,
+            "filterTestAccounts": False,
+            "include": ["exception", "stacktrace", "release"],
+        }
+
+    @classmethod
+    def _sample_request_allowed(cls, resource, payload):
+        if resource != "error_tracking/query/issue_events/" or not isinstance(payload, dict):
+            return False
+        try:
+            return (
+                payload == cls.sample_request(payload["issueId"])
+                and type(payload["limit"]) is int
+                and payload["onlyAppFrames"] is True
+                and payload["filterTestAccounts"] is False
+            )
+        except (ValueError, TypeError, AttributeError, KeyError):
+            return False
+
     async def _request(self, config, method, resource, *, provisioning=False, payload=None):
         self.validate(config)
         # Provisioning includes private ownership GETs as well as mutations.
         # The default incident path is limited to these fixed issue reads.
-        if method != "GET" and not provisioning:
-            raise AlertError("Incident requests cannot perform mutations")
-        if not provisioning and not self._incident_resource(resource):
+        sampled_read = method == "POST" and self._sample_request_allowed(resource, payload)
+        if not provisioning and method != "GET" and not sampled_read:
+            raise AlertError("Incident requests cannot perform mutations or arbitrary queries")
+        if not provisioning and not sampled_read and (not self._incident_resource(resource) or payload is not None):
             raise AlertError("Incident requests are limited to fixed issue reads")
         token = self._credential(config)
         self._budget(config["host"])
@@ -199,6 +319,18 @@ class PostHogAdapter:
         config = source["config"]
         name = f"kbots-alert-{source['id']}-r{source['revision']}"
         content = f"{MARKER} {source['id']} {source['nonce']} {{event.event}} {{event.uuid}} {{event.distinct_id}}"
+        # Absence means the exact v1 template, including existing live revisions.
+        if config.get("message_format", 1) == 2:
+            content = (
+                alert_heading(source) + "\n{event.properties.test == true ? 'Drill. ' : ''}**"
+                "{event.event == '$error_tracking_issue_created' ? 'New issue' : "
+                "event.event == '$error_tracking_issue_reopened' ? 'Reopened issue' : 'Spiking issue'}**: "
+                "{substring(event.properties.name, 1, 150)}\n"
+                + issue_link(source, "{event.distinct_id}")
+                + "\n||"
+                + content.replace(MARKER, "KBOTS_ALERT_V2", 1)
+                + " {event.properties.test == true ? 'drill' : 'unknown'}||"
+            )
         return {
             "name": name,
             "type": "internal_destination",
@@ -396,7 +528,7 @@ class PostHogAdapter:
                         "uuid": event_id,
                         "event": EVENTS[config["triggers"][0]],
                         "distinct_id": issue_id,
-                        "properties": {},
+                        "properties": {"name": "Setup delivery test", "test": True},
                     },
                     "project": {
                         "id": int(config["project"]),
@@ -427,7 +559,12 @@ class PostHogAdapter:
             "users",
             "volume",
         )
-        return {key: clean_text(data[key]) for key in fields if isinstance(data.get(key), (str, int, float))}
+        issue = {key: clean_text(data[key]) for key in fields if isinstance(data.get(key), (str, int, float))}
+        sample = await self._request(
+            source["config"], "POST", "error_tracking/query/issue_events/", payload=self.sample_request(issue_id)
+        )
+        issue["sample"] = sampled_exception(sample)
+        return issue
 
     async def disable(self, source, destination_id):
         data, payload = await self._owned_destination(source, destination_id, enabled=None)

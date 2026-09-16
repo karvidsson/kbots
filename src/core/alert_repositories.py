@@ -20,6 +20,17 @@ SKIP = {
 }
 
 
+def extract_repository_input(text):
+    """Accept one URL in ordinary prose, without making a network request."""
+    # Leave a real local path intact, including spaces in directory names.
+    if text.strip().startswith(("/", "~/", "./", "../")):
+        return text.strip()
+    matches = re.findall(r"(?:https?://|ssh://|git://|git@[A-Za-z0-9.-]+:)[^\s<>\"']+", text)
+    if len(matches) > 1:
+        raise AlertError("Send one repository URL so I can choose the right clone")
+    return matches[0].rstrip(".,);]}") if matches else text.strip()
+
+
 def remote_identity(value):
     """Compare host/namespace/repository, excluding transport and credentials."""
     value = value.strip().removeprefix("<").removesuffix(">")
@@ -101,6 +112,7 @@ def resolve_repository(value, configured_roots):
         roots = list(dict.fromkeys(Path(p).expanduser().resolve() for p in configured_roots))
     except (OSError, RuntimeError, ValueError):
         raise AlertError("Configured alerts.repository_roots could not be resolved") from None
+    value = extract_repository_input(value)
     identity = remote_identity(value)
     if not identity:
         if "://" in value or re.match(r"[^/\s]+@[^/\s]+:", value):

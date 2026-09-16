@@ -123,12 +123,17 @@ async def test_issues_use_fixed_get_and_positive_projection(fixture):
     _, source, adapter, _ = fixture
     issue = str(uuid.uuid4())
     adapter._request = AsyncMock(
-        return_value={"id": issue, "name": "Error " + WEBHOOK, "properties": {"secret": KEY}, "person": KEY}
+        side_effect=[
+            {"id": issue, "name": "Error " + WEBHOOK, "properties": {"secret": KEY}, "person": KEY},
+            {"results": []},
+        ]
     )
     result = await adapter.issue(source, issue)
-    assert set(result) == {"id", "name"}
+    assert set(result) == {"id", "name", "sample"}
     assert WEBHOOK not in json.dumps(result) and KEY not in json.dumps(result)
-    assert adapter._request.call_args.args[1:] == ("GET", f"error_tracking/issues/{issue}/")
+    assert adapter._request.call_args_list[0].args[1:] == ("GET", f"error_tracking/issues/{issue}/")
+    assert adapter._request.call_args.args[1:] == ("POST", "error_tracking/query/issue_events/")
+    assert adapter._request.call_args.kwargs["payload"] == adapter.sample_request(issue)
     assert not adapter._request.call_args.kwargs.get("provisioning")
 
 
