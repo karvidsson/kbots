@@ -177,6 +177,16 @@ def sample_drill_status(sample, filtered):
     return "drill" if event_id == filtered_id else "unknown"
 
 
+def sampled_event_matches_trigger(sample, event_id):
+    """Compare private UUIDs locally; only the relation leaves the adapter."""
+    try:
+        if len(sample["results"]) != 1:
+            return None
+        return uuid.UUID(sample["results"][0]["uuid"]) == uuid.UUID(event_id)
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return None
+
+
 class DestinationNotFoundError(AlertError):
     """An exact destination GET returned 404; listing confirmation is still required."""
 
@@ -597,7 +607,7 @@ class PostHogAdapter:
         )
         self.store.finish_operation(source, "delivery-test", {"event_id": event_id})
 
-    async def issue(self, source, issue_id):
+    async def issue(self, source, issue_id, event_id=None):
         issue_id = str(uuid.UUID(issue_id))
         data = await self._request(source["config"], "GET", f"error_tracking/issues/{issue_id}/")
         if str(data.get("id")) != issue_id:
@@ -632,8 +642,17 @@ class PostHogAdapter:
             payload=self.sample_request(issue_id, date_range=query["dateRange"], drill=True),
         )
         issue["sample"]["drill_status"] = sample_drill_status(sample, filtered)
+        matches_trigger = sampled_event_matches_trigger(sample, event_id)
+        issue["sample"]["matches_trigger"] = matches_trigger
+        if matches_trigger is True:
+            issue["sample"]["status"] = "The sampled exception is the triggering event."
         issue["sample"]["drill_scope"] = (
-            "The recent sampled exception only, not the triggering lifecycle event or every event in this issue. "
+            (
+                "The sampled exception and triggering event, confirmed by matching UUIDs. "
+                if matches_trigger is True
+                else "The recent sampled exception only; its identity is not confirmed as the triggering event. "
+            )
+            + "This does not classify every event in the issue. "
             "Unmarked means no declared test=true match; it is not proof of a production defect."
         )
         return issue

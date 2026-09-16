@@ -475,14 +475,21 @@ class AlertStore:
         return 15 if row[0] is None else max(0.1, min(15, row[0] - time.time()))
 
     def annotate(self, receipt, **values):
-        allowed = {"issue_name", "setup_test", "drill", "sample_drill_status"}
+        allowed = {"issue_name", "issue_title", "setup_test", "drill", "sample_drill_status"}
         if set(values) - allowed:
             raise AlertError("Invalid incident presentation")
+        row = self.db.execute(
+            "SELECT presentation FROM receipts WHERE id=? AND lease=? AND state='running'",
+            (receipt["id"], receipt["lease"]),
+        ).fetchone()
+        if not row:
+            return
+        presentation = {**json.loads(row["presentation"]), **values}
         self.db.execute(
             "UPDATE receipts SET presentation=? WHERE id=? AND lease=? AND state='running'",
-            (json.dumps(values), receipt["id"], receipt["lease"]),
+            (json.dumps(presentation), receipt["id"], receipt["lease"]),
         )
-        receipt.update(values)
+        receipt.update(presentation)
 
     def save_result(self, receipt, result, success=True):
         return (
