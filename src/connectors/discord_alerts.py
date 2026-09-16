@@ -17,6 +17,7 @@ from src.core.alert_credentials import CredentialEntry
 from src.core.alert_diagnosis import AlertWorker, public_text
 from src.core.alert_errors import failure_reason, log_failure
 from src.core.alert_lifecycle import AlertLifecycle
+from src.core.alert_operator import OperatorRehearsal
 from src.core.alert_repositories import resolve_repository
 
 
@@ -150,6 +151,11 @@ class DiscordAlertTransport:
 
     async def lifecycle_notice(self, notice):
         source = json.loads(notice["context"])
+        if source.get("target") == "operator":
+            # The original text remains in the durable local transcript. Never
+            # fabricate a DM or deliver rehearsal notices to the parent owner.
+            self.store.db.execute("UPDATE lifecycle_notices SET state='complete' WHERE id=?", (notice["id"],))
+            return
         client = self.bot(source).client
         if source.get("target") == "dm":
             current = self.store.get(source["id"])
@@ -428,6 +434,8 @@ class DiscordAlerts:
         )
         self.worker.accounts = set()
         self.lifecycle_task = None
+        self.operator = OperatorRehearsal(self, directory)
+        self.lifecycle.expire_rehearsals = self.operator.expire
         self.credentials = CredentialEntry(
             directory,
             connector.vault,
@@ -441,6 +449,12 @@ class DiscordAlerts:
             self.worker.accounts.add(account)
             if self.task is None:
                 await self.credentials.start()
+                if self.config.get("operator_rehearsal") is True:
+                    try:
+                        await self.operator.start()
+                    except Exception as error:
+                        # The optional local socket must not interrupt monitoring.
+                        log_failure(error, "operator rehearsal startup")
                 self.task = asyncio.create_task(self.worker.run(), name="alert-worker")
                 self.lifecycle_task = asyncio.create_task(self.lifecycle.run(), name="alert-lifecycle")
 
@@ -453,6 +467,7 @@ class DiscordAlerts:
                     await task
                 except asyncio.CancelledError:
                     pass
+        await self.operator.stop()
         await self.credentials.stop()
         self.store.close()
 
@@ -650,8 +665,11 @@ class DiscordAlerts:
             ):
                 other = self.store.get(row["id"])
                 if all(other["config"].get(k) == config.get(k) for k in ("service", "host", "project", "repo")):
+                    if self.operator.allow_duplicate(source, other):
+                        continue
                     raise AlertError("This app already has an alert registration. Use /alerts status or /alerts rotate")
             await self.adapters[config["service"]].check_credentials(config)
+            self.operator.check_creation(source)
             source = self.store.update(source["id"], state="provisioning")
             return await self.provision(source)
         else:
