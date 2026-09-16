@@ -306,6 +306,7 @@ class ClaudeCodeProvider(LLMProvider):
     Each call spawns `claude --print` in the agent's project directory.
     Claude Code reads CLAUDE.md (stub importing AGENTS.md) for identity.
     """
+    supports_tool_free = True
     name = "claude_code"
     reads_project_context = True
 
@@ -333,6 +334,7 @@ class ClaudeCodeProvider(LLMProvider):
             allowed_tools: list[str] — Claude Code tools to allow
         """
         project_dir = kwargs.get("project_dir", ".")
+        tool_free = bool(kwargs.get("tool_free"))
         model = kwargs.get("model", self._default_model)
         session_id = kwargs.get("session_id")
         allowed_tools = kwargs.get("allowed_tools")
@@ -353,7 +355,11 @@ class ClaudeCodeProvider(LLMProvider):
         # permissions (there's no trust dialog to accept headless), so the
         # agent's allow-list — Bash, MCP tools, etc. — silently doesn't apply
         # and every tool comes back "not granted". Mark the workspace trusted.
-        _ensure_workspace_trusted(cwd)
+        if tool_free:
+            if session_id or tools:
+                raise ValueError("Tool-free diagnostics cannot resume or receive tools")
+        else:
+            _ensure_workspace_trusted(cwd)
 
         # Pre-flight probe: if the CLI has no local state for this session, skip --resume.
         # Stale session_ids that still exist in storage but not on disk cause silent hangs
@@ -396,16 +402,21 @@ class ClaudeCodeProvider(LLMProvider):
 
         # MCP config — use explicit path if set, otherwise auto-discover from cwd
         mcp_config = kwargs.get("mcp_config")
-        if mcp_config:
+        if tool_free:
+            args.extend(["--tools", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+                         "--disable-slash-commands", "--setting-sources", "",
+                         "--settings", '{"disableAllHooks":true}', "--no-session-persistence"])
+        elif mcp_config:
             args.extend(["--mcp-config", str(mcp_config)])
 
         # Working directories beyond the agent dir. Always the shared temp dir
         # and the codex; then anything the deployment or this agent adds.
-        args.extend(_extra_dir_args(kwargs.get("extra_dirs"),
-                                    kwargs.get("sandbox_dirs")))
+        if not tool_free:
+            args.extend(_extra_dir_args(kwargs.get("extra_dirs"),
+                                        kwargs.get("sandbox_dirs")))
 
         # Allowed tools
-        if allowed_tools:
+        if allowed_tools and not tool_free:
             args.extend(["--allowedTools"] + allowed_tools)
 
         # Disallowed tools — hide and block these entirely
@@ -434,7 +445,7 @@ class ClaudeCodeProvider(LLMProvider):
                     stderr=asyncio.subprocess.PIPE,
                     cwd=str(cwd),
                     env=self._build_env(channel_id=channel_id, user_id=user_id,
-                                        extra_env=kwargs.get("extra_env"),
+                                        extra_env=None if tool_free else kwargs.get("extra_env"),
                                         inter_agent_depth=inter_agent_depth),
                     limit=_STREAM_LIMIT,
                 )

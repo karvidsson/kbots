@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 class MockProvider(LLMProvider):
     """Echo/canned-response provider for development and tests."""
+    supports_tool_free = True
     name = "mock"
 
     def __init__(self, config: dict):

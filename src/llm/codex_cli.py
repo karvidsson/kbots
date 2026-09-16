@@ -315,8 +315,26 @@ def _sh_quote(s: str) -> str:
     return "'" + str(s).replace("'", "'\\''") + "'"
 
 
+def tool_free_config(env):
+    """Disable configured global MCP servers before startup, not just their calls."""
+    import tomllib
+    path = Path(env.get("CODEX_HOME") or str(Path(env.get("HOME", "~")) / ".codex")) / "config.toml"
+    if not path.exists():
+        return []
+    try:
+        data = tomllib.loads(path.read_text())
+    except (OSError, ValueError):
+        raise ValueError("Cannot establish a tool-free Codex configuration") from None
+    layers = [data, *data.get("profiles", {}).values()]
+    servers = {name for layer in layers for name in layer.get("mcp_servers", {})}
+    plugins = {name for layer in layers for name in layer.get("plugins", {})}
+    return ([f"mcp_servers.{json.dumps(name)}.enabled=false" for name in sorted(servers)]
+            + [f"plugins.{json.dumps(name)}.enabled=false" for name in sorted(plugins)])
+
+
 class CodexCLIProvider(LLMProvider):
     """LLM provider that spawns the Codex CLI headless per turn."""
+    supports_tool_free = True
     name = "codex_cli"
     # The CLI loads the agent identity (AGENTS.md) from project_dir itself —
     # the engine must not inject it as a system message.
@@ -379,6 +397,7 @@ class CodexCLIProvider(LLMProvider):
         **kwargs,
     ) -> LLMResponse:
         project_dir = kwargs.get("project_dir", ".")
+        tool_free = bool(kwargs.get("tool_free"))
         model = kwargs.get("model") or self._default_model
         session_id = kwargs.get("session_id")
         effort = kwargs.get("effort")
@@ -393,12 +412,19 @@ class CodexCLIProvider(LLMProvider):
             sandbox, approval_policy, approvals_reviewer)
         additional_dirs = agent_session_dirs(
             kwargs.get("extra_dirs"), kwargs.get("sandbox_dirs"))
+        if tool_free:
+            if session_id or tools:
+                raise ValueError("Tool-free diagnostics cannot resume or receive tools")
+            sandbox, approval_policy, additional_dirs = "read-only", "never", []
 
         cwd = Path(project_dir).resolve()
         cwd.mkdir(parents=True, exist_ok=True)
 
         env = {k: v for k, v in os.environ.items() if k in self._ENV_ALLOWLIST}
-        env.update(kwargs.get("extra_env") or {})
+        if not tool_free:
+            env.update(kwargs.get("extra_env") or {})
+        else:
+            env.pop("SSH_AUTH_SOCK", None)
         # Sender identity, as resolved by the engine from the inbound message —
         # never fabricated here. mcp_config_args copies it into each MCP
         # server's table (_CONTEXT_ENV); os.environ is never mutated, so
@@ -414,6 +440,8 @@ class CodexCLIProvider(LLMProvider):
         # disk before codex starts. Rewritten (or removed) every turn, so it
         # always states this turn's grants and never an earlier turn's.
         builtins = denied_builtins(kwargs.get("disallowed_tools"))
+        if tool_free:
+            builtins = ["*"]
         hooks_armed = write_hook_config(cwd, builtins)
         if hooks_armed:
             # The hook reads this from the environment it inherits from codex.
@@ -445,6 +473,14 @@ class CodexCLIProvider(LLMProvider):
                 additional_dirs=additional_dirs,
                 hooks_armed=hooks_armed,
             )
+            if tool_free:
+                # Deny hook covers every tool name, including external MCP and
+                # future tools. Read-only sandbox is an independent file barrier.
+                # These flags additionally remove the common tool surfaces.
+                for setting in (*tool_free_config(env), 'features.shell_tool=false', 'features.unified_exec=false',
+                                'features.multi_agent=false', 'apps._default.enabled=false',
+                                'web_search="disabled"'):
+                    args[2:2] = ["-c", setting]
             logger.debug(f"{tag}codex exec: cwd={cwd} model={model} "
                          f"resume={resuming} prompt_len={len(prompt)}")
             # `timeout` asks how long the turn may run and is the same either

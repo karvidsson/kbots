@@ -83,6 +83,8 @@ class DiscordConnector(Connector):
         self._on_guild_setup = None
         self._on_guild_intro = None
         self._setup_profile: str = ""
+        self._alerts = None
+        self._alert_reservations = None
         # Long replies are cut at a structural boundary; the rest arrives on a
         # reaction. Built here with no data dir, rebuilt in set_setup_context
         # once the engine says where state lives.
@@ -126,6 +128,14 @@ class DiscordConnector(Connector):
         # reaction the fixed handlers do not claim was previously dropped in
         # silence. `defaults.reply.reaction_wake: false` turns it off for
         # deployments where reactions are decoration rather than signal.
+        alerts_cfg = self._full_config.get("alerts", {})
+        if alerts_cfg.get("enabled") and not self._setup_profile:
+            from src.connectors.discord_alerts import DiscordAlerts
+            self._alerts = DiscordAlerts(self, alerts_cfg, Path(self._data_dir) / "application-alerts")
+            self._alert_reservations = self._alerts.store
+        elif (Path(self._data_dir) / "application-alerts" / "alerts.db").exists():
+            from src.core.alert_channels import AlertStore
+            self._alert_reservations = AlertStore(Path(self._data_dir) / "application-alerts")
         self._reaction_wake = bool(reply_cfg.get("reaction_wake", True))
         if not self._reaction_wake:
             logger.info("Reaction wake: OFF (unhandled reactions are ignored)")
@@ -189,6 +199,10 @@ class DiscordConnector(Connector):
 
     async def stop(self) -> None:
         """Stop all bot accounts."""
+        if self._alerts:
+            await self._alerts.stop()
+        elif self._alert_reservations:
+            self._alert_reservations.close()
         for name, bot in self.bots.items():
             logger.info(f"Stopping Discord bot: {name}")
             await bot.close()
@@ -551,6 +565,11 @@ class DiscordConnector(Connector):
         routing = agent_cfg.get("routing", {}).get("discord", {})
         return routing.get("account")
 
+    def _reserved_alert(self, channel_id):
+        controller = getattr(self, "_alerts", None)
+        store = controller.store if controller else getattr(self, "_alert_reservations", None)
+        return store.channel(str(channel_id)) if store else None
+
     def get_agent_for_channel(self, channel_id: str, bot_account: str,
                               category_id: str | None = None) -> str | None:
         """Find which agent handles messages in this channel from this bot.
@@ -574,6 +593,9 @@ class DiscordConnector(Connector):
         # a mention route makes it a decision any participant makes silently,
         # as often as it likes. The caller answers the mention instead (see
         # _goal_outsider_notice) so nothing is dropped without a word.
+        if self._reserved_alert(channel_id):
+            # Alert rooms never fall through to ordinary privileged agent turns.
+            return None
         goal_participants = self._goal_participants(channel_id)
         if goal_participants:
             for agent_id, agent_cfg in self._agent_configs.items():
@@ -689,7 +711,11 @@ class DiscordBot:
         for intent_name in (intents_list or DEFAULT_INTENTS):
             setattr(intents, intent_name, True)
 
-        self.client = discord.Client(
+        client_class = discord.Client
+        if getattr(connector, "_alerts", None):
+            from src.connectors.discord_alerts import AlertChannelClient
+            client_class = AlertChannelClient
+        self.client = client_class(
             intents=intents,
             max_messages=max_messages,
             member_cache_flags=discord.MemberCacheFlags.none(),
@@ -702,6 +728,10 @@ class DiscordBot:
         self.client.event(self.on_message)
         self.client.event(self.on_raw_reaction_add)
         self.client.event(self.on_guild_join)
+        self.client.event(self.on_guild_channel_create)
+        self.client.event(self.on_guild_channel_delete)
+        self.client.event(self.on_guild_channel_update)
+        self.client.event(self.on_guild_remove)
 
         # Kept for server provisioning, which needs REST calls of its own.
         self._token = ""
@@ -775,6 +805,27 @@ class DiscordBot:
         except Exception as e:
             logger.info(f"[{self.account_name}] could not set nickname in "
                         f"'{getattr(guild, 'name', guild.id)}': {e}")
+
+    async def on_guild_channel_create(self, channel) -> None:
+        alerts = getattr(self.connector, "_alerts", None)
+        if alerts:
+            await alerts.lifecycle.reconcile(self.account_name, channel)
+
+    async def on_guild_channel_delete(self, channel) -> None:
+        alerts = getattr(self.connector, "_alerts", None)
+        if alerts:
+            await alerts.lifecycle.reconcile(self.account_name, channel)
+            alerts.lifecycle.wake.set()
+
+    async def on_guild_channel_update(self, before, after) -> None:
+        alerts = getattr(self.connector, "_alerts", None)
+        if alerts:
+            await alerts.lifecycle.reconcile(self.account_name, after)
+
+    async def on_guild_remove(self, guild) -> None:
+        alerts = getattr(self.connector, "_alerts", None)
+        if alerts:
+            await alerts.lifecycle.guild_lost(self.account_name, guild.id)
 
     async def on_guild_join(self, guild) -> None:
         """A server invited this bot: provision the channels a fleet needs.
@@ -926,6 +977,10 @@ class DiscordBot:
             f"Discord bot '{self.account_name}' ready as {self.client.user} "
             f"(guilds: {len(self.client.guilds)})"
         )
+
+        alerts = getattr(self.connector, "_alerts", None)
+        if alerts:
+            await alerts.start(self.account_name)
 
         # Record this bot's Discord identity in the roster so other agents recognize
         # it as a teammate (resolve_discord_user / user-context) rather than an
@@ -1171,6 +1226,12 @@ class DiscordBot:
         if message.author == self.client.user:
             return
 
+        alerts = getattr(self.connector, "_alerts", None)
+        if alerts and await alerts.on_message(self, message):
+            return
+        if DiscordConnector._reserved_alert(self.connector, str(message.channel.id)):
+            return  # Disabled feature keeps historical webhook rooms reserved.
+
         # Dedup: skip messages already seen (replayed after Discord RESUME)
         if message.id in self._seen_message_ids:
             return
@@ -1362,6 +1423,8 @@ class DiscordBot:
         if payload.user_id == self.client.user.id:
             return
 
+        if DiscordConnector._reserved_alert(self.connector, str(payload.channel_id)):
+            return  # Phase 1 never escalates a reaction into a coding session.
         emoji = str(payload.emoji)
 
         # Expand a shortened reply. Checked first and cheap: it is a read of
@@ -1772,6 +1835,9 @@ class DiscordBot:
 
     def _register_commands(self) -> None:
         """Register all slash commands on this bot's command tree."""
+        alerts = getattr(self.connector, "_alerts", None)
+        if alerts:
+            alerts.register_commands(self)
         self._register_status_commands()
         self._register_admin_commands()
         self._register_skill_commands()
