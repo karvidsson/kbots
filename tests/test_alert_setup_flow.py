@@ -209,7 +209,8 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         assert provider.complete.await_count == 1
         public = json.dumps([m.content for m in history]) + "\n".join(alerts.store.db.iterdump())
         assert "synthetic-token" not in public and "synthetic-key" not in public
-        assert any("Diagnosis complete" in m.content for m in history)
+        assert any("Setup check received. Alert path works." in m.content for m in history)
+        assert all("Proposed fix for review" not in m.content for m in history)
         # A restarted reporter reconciles the receipt instead of posting twice.
         await alerts.worker.once()
         assert provider.complete.await_count == 1

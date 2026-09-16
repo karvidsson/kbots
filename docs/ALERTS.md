@@ -427,6 +427,14 @@ Links. Other rooms use a spoiler and require no permission changes. Provisioning
 only adds an embed permission overwrite if the bot already has that permission
 in the guild. Legacy start/result markers remain recoverable.
 
+The first issue-summary read fixes the linked label as app name plus the first
+line of the description, or the issue name when no description exists. It is
+sanitized, bounded to 80 characters and retained across waits, restarts and edits.
+Before that metadata arrives, the status shows plain app context without an issue
+link label. Verdicts and headings occupy separate paragraphs. A declared drill
+leads with reporting-path confirmation instead of a proposed-fix heading; a drill
+sample not bound to the trigger is explicitly described as a sample.
+
 The deterministic delivery test is labelled as a setup test. New PostHog
 created/reopened notifications carry an explicit drill bit derived only from
 `event.properties.test == true`; names containing "test" are not evidence.
@@ -436,8 +444,11 @@ for legacy destinations, only when its exception UUID matches the unfiltered
 sample. The event IDs are compared internally and excluded from model input.
 A sample with no filtered match is unmarked, not proven to be a production fault.
 Empty windows or mismatched identities remain unknown. Both requests use the
-same explicit seven-day UTC window, and channel wording distinguishes a sampled
-drill from the triggering event or the issue as a whole.
+same explicit seven-day UTC window. The sampled event UUID is also compared to
+the bound envelope's event ID without adding an include group. Exact equality
+confirms the triggering event's sampled classification; different or missing IDs
+retain the sample-only caveat. Only that relation reaches the model, never the
+UUID. This does not classify every event in the issue.
 The diagnostic prompt distinguishes a marked drill from a production fault and
 asks for verification of the reporting path. It never authorizes execution,
 fixes, resolving an issue or changing the debug route.
@@ -457,9 +468,11 @@ A path with multiple matches is not guessed. Parent traversal, untracked files,
 hidden/dependency paths, symlinks and escapes from the registered root cannot
 supply snippets. At most four files and 5,000 characters per file are included.
 Compiled line numbers are explicitly not presented as source-map resolutions.
-When no frame resolves, the old bounded keyword fallback remains, labelled as a
-fallback with the unresolved frames exposed. The sample is recent evidence, not
-proof that it is the exact lifecycle-triggering exception.
+When in-app frames exist but none resolves, no source snippets or unrelated file
+inventory are passed to the model. The evidence says "No in-app frame maps to a
+tracked file." and retains the unresolved frames. The bounded keyword fallback
+remains only when no in-app frames were supplied. A recent sample is treated as
+the triggering event only when its UUID exactly matches the bound event ID.
 
 
 Lifecycle notifications can precede exception-query indexing. Before invoking

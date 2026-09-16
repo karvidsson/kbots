@@ -138,8 +138,15 @@ UUIDs are `unknown`. A different filtered event may be an older drill in a mixed
 issue or reflect ingestion between queries; neither can classify the sampled
 event. The channel, durable receipt and prompt keep this sample scope explicit.
 The original bound lifecycle drill bit still identifies a declared triggering
-event, separately from the sample. Diagnosis runs for drills too, explaining
-the reporting path rather than proposing removal of the intentional debug route.
+event, separately from the sample. The adapter also accepts the bound trigger
+UUID as an internal argument to `issue`. It compares that UUID to the unfiltered
+sample and exposes only `matches_trigger` (true, false or unknown), not either
+raw ID. Exact equality lets the diagnosis state the triggering event's declared
+drill status without a sample-identity caveat. Missing or different IDs retain the
+caveat. The existing response projection already returns `uuid` independently of
+`include`; neither request body nor read scope is widened. Diagnosis runs for
+drills too, explaining the reporting path rather than proposing removal of the
+intentional debug route.
 
 
 The exception query can lag the lifecycle notification. Empty results expose

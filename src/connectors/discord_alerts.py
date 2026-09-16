@@ -14,7 +14,7 @@ from discord.state import ConnectionState
 
 from src.core.alert_channels import AlertError, AlertStore, ensure_operation
 from src.core.alert_credentials import CredentialEntry
-from src.core.alert_diagnosis import AlertWorker, public_text
+from src.core.alert_diagnosis import AlertWorker, incident_label, public_text
 from src.core.alert_errors import failure_reason, log_failure
 from src.core.alert_lifecycle import AlertLifecycle
 from src.core.alert_operator import OperatorRehearsal
@@ -369,7 +369,12 @@ class DiscordAlertTransport:
     @staticmethod
     def incident_title(source, receipt):
         config = source["config"]
-        label = receipt.get("issue_name") or config.get("app", "Application issue")
+        label = receipt.get("issue_title")
+        if not label:
+            if not receipt.get("issue_name"):
+                # Before the first issue read, show status without inventing a link label.
+                return public_text(config.get("app", "Application"), 80)
+            label = incident_label(source, {"name": receipt["issue_name"]})
         title = public_text(label, 80).replace("[", "(").replace("]", ")")
         if config.get("host") and config.get("project"):
             title = f"[{title}]({config['host']}/project/{config['project']}/error_tracking/{receipt['issue_id']})"
@@ -409,7 +414,18 @@ class DiscordAlertTransport:
         )
 
     async def report(self, source, receipt):
-        prefix = "Diagnosis complete. Proposed fix for review:\n" if receipt["success"] else "Diagnosis held:\n"
+        prefix = "Diagnosis held:"
+        if receipt["success"]:
+            prefix = (
+                "Setup check received. Alert path works."
+                if receipt.get("setup_test")
+                else "Drill received. Alert path works; no fix needed."
+                if receipt.get("drill")
+                else "Drill sample received. Alert path works; no fix needed for this sample."
+                if receipt.get("sample_drill_status") == "drill"
+                else "Diagnosis complete. Proposed fix for review:"
+            )
+        prefix += "\n\n"
         return await self._notice(
             source, receipt, "result", self.incident_title(source, receipt) + "\n" + prefix + receipt["result"]
         )

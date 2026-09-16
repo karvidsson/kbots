@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import time
+import unicodedata
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -22,6 +23,20 @@ _SECRET = re.compile(
 
 def public_text(value, limit=1800):
     return _SECRET.sub("[redacted]", str(value or ""))[:limit].replace("@", "＠")
+
+
+def incident_label(source, issue):
+    """A bounded plain-text link label, chosen once from the first issue read."""
+    description = str(issue.get("description") or "").strip()
+    detail = description or str(issue.get("name") or "Application issue")
+    detail = detail.splitlines()[0] if detail else "Application issue"
+    text = str(source["config"].get("app", "Application")) + ": " + detail
+    text = re.sub(r"(https?://)[^/\s]+@", r"\1[credentials redacted]@", text)
+    text = public_text(text)
+    text = "".join(c for c in text if unicodedata.category(c) not in {"Cc", "Cf"})
+    text = re.sub(r"[\[\]*_`<>\\|#]", "", text)
+    text = " ".join(text.split())
+    return text if len(text) <= 80 else text[:79] + "…"
 
 
 def frame_selections(issue, names):
@@ -95,8 +110,10 @@ def source_evidence(repo, issue):
     matched, unresolved = frame_selections(issue, eligible)
     selected = [match["path"] for match in matched]
     needles = set(re.findall(r"\b[A-Za-z_][A-Za-z_0-9]{4,40}\b", str(issue.get("name", ""))))
+    has_frames = any(item.get("frames") for item in issue.get("sample", {}).get("exceptions", []))
+    no_frame_match = has_frames and not selected
     snippets = []
-    for name in selected if selected else eligible[:300]:
+    for name in selected if selected else [] if no_frame_match else eligible[:300]:
         path = root / name
         if (
             path.is_symlink()
@@ -112,11 +129,15 @@ def source_evidence(repo, issue):
             break
     return {
         "revision": revision,
-        "source_files": eligible[:60],
+        "source_files": [] if no_frame_match else eligible[:60],
         "snippets": snippets,
         "frame_matches": matched,
         "unresolved_frames": unresolved,
-        "selection": "in-app frame paths" if selected else "issue-name fallback; no frame resolved",
+        "selection": "in-app frame paths"
+        if selected
+        else "No in-app frame maps to a tracked file."
+        if no_frame_match
+        else "issue-name fallback; no frame resolved",
         "scope": "bounded tracked source sample; repository was not executed",
     }
 
@@ -129,7 +150,15 @@ def human_diagnosis(text):
         text,
         flags=re.IGNORECASE,
     )
-    return re.sub(r"\bsetup_test\b", "setup check", text)
+    text = re.sub(r"\bsetup_test\b", "setup check", text)
+    headings = r"Observations|Observed facts|Cause|Suspected cause|Proposed fix|Missing evidence|Evidence|Details"
+    text = re.sub(
+        rf"[ \t\n]*(\*\*(?:{headings})\s*:?\*\*)[ \t]*(?:\n[ \t]*)?",
+        lambda m: "\n\n" + m[1] + "\n",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text.strip()
 
 
 async def diagnose(manager, source, issue, directory):
@@ -172,7 +201,11 @@ async def diagnose(manager, source, issue, directory):
                 "has no events, and an indexing delay is not evidence of a defect in the repository."
                 " Separately, sample.drill_status classifies only the sampled exception. When it is drill, "
                 "label that sample a declared drill and verify its reporting path, without treating the entire "
-                "issue or lifecycle event as a drill. When unmarked, no test marker matched; that does not "
+                "issue as a drill. If sample.matches_trigger is true, UUID equality confirms that this is "
+                "the triggering event: state its drill classification as a fact and do not hedge its identity. "
+                "Otherwise keep the distinction: the sample may not be the event that triggered the alert. "
+                "Use separate paragraphs for the verdict and each heading. "
+                "When unmarked, no test marker matched; that does not "
                 "prove a production defect. Unknown means classification could not be established."
             ),
         ),
@@ -288,7 +321,7 @@ class AlertWorker:
         if remaining > 0:
             try:
                 issue = await asyncio.wait_for(
-                    self.adapters[source["config"]["service"]].issue(source, receipt["issue_id"]),
+                    self.adapters[source["config"]["service"]].issue(source, receipt["issue_id"], receipt["event_id"]),
                     timeout=remaining,
                 )
             except TimeoutError:
@@ -299,11 +332,14 @@ class AlertWorker:
                         "Exception evidence read timed out before a sample response; diagnosis is held"
                     ) from None
             else:
+                if not receipt.get("issue_title"):
+                    self.store.annotate(receipt, issue_title=incident_label(source, issue))
                 if issue.get("sample", {}).get("availability") != "empty":
                     if not self.store.checkpoint_evidence(receipt, {**state, "status": "available", "issue": issue}):
                         return None
                     return issue
                 if self.store.defer_evidence(receipt, issue):
+                    await self.transport.progress(source, receipt)
                     return None
         if issue is None:
             raise AlertError("Exception evidence read was interrupted before a sample response; diagnosis is held")
@@ -333,12 +369,15 @@ class AlertWorker:
                 return True
             setup_test = receipt["event_id"] == str(uuid.uuid5(uuid.UUID(source["id"]), source["nonce"]))
             issue["setup_test"] = setup_test
-            if receipt.get("drill") is True:
+            sample = issue.get("sample", {})
+            sample_status = sample.get("drill_status")
+            matched_drill = sample.get("matches_trigger") is True and sample_status == "drill"
+            if receipt.get("drill") is True or matched_drill:
                 issue["test"] = True
-            sample_status = issue.get("sample", {}).get("drill_status")
             self.store.annotate(
                 receipt,
                 issue_name=public_text(issue.get("name", "Application issue"), 150),
+                issue_title=receipt.get("issue_title") or incident_label(source, issue),
                 setup_test=setup_test,
                 drill=issue.get("test") is True,
                 sample_drill_status=sample_status,
@@ -346,15 +385,17 @@ class AlertWorker:
             await self.transport.progress(source, receipt)
             result = await diagnose(self.manager, source, issue, self.directory)
             if setup_test:
-                result = "Setup test. " + result
+                result = "Setup test.\n\n" + result
+            elif matched_drill:
+                result = "The triggering event is a declared drill.\n\n" + result
             elif issue.get("test") is True:
-                result = "Deliberate drill. " + result
+                result = "Deliberate drill.\n\n" + result
             elif sample_status == "drill":
-                result = "The sampled exception is a declared drill. " + result
+                result = "The sampled exception is a declared drill.\n\n" + result
             elif sample_status == "unmarked":
-                result = "The sampled exception has no declared drill marker. " + result
+                result = "The sampled exception has no declared drill marker.\n\n" + result
             elif sample_status == "unknown":
-                result = "Drill status of the sampled exception is unknown. " + result
+                result = "Drill status of the sampled exception is unknown.\n\n" + result
             if receipt.get("evidence", {}).get("status") == "timed_out":
                 result = (
                     "Stack trace was not yet available after a 90-second wait. "
