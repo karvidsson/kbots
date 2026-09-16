@@ -24,7 +24,7 @@ import sys
 
 def decide(payload: dict, denied: set[str]) -> dict:
     tool = str(payload.get("tool_name") or "")
-    if tool not in denied:
+    if "*" not in denied and tool not in denied:
         return {}
     return {
         "hookSpecificOutput": {
@@ -34,6 +34,9 @@ def decide(payload: dict, denied: set[str]) -> dict:
             # tool is off for it specifically, not broken or temporarily busy,
             # or it retries the same call for the rest of the turn.
             "permissionDecisionReason": (
+                "This is a tool-free diagnostic call. All tool execution is disabled. "
+                "Use only the supplied evidence."
+                if "*" in denied else
                 f"{tool} is not available to this agent. It is disabled in "
                 f"the agent's kbots configuration (disallow_builtins). Do not "
                 f"retry it; use another tool or explain what you cannot do."

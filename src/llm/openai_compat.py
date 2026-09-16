@@ -132,6 +132,7 @@ def _to_openai_messages(messages: list[Message]) -> list[dict]:
 
 class OpenAICompatProvider(LLMProvider):
     """Direct-HTTP provider for OpenAI-compatible local runtimes."""
+    supports_tool_free = True
     name = "local"
 
     def __init__(self, config: dict):
@@ -302,6 +303,8 @@ class OpenAICompatProvider(LLMProvider):
                     model=model, stop_reason="error")
 
         msg = data.get("message") or {}
+        if kwargs.get("tool_free") and msg.get("tool_calls"):
+            return LLMResponse(content="Tool-free response contained tool calls", model=model, stop_reason="error")
         tool_calls = None
         if msg.get("tool_calls"):
             tool_calls = [{"id": f"call_{uuid.uuid4().hex[:8]}",
@@ -322,6 +325,11 @@ class OpenAICompatProvider(LLMProvider):
         stream: bool = False,
         **kwargs,
     ) -> LLMResponse:
+        if kwargs.get("tool_free"):
+            if tools or kwargs.get("session_id"):
+                raise ValueError("Tool-free diagnostics cannot resume or receive tools")
+            if any(getattr(m.role, "value", m.role) == "tool" or m.tool_calls for m in messages):
+                raise ValueError("Tool-free diagnostics cannot receive tool history")
         model = kwargs.get("model") or self._default_model
         if model in _CLAUDE_ALIASES:
             # Agent inherited a Claude alias from defaults — use the local default.
@@ -369,6 +377,8 @@ class OpenAICompatProvider(LLMProvider):
             return LLMResponse(content=f"Malformed response from local endpoint: {str(data)[:200]}",
                                model=model, stop_reason="error")
 
+        if kwargs.get("tool_free") and msg.get("tool_calls"):
+            return LLMResponse(content="Tool-free response contained tool calls", model=model, stop_reason="error")
         tool_calls = None
         if msg.get("tool_calls"):
             tool_calls = []

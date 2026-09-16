@@ -1,0 +1,181 @@
+"""One complete offline DM -> provisioning -> webhook -> diagnosis rehearsal."""
+
+import copy
+import json
+import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
+
+import discord
+
+from src.connectors.discord import DiscordBot, DiscordConnector
+from src.connectors.discord_alerts import DiscordAlerts
+from src.core.base import LLMResponse
+
+
+async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_path, monkeypatch):
+    from src.core import alert_diagnosis
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    secrets = {"secrets/posthog-api-key": "synthetic-key-with-no-real-permissions"}
+    vault = SimpleNamespace(get=secrets.get, set=lambda k, v: secrets.__setitem__(k, v), _fernet=object())
+    connector = DiscordConnector({"admin_users": ["101"]}, vault=vault)
+    connector.set_agent_configs({"worker": {"routing": {"discord": {"account": "one", "channels": []}}}})
+    provider = SimpleNamespace(
+        supports_tool_free=True,
+        complete=AsyncMock(return_value=LLMResponse(content="Suspected null input; inspect handler.")),
+    )
+    connector._agent_manager = SimpleNamespace(
+        agent_configs={"worker": {"llm": {"model": "test"}}},
+        defaults={},
+        storage=None,
+        _apply_provider_override=lambda *a: None,
+        _get_agent_llm=lambda *a: provider,
+        _effective_model=lambda *a: "test",
+        active_turns=0,
+    )
+    alerts = DiscordAlerts(
+        connector,
+        {"repository_roots": [str(tmp_path)], "adapters": {"posthog": "extras.posthog.alerts:PostHogAdapter"}},
+        tmp_path / "state",
+    )
+    connector._alerts = alerts
+    bot = DiscordBot("one", connector, admin_users=["101"])
+    connector.bots["one"] = bot
+    user = SimpleNamespace(id=999)
+    guild = SimpleNamespace(id=301, name="Example server", default_role="everyone")
+    room = Mock(spec=discord.TextChannel)
+    room.id, room.guild, room.topic = 401, guild, None
+    history, webhooks = [], []
+
+    async def send(text, **kwargs):
+        assert kwargs.get("allowed_mentions").everyone is False
+        msg = SimpleNamespace(id=700 + len(history), author=user, webhook_id=None, content=text)
+        history.append(msg)
+        return msg
+
+    async def messages(**kwargs):
+        for msg in reversed(history):
+            yield msg
+
+    async def create_room(name, **kwargs):
+        assert kwargs["overwrites"]["everyone"].view_channel is False
+        room.topic = kwargs["topic"]
+        return room
+
+    async def create_webhook(**kwargs):
+        hook = SimpleNamespace(
+            id=501,
+            name=kwargs["name"],
+            user=user,
+            token="synthetic",
+            url="https://discord.com/api/webhooks/501/synthetic-token",
+        )
+        webhooks.append(hook)
+        return hook
+
+    room.send, room.history = send, messages
+    room.webhooks, room.create_webhook = AsyncMock(return_value=webhooks), create_webhook
+    guild.fetch_channels = AsyncMock(return_value=[])
+    guild.fetch_member = AsyncMock(side_effect=lambda member_id: member_id)
+    guild.create_text_channel = AsyncMock(side_effect=create_room)
+    bot.client = SimpleNamespace(
+        user=user, guilds=[guild], get_guild=lambda *a: guild, fetch_channel=AsyncMock(return_value=room)
+    )
+    interaction = SimpleNamespace(
+        guild=None,
+        user=SimpleNamespace(id=101, bot=False),
+        channel_id=201,
+        channel=SimpleNamespace(id=201),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+    # Simulate the account startup reconciliation before accepting new setup.
+    await alerts.lifecycle.reconcile("one")
+    alerts.worker.accounts.add("one")
+    await alerts.begin(bot, interaction, "posthog")
+    source = alerts.store.draft("one", "101", "201")
+    for text in (
+        "sample",
+        str(repo),
+        "https://eu.posthog.com/project/123",
+        "secrets/posthog-api-key",
+        "301",
+        "created,reopened",
+    ):
+        await alerts.answer(alerts.store.get(source["id"]), bot, text)
+    source = alerts.store.get(source["id"])
+    assert "Reply CREATE" in alerts.question(source, bot)
+    guild.create_text_channel.assert_not_awaited()
+    calls, remote = [], {}
+    issue_id, destination_id = str(uuid.uuid4()), str(uuid.uuid4())
+
+    async def request(config, method, path, **kwargs):
+        calls.append((method, path))
+        if path == "error_tracking/issues/?limit=1":
+            return {"results": [{"id": issue_id}]}
+        if path.startswith("hog_functions/?"):
+            return {"results": [], "next": None}
+        if method == "POST" and path == "hog_functions/":
+            assert alerts.store.channel("401")["state"] == "provisional"
+            remote.update(
+                {
+                    **copy.deepcopy(kwargs["payload"]),
+                    "id": destination_id,
+                    "hog": "print(inputs.content)",
+                    "template": {"id": "template-discord", "code": "print(inputs.content)", "inputs_schema": []},
+                }
+            )
+            # The serializer does not echo this write-only request field.
+            remote.pop("template_id")
+            return copy.deepcopy(remote)
+        if method == "GET" and path == f"hog_functions/{destination_id}/":
+            return copy.deepcopy(remote)
+        if path.endswith("/invocations/"):
+            payload = kwargs["payload"]
+            # Pinned vendor endpoint rejects a request without configuration
+            # unless use_draft=true; it does not infer configuration from the ID.
+            assert payload["configuration"]["hog"] == remote["hog"]
+            assert payload["configuration"]["inputs"] == remote["inputs"]
+            assert payload["mock_async_functions"] is False
+            event = payload["globals"]["event"]
+            current = alerts.store.channel("401")
+            text = f"KBOTS_ALERT_V1 {current['id']} {current['nonce']} "
+            text += f"{event['event']} {event['uuid']} {event['distinct_id']}"
+            await bot.on_message(
+                SimpleNamespace(
+                    id=600,
+                    channel=room,
+                    guild=guild,
+                    webhook_id=501,
+                    author=SimpleNamespace(id=501, bot=True),
+                    content=text,
+                )
+            )
+            return {"status": "success", "logs": ["must not be surfaced"]}
+        if path == f"error_tracking/issues/{issue_id}/":
+            return {"id": issue_id, "name": "TypeError in handler"}
+        raise AssertionError((method, path))
+
+    alerts.adapters["posthog"]._request = request
+    monkeypatch.setattr(alert_diagnosis, "source_evidence", lambda *a: {"revision": "test", "snippets": []})
+    try:
+        reply = await alerts.answer(source, bot, "CREATE")
+        assert "provisional" in reply
+        assert alerts.store.counts(source["id"]) == {"pending": 1}
+        await alerts.worker.once()
+        assert alerts.store.get(source["id"])["state"] == "provisional"
+        await alerts.worker.once()
+        assert alerts.store.get(source["id"])["state"] == "active"
+        assert alerts.store.counts(source["id"]) == {"complete": 1}
+        assert len([call for call in calls if call[0] == "POST"]) == 2
+        assert provider.complete.await_count == 1
+        public = json.dumps([m.content for m in history]) + "\n".join(alerts.store.db.iterdump())
+        assert "synthetic-token" not in public and "synthetic-key" not in public
+        assert any("Diagnosis complete" in m.content for m in history)
+        # A restarted reporter reconciles the receipt instead of posting twice.
+        await alerts.worker.once()
+        assert provider.complete.await_count == 1
+    finally:
+        alerts.store.close()

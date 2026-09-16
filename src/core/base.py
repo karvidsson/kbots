@@ -570,6 +570,8 @@ class LLMProvider(ABC):
     # CLAUDE.md) from the project directory themselves — the engine must not
     # inject it as a system message on top.
     reads_project_context: bool = False
+    # Explicit opt-in: tools=None does not disable native tools in CLI providers.
+    supports_tool_free: bool = False
 
     def __init__(self, config: dict):
         self.config = config
