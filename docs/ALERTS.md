@@ -34,9 +34,16 @@ acceptance checks below on the exact deployed version.
 
 As a configured Discord administrator, DM the responsible bot and run
 `/alerts create service:posthog` or `/alert posthog`. Supply the application
-name, local Git repository, private API project URL, one existing credential reference,
+name, Git repository URL or local path, private API project URL, one existing credential reference,
 server and lifecycle events. The bot shows the concrete resources and event
 selection and requires `CREATE` before any provisioning. `CANCEL` stops setup.
+
+Enter the app's natural name, including spaces and capitals. For example,
+`Example App` becomes `alerts-example-app`. Setup lowercases the
+channel suffix, folds decomposable accents, removes invisible formatting marks,
+turns separators into hyphens and shortens it to 41 characters. A name with no
+usable ASCII letters or digits uses `alerts-app`. The creation confirmation shows the
+resulting channel name before any resources are created.
 
 Supply the existing vault reference for both provisioning and incident reads,
 for example `secrets/posthog-api-key`. Existing plain tokens are accepted without
@@ -44,6 +51,24 @@ rewriting the vault or requiring the key to be entered again. The final setup
 confirmation includes the API host and reference. Credential names do not prove
 scopes; an all-access key remains all-access, while the incident path permits
 only fixed issue GETs and never gives that key to the model.
+
+For a repository URL, setup finds local clones under `repository_roots` by
+reading their local Git remote URLs. HTTPS and SSH forms, optional `.git`,
+trailing slashes, and case differences match the same host/namespace/repository;
+embedded credentials are ignored and never reflected in status messages.
+Exactly one match is required. No match names the searched roots; multiple
+matches list candidate paths so the administrator can choose one explicitly.
+The stored value remains an absolute local path. Setup never fetches or clones.
+Local paths, including repositories without remotes, remain supported.
+
+Discovery searches at most four directory levels below each root, skips Git
+metadata and common dependency/build directories, and is bounded to 2,000
+directories, 20,000 entries and 15 seconds. Git reads have a two-second timeout.
+Search errors and exhausted budgets refuse selection from a partial result.
+Resolved paths must remain within the configured roots, including symlink
+aliases. Overlapping roots and aliases of the same clone are deduplicated.
+Git configuration includes and inherited Git environment overrides are ignored;
+use an explicit local path if a remote exists only in an included configuration.
 
 For a new key, use hidden terminal input instead of Discord. The setup prompt
 gives the running service's socket path:

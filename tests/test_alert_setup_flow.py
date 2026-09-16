@@ -2,23 +2,28 @@
 
 import copy
 import json
+import subprocess
 import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import discord
+import pytest
 
 from src.connectors.discord import DiscordBot, DiscordConnector
 from src.connectors.discord_alerts import DiscordAlerts
 from src.core.base import LLMResponse
 
 
-async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_path, monkeypatch):
+@pytest.mark.parametrize("repository_input", ["path", "url"])
+async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_path, monkeypatch, repository_input):
     from src.core import alert_diagnosis
 
     repo = tmp_path / "repo"
     repo.mkdir()
-    (repo / ".git").mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    remote = "https://code.example/team/sample.git"
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", remote], check=True)
     secrets = {"secrets/posthog-api-key": "synthetic-key-with-no-real-permissions"}
     vault = SimpleNamespace(get=secrets.get, set=lambda k, v: secrets.__setitem__(k, v), _fernet=object())
     connector = DiscordConnector({"admin_users": ["101"]}, vault=vault)
@@ -61,6 +66,7 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
             yield msg
 
     async def create_room(name, **kwargs):
+        assert name == "alerts-sample-app"
         assert kwargs["overwrites"]["everyone"].view_channel is False
         room.topic = kwargs["topic"]
         return room
@@ -97,8 +103,8 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
     await alerts.begin(bot, interaction, "posthog")
     source = alerts.store.draft("one", "101", "201")
     for text in (
-        "sample",
-        str(repo),
+        "Sample App",
+        remote if repository_input == "url" else str(repo),
         "https://eu.posthog.com/project/123",
         "secrets/posthog-api-key",
         "301",
@@ -106,6 +112,7 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
     ):
         await alerts.answer(alerts.store.get(source["id"]), bot, text)
     source = alerts.store.get(source["id"])
+    assert source["config"]["repo"] == str(repo.resolve())
     assert "Reply CREATE" in alerts.question(source, bot)
     guild.create_text_channel.assert_not_awaited()
     calls, remote = [], {}
@@ -177,5 +184,56 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         # A restarted reporter reconciles the receipt instead of posting twice.
         await alerts.worker.once()
         assert provider.complete.await_count == 1
+    finally:
+        alerts.store.close()
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("Example App", "example-app"),
+    ("  EXAMPLE   APP  ", "example-app"),
+    ("example-app", "example-app"),
+    ("\tMy\nNew App\t", "my-new-app"),
+    ("My___App!!!", "my-app"),
+    ("Café ÅÄÖ", "cafe-aao"),
+    ("EXAM\u200bPLE APP", "example-app"),
+    ("Ｆｕｌｌ Ｗｉｄｔｈ", "full-width"),
+    ("1986 Console", "1986-console"),
+    ("A", "a"),
+    ("A" * 80, "a" * 41),
+    ("A" * 40 + " End", "a" * 40),
+    ("!!!", "app"),
+    ("\u200b", "app"),
+])
+async def test_natural_app_name_normalized_before_creation_confirmation(tmp_path, name, expected):
+    connector = SimpleNamespace(vault=SimpleNamespace(get=lambda _: None), _agent_manager=None)
+    alerts = DiscordAlerts(
+        connector, {"adapters": {"posthog": "extras.posthog.alerts:PostHogAdapter"}}, tmp_path / "state"
+    )
+    try:
+        source = alerts.store.begin("worker", "101", "one", "201")
+        source = alerts.store.update(source["id"], guild_id="301", config={
+            "service": "posthog", "repo": str(tmp_path / "repo"), "project": "123",
+            "host": "https://eu.posthog.com", "api_key": "secrets/service-key", "triggers": ["created"],
+        })
+        assert "Spaces and capitals are fine" in alerts.question(source, None)
+        response = await alerts.answer(source, None, name)
+        saved = alerts.store.get(source["id"])
+        assert saved["config"]["app"] == expected
+        assert saved["state"] == "draft"
+        assert response.startswith(f"Create alerts-{expected} in server ")
+        assert "Reply CREATE to proceed" in response
+        assert not alerts.store.db.execute("SELECT 1 FROM operations").fetchone()
+    finally:
+        alerts.store.close()
+
+
+async def test_cancel_still_cancels_at_app_name_step(tmp_path):
+    connector = SimpleNamespace(vault=SimpleNamespace(get=lambda _: None), _agent_manager=None)
+    alerts = DiscordAlerts(connector, {}, tmp_path / "state")
+    try:
+        source = alerts.store.begin("worker", "101", "one", "201")
+        assert "Setup stopped" in await alerts.answer(source, None, " CANCEL ")
+        saved = alerts.store.get(source["id"])
+        assert saved["state"] == "disabled" and "app" not in saved["config"]
     finally:
         alerts.store.close()
