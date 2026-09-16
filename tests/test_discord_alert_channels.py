@@ -91,7 +91,8 @@ async def test_replayed_discord_message_deduplicates_in_store_before_new_ack(set
     await bot.on_message(msg)
     await bot.on_message(msg)
     assert alerts.store.counts(source["id"]) == {"pending": 1}
-    assert alerts.transport.say.await_count == 1
+    alerts.transport.say.assert_not_awaited()  # The worker owns ordered status updates.
+    assert alerts.worker.wake.is_set()
 
 
 async def test_reaction_cannot_wake_privileged_session(setup):
@@ -104,20 +105,26 @@ async def test_reaction_cannot_wake_privileged_session(setup):
 async def test_bounded_diagnosis_is_delivered_in_full_without_shortener(setup):
     connector, alerts, _, source = setup
     connector._shortener.shorten = Mock(side_effect=AssertionError("no hidden remainder"))
-    room = SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(id=801)))
+    from tests.test_alert_setup_ux import MemoryChannel
 
-    async def history(**kwargs):
-        for _ in ():
-            yield None
-
-    room.history = history
+    room = MemoryChannel()
     alerts.transport.channel = AsyncMock(return_value=room)
     result = "x" * 1590 + " RESULTEND"
-    receipt = {"id": str(uuid.uuid4()), "success": True, "result": result}
+    source = alerts.store.update(
+        source["id"],
+        config={**source["config"], "host": "https://eu.posthog.com", "project": "123456789012", "app": "sample"},
+    )
+    receipt = {
+        "id": str(uuid.uuid4()),
+        "issue_id": str(uuid.uuid4()),
+        "issue_name": "E" * 150,
+        "success": True,
+        "result": result,
+    }
     await alerts.transport.report(source, receipt)
-    content = room.send.call_args.args[0]
+    content = room.messages[0].content
     assert result in content and len(content) < 2000
-    assert content.endswith(f"[alert:{receipt['id']}:result]")
+    assert room.messages[0].embeds[0].footer.text == f"[alert:{receipt['id']}:status]"
     connector._shortener.shorten.assert_not_called()
 
 
@@ -162,7 +169,7 @@ async def test_listener_is_provisional_before_vendor_delivery_and_test_does_not_
     adapter.test_delivery = test_delivery
     alerts.adapters["posthog"] = adapter
     reply = await alerts.provision(source)
-    assert "provisional" in reply and "internal-secret" not in reply
+    assert "Checking test delivery" in reply and "internal-secret" not in reply
     assert alerts.store.get(source["id"])["state"] == "provisional"
 
 

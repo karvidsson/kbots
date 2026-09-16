@@ -5,7 +5,7 @@ private API host `eu.posthog.com` or `us.posthog.com`, not the ingestion host.
 One vault reference supplies the API key for provisioning and diagnosis.
 An existing token can be used directly, including an all-access key, without
 rewriting it. Its name is not evidence of scope. The runtime adapter permits
-fixed issue GETs only; the diagnostic model receives neither the key nor an
+fixed issue GETs and one fixed read-only issue-sample POST; the diagnostic model receives neither the key nor an
 HTTP tool. Provisioning needs Hog function read/write access for reconciliation,
 creation, test invocation, disabling and soft-deleting the owned destination.
 A successful issue GET proves read access to that endpoint; it does not establish the key's
@@ -42,8 +42,8 @@ responses can contain its full URL in both `inputs.webhookUrl.value` and
 compiled bytecode. All destination inspection happens inside the adapter;
 only the validated destination UUID is returned or journaled. HTTP errors
 surface fixed status text, never response bodies, request payloads or raw
-exceptions. Positive issue projection excludes event properties, persons and
-arbitrary nested objects. Do not use a generic HTTP tool to dump these objects.
+exceptions. Positive projection excludes arbitrary event properties, persons,
+sessions, captured locals and unrecognized nested objects. Do not use a generic HTTP tool to dump these objects.
 
 Read-only source verification, pinned to PostHog commit
 `e4aa96a7ea4679a5004a0ad1c2630c7992f5af80`:
@@ -54,6 +54,8 @@ Read-only source verification, pinned to PostHog commit
   define the supported lifecycle filters.
 - [Lifecycle event production](https://github.com/PostHog/posthog/blob/e4aa96a7ea4679a5004a0ad1c2630c7992f5af80/products/error_tracking/backend/logic/lifecycle_events.py)
   binds the issue ID to `distinct_id`.
+- [Error Tracking route manifest](https://github.com/PostHog/posthog/blob/e4aa96a7ea4679a5004a0ad1c2630c7992f5af80/products/error_tracking/manifest.tsx)
+  defines direct `/error_tracking/<issue-id>` links.
 - [PostHog OpenAPI schema](https://app.posthog.com/api/schema/?format=json)
   describes Hog function creation and `/hog_functions/{id}/invocations/`.
 
@@ -68,3 +70,50 @@ write-only; it cannot be verified by reading that field back. A lost PATCH
 response can be reconciled by these reads without repeating the mutation.
 Unsubscribe keeps disabling only, preserving its channel reservation and vendor
 object. Failures retain the ownership journal for durable cleanup retries.
+
+## Readable messages and drills
+
+New sources explicitly select message format 2. Content starts with the app,
+issue title, lifecycle event and issue link, then a spoiler containing the bound
+`KBOTS_ALERT_V2` envelope. Its final token is `drill` only when the lifecycle
+event has boolean `test: true`; otherwise it is `unknown`. The referenced event
+contract spreads originating exception properties onto created/reopened events,
+but not spiking events. Manual transitions can also lack the marker. The setup
+invocation supplies a test name/marker and is independently recognized by its
+deterministic event UUID. The drill bit comes from the bound lifecycle envelope; the fixed sampled-event
+read described below does not return custom event properties such as `test`.
+
+Sources without `message_format: 2` retain the exact original `KBOTS_ALERT_V1`
+content. The adapter does not accept an arbitrary alternate payload during an
+ownership check: it reconstructs the one template selected by that revision.
+Existing revisions, their snapshots and vendor resources require no migration.
+Their original envelope lacks a drill bit, so natural drill classification is
+unknown until a fresh format-2 registration is explicitly provisioned. The new
+Hog content expression and natural event delivery require live acceptance on the
+deployed revision; offline transport doubles are not evidence of vendor delivery.
+
+## Exception evidence
+
+In addition to the summary GET, incident processing may POST only to
+`error_tracking/query/issue_events/` with exactly this body:
+
+```json
+{"issueId":"<canonical issue UUID>","limit":1,"onlyAppFrames":true,"filterTestAccounts":false,"include":["exception","stacktrace","release"]}
+```
+
+The pinned [query view](https://github.com/PostHog/posthog/blob/e4aa96a7ea4679a5004a0ad1c2630c7992f5af80/products/error_tracking/backend/presentation/views/query.py)
+marks this as `error_tracking:read`. It samples the most recent event in a default
+seven-day window. This is not necessarily the exception that triggered the
+lifecycle notification. Missing samples are stated explicitly.
+
+The runtime rejects any extra field, larger limit, different include group,
+false application-frame filter or alternate endpoint on this path. It never
+requests `code_variables`, `environment`, `navigation` or `correlation`.
+The [response normalizer](https://github.com/PostHog/posthog/blob/e4aa96a7ea4679a5004a0ad1c2630c7992f5af80/products/error_tracking/backend/facade/query_utils.py)
+still returns `distinct_id` alongside events, so a second positive projection is
+mandatory. Only up to three exception type/value pairs and 24 application frames
+(source, resolved name and line) reach diagnosis. Captured variables, identities,
+sessions and arbitrary release metadata are not forwarded. Up to three release
+versions and validated Git commit hashes are retained for revision comparison. Frame URL query strings and
+credentials are discarded. Existing response-size, credential-host, redirect and
+request-budget limits apply to this read too.

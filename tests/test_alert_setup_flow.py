@@ -55,9 +55,22 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
     room.id, room.guild, room.topic = 401, guild, None
     history, webhooks = [], []
 
-    async def send(text, **kwargs):
+    async def send(text=None, **kwargs):
+        text = kwargs.pop("content", text)
         assert kwargs.get("allowed_mentions").everyone is False
-        msg = SimpleNamespace(id=700 + len(history), author=user, webhook_id=None, content=text)
+        msg = SimpleNamespace(
+            id=700 + len(history),
+            author=user,
+            webhook_id=None,
+            content=text,
+            embeds=[kwargs["embed"]] if kwargs.get("embed") is not None else [],
+        )
+
+        async def edit(*, content, embed, **kwargs):
+            msg.content, msg.embeds = content, [embed] if embed else []
+            return msg
+
+        msg.edit = edit
         history.append(msg)
         return msg
 
@@ -83,6 +96,7 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         return hook
 
     room.send, room.history = send, messages
+    room.fetch_message = AsyncMock(side_effect=lambda ident: next(m for m in history if m.id == ident))
     room.webhooks, room.create_webhook = AsyncMock(return_value=webhooks), create_webhook
     guild.fetch_channels = AsyncMock(return_value=[])
     guild.fetch_member = AsyncMock(side_effect=lambda member_id: member_id)
@@ -107,7 +121,6 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         remote if repository_input == "url" else str(repo),
         "https://eu.posthog.com/project/123",
         "secrets/posthog-api-key",
-        "301",
         "created,reopened",
     ):
         await alerts.answer(alerts.store.get(source["id"]), bot, text)
@@ -150,6 +163,17 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
             current = alerts.store.channel("401")
             text = f"KBOTS_ALERT_V1 {current['id']} {current['nonce']} "
             text += f"{event['event']} {event['uuid']} {event['distinct_id']}"
+            if current["config"].get("message_format") == 2:
+                from extras.posthog.alerts import alert_heading, issue_link
+
+                text = (
+                    alert_heading(current)
+                    + "\nSetup delivery test\n"
+                    + issue_link(current, issue_id)
+                    + "\n||"
+                    + text.replace("KBOTS_ALERT_V1", "KBOTS_ALERT_V2")
+                    + " drill||"
+                )
             await bot.on_message(
                 SimpleNamespace(
                     id=600,
@@ -161,6 +185,8 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
                 )
             )
             return {"status": "success", "logs": ["must not be surfaced"]}
+        if path == "error_tracking/query/issue_events/":
+            return {"results": []}
         if path == f"error_tracking/issues/{issue_id}/":
             return {"id": issue_id, "name": "TypeError in handler"}
         raise AssertionError((method, path))
@@ -169,14 +195,15 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
     monkeypatch.setattr(alert_diagnosis, "source_evidence", lambda *a: {"revision": "test", "snippets": []})
     try:
         reply = await alerts.answer(source, bot, "CREATE")
-        assert "provisional" in reply
+        assert "Checking test delivery" in reply
         assert alerts.store.counts(source["id"]) == {"pending": 1}
         await alerts.worker.once()
         assert alerts.store.get(source["id"])["state"] == "provisional"
         await alerts.worker.once()
         assert alerts.store.get(source["id"])["state"] == "active"
         assert alerts.store.counts(source["id"]) == {"complete": 1}
-        assert len([call for call in calls if call[0] == "POST"]) == 2
+        assert len([call for call in calls if call[0] == "POST" and call[1].startswith("hog_functions/")]) == 2
+        assert calls.count(("POST", "error_tracking/query/issue_events/")) == 1
         assert provider.complete.await_count == 1
         public = json.dumps([m.content for m in history]) + "\n".join(alerts.store.db.iterdump())
         assert "synthetic-token" not in public and "synthetic-key" not in public
@@ -188,22 +215,25 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         alerts.store.close()
 
 
-@pytest.mark.parametrize("name,expected", [
-    ("Example App", "example-app"),
-    ("  EXAMPLE   APP  ", "example-app"),
-    ("example-app", "example-app"),
-    ("\tMy\nNew App\t", "my-new-app"),
-    ("My___App!!!", "my-app"),
-    ("Café ÅÄÖ", "cafe-aao"),
-    ("EXAM\u200bPLE APP", "example-app"),
-    ("Ｆｕｌｌ Ｗｉｄｔｈ", "full-width"),
-    ("1986 Console", "1986-console"),
-    ("A", "a"),
-    ("A" * 80, "a" * 41),
-    ("A" * 40 + " End", "a" * 40),
-    ("!!!", "app"),
-    ("\u200b", "app"),
-])
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("Example App", "example-app"),
+        ("  EXAMPLE   APP  ", "example-app"),
+        ("example-app", "example-app"),
+        ("\tMy\nNew App\t", "my-new-app"),
+        ("My___App!!!", "my-app"),
+        ("Café ÅÄÖ", "cafe-aao"),
+        ("EXAM\u200bPLE APP", "example-app"),
+        ("Ｆｕｌｌ Ｗｉｄｔｈ", "full-width"),
+        ("1986 Console", "1986-console"),
+        ("A", "a"),
+        ("A" * 80, "a" * 41),
+        ("A" * 40 + " End", "a" * 40),
+        ("!!!", "app"),
+        ("\u200b", "app"),
+    ],
+)
 async def test_natural_app_name_normalized_before_creation_confirmation(tmp_path, name, expected):
     connector = SimpleNamespace(vault=SimpleNamespace(get=lambda _: None), _agent_manager=None)
     alerts = DiscordAlerts(
@@ -211,10 +241,18 @@ async def test_natural_app_name_normalized_before_creation_confirmation(tmp_path
     )
     try:
         source = alerts.store.begin("worker", "101", "one", "201")
-        source = alerts.store.update(source["id"], guild_id="301", config={
-            "service": "posthog", "repo": str(tmp_path / "repo"), "project": "123",
-            "host": "https://eu.posthog.com", "api_key": "secrets/service-key", "triggers": ["created"],
-        })
+        source = alerts.store.update(
+            source["id"],
+            guild_id="301",
+            config={
+                "service": "posthog",
+                "repo": str(tmp_path / "repo"),
+                "project": "123",
+                "host": "https://eu.posthog.com",
+                "api_key": "secrets/service-key",
+                "triggers": ["created"],
+            },
+        )
         assert "Spaces and capitals are fine" in alerts.question(source, None)
         response = await alerts.answer(source, None, name)
         saved = alerts.store.get(source["id"])

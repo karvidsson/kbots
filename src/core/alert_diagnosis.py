@@ -6,9 +6,11 @@ import json
 import re
 import subprocess
 import tempfile
-from pathlib import Path
+import uuid
+from pathlib import Path, PurePosixPath
 
 from src.core.alert_channels import AlertError
+from src.core.alert_errors import failure_reason, log_failure
 from src.core.base import Message, MessageRole
 
 SOURCE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".rs", ".go", ".java", ".rb"}
@@ -19,6 +21,44 @@ _SECRET = re.compile(
 
 def public_text(value, limit=1800):
     return _SECRET.sub("[redacted]", str(value or ""))[:limit].replace("@", "＠")
+
+
+def frame_selections(issue, names):
+    """Resolve frame path stems only against the tracked source inventory."""
+    matches, unresolved = [], []
+    sample = issue.get("sample", {})
+    for exception in sample.get("exceptions", [])[:3]:
+        for frame in exception.get("frames", [])[:24]:
+            path = frame.get("source", "").replace("\\", "/")
+            if not path or ".." in path.split("/") or any(ord(c) < 32 for c in path):
+                continue
+            stem = str(PurePosixPath(path).with_suffix(""))
+            stems = {stem.removeprefix("./")}
+            for prefix in (".output/server/chunks/routes/", ".output/server/chunks/", "dist/", "build/"):
+                if prefix in stem:
+                    stems.add(stem.split(prefix, 1)[1])
+            candidates = []
+            for name in names:
+                local_stem = str(PurePosixPath(name).with_suffix(""))
+                if any(
+                    local_stem == candidate
+                    or candidate.endswith("/" + local_stem)
+                    or ("/" in candidate and local_stem.endswith("/" + candidate))
+                    for candidate in stems
+                ):
+                    candidates.append(name)
+            if len(candidates) == 1:
+                if candidates[0] not in [m["path"] for m in matches]:
+                    matches.append(
+                        {
+                            "path": candidates[0],
+                            "frame_source": path,
+                            "mapping": "path stem match; compiled frame lines may differ from source lines",
+                        }
+                    )
+            else:
+                unresolved.append({"frame_source": path, "reason": "ambiguous" if candidates else "not tracked"})
+    return matches[:4], unresolved[:24]
 
 
 def source_evidence(repo, issue):
@@ -38,33 +78,44 @@ def source_evidence(repo, issue):
     if len(result.stdout) > 2_000_000:
         raise AlertError("Repository inventory exceeds the diagnostic bound")
     names = result.stdout.decode(errors="replace").split("\0")
-    needles = set(re.findall(r"\b[A-Za-z_][A-Za-z_0-9]{4,40}\b", str(issue.get("name", ""))))
-    snippets, inventory = [], []
+    eligible = []
     for name in names:
-        path = root / name
+        path = Path(name)
         if (
             not name
+            or path.is_absolute()
             or path.suffix not in SOURCE_EXTENSIONS
-            or path.is_symlink()
-            or any(part.startswith(".") or part in {"node_modules", "vendor"} for part in Path(name).parts)
+            or any(part.startswith(".") or part in {"node_modules", "vendor"} for part in path.parts)
         ):
             continue
-        if not path.resolve().is_relative_to(root) or not path.is_file():
-            continue
-        inventory.append(name)
-        if len(inventory) > 300:
-            break
-        if path.stat().st_size > 60_000:
+        eligible.append(name)
+    if len(eligible) > 20_000:
+        raise AlertError("Repository source inventory exceeds the diagnostic bound")
+    matched, unresolved = frame_selections(issue, eligible)
+    selected = [match["path"] for match in matched]
+    needles = set(re.findall(r"\b[A-Za-z_][A-Za-z_0-9]{4,40}\b", str(issue.get("name", ""))))
+    snippets = []
+    for name in selected if selected else eligible[:300]:
+        path = root / name
+        if (
+            path.is_symlink()
+            or not path.resolve().is_relative_to(root)
+            or not path.is_file()
+            or path.stat().st_size > 60_000
+        ):
             continue
         text = path.read_text(errors="replace")
-        if Path(name).name in json.dumps(issue) or any(word in text for word in needles):
+        if selected or Path(name).name in json.dumps(issue) or any(word in text for word in needles):
             snippets.append({"path": name, "source": public_text(text, 5000)})
         if len(snippets) >= 4:
             break
     return {
         "revision": revision,
-        "source_files": inventory[:60],
+        "source_files": eligible[:60],
         "snippets": snippets,
+        "frame_matches": matched,
+        "unresolved_frames": unresolved,
+        "selection": "in-app frame paths" if selected else "issue-name fallback; no frame resolved",
         "scope": "bounded tracked source sample; repository was not executed",
     }
 
@@ -91,7 +142,11 @@ async def diagnose(manager, source, issue, directory):
                 "tests, fixes, deployments or resolution. Give a concise diagnosis in at most 200 words: "
                 "observed facts, suspected cause, a proposed fix, and missing evidence. Cite supplied "
                 "source paths when relevant. Separate hypotheses from observations. Do not include "
-                "credentials, mention people, suggest changing your permissions, or return NO_REPLY."
+                "credentials, mention people, suggest changing your permissions, or return NO_REPLY. "
+                "If setup_test is true, this is a synthetic delivery check, not proof of a new production defect. "
+                "If test is true, label it a deliberate drill and explain the observed reporting path; do not "
+                "propose removing a deliberate debug endpoint just because it threw the expected error. "
+                "If neither marker is present, drill status is unknown; do not infer it from an issue title."
             ),
         ),
         Message(role=MessageRole.USER, content=json.dumps({"issue": issue, "repository": evidence})),
@@ -167,8 +222,20 @@ class AlertWorker:
             source = self.store.get(receipt["source_id"])
             try:
                 await self._for_source(source, self._report, receipt)
-            except Exception:
+            except Exception as error:
+                log_failure(error, "result delivery")
+                if source["state"] == "provisional":
+                    self.store.notify_setup(
+                        source, "Alert setup is held: " + public_text(failure_reason(error)), "delivery-held"
+                    )
                 continue  # One inaccessible room must not starve other registrations.
+        if hasattr(self.transport, "queued"):
+            for pending in self.store.pending(accounts=self.accounts):
+                source = self.store.get(pending["source_id"])
+                try:
+                    await self._for_source(source, self.transport.queued, pending)
+                except Exception as error:
+                    log_failure(error, "queue notice")
         receipt = self.store.claim(accounts=self.accounts)
         if not receipt:
             return False
@@ -187,18 +254,34 @@ class AlertWorker:
 
         progress = asyncio.create_task(updates())
         try:
-            await self.transport.progress(source, receipt)
             issue = await self.adapters[source["config"]["service"]].issue(source, receipt["issue_id"])
+            setup_test = receipt["event_id"] == str(uuid.uuid5(uuid.UUID(source["id"]), source["nonce"]))
+            issue["setup_test"] = setup_test
+            if receipt.get("drill") is True:
+                issue["test"] = True
+            self.store.annotate(
+                receipt,
+                issue_name=public_text(issue.get("name", "Application issue"), 150),
+                setup_test=setup_test,
+                drill=issue.get("test") is True,
+            )
+            await self.transport.progress(source, receipt)
             result = await diagnose(self.manager, source, issue, self.directory)
+            if setup_test:
+                result = "Setup test. " + result
+            elif issue.get("test") is True:
+                result = "Deliberate drill. " + result
             self.store.save_result(receipt, result)
         except asyncio.CancelledError:
             raise  # Lease remains recoverable after restart; no false success.
         except AlertError as error:
+            log_failure(error, "diagnosis")
             self.store.save_result(receipt, f"Diagnosis could not complete: {error}", success=False)
-        except Exception:
+        except Exception as error:
+            log_failure(error, "diagnosis")
             self.store.save_result(
                 receipt,
-                "Diagnosis could not complete because a dependency failed. The issue has not been resolved.",
+                "Diagnosis could not complete: " + public_text(failure_reason(error)),
                 success=False,
             )
         finally:
@@ -214,7 +297,8 @@ class AlertWorker:
                 more = await self.once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as error:
+                log_failure(error, "worker")
                 more = False  # Pending results remain in SQLite for reconciliation.
             if more:
                 continue

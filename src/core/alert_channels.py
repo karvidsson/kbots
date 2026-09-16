@@ -76,6 +76,12 @@ class AlertStore:
                 available REAL NOT NULL DEFAULT 0
             );
         """)
+        if "waiting" not in {row["name"] for row in self.db.execute("PRAGMA table_info(sources)")}:
+            self.db.execute("ALTER TABLE sources ADD COLUMN waiting INTEGER NOT NULL DEFAULT 1")
+        if "presentation" not in {row["name"] for row in self.db.execute("PRAGMA table_info(receipts)")}:
+            self.db.execute("ALTER TABLE receipts ADD COLUMN presentation TEXT NOT NULL DEFAULT '{}'")
+        # A restart during local lookup must not strand an unfinished draft.
+        self.db.execute("UPDATE sources SET waiting=1 WHERE state='draft' AND waiting=0")
         # Existing cleaned rows only establish a disable, never a removal.
         if "removed" not in {row["name"] for row in self.db.execute("PRAGMA table_info(alert_revisions)")}:
             self.db.execute("ALTER TABLE alert_revisions ADD COLUMN removed INTEGER NOT NULL DEFAULT 0")
@@ -113,14 +119,40 @@ class AlertStore:
         return self._source(
             self.db.execute(
                 "SELECT * FROM sources WHERE account=? AND user_id=? AND dm_id=? "
-                "AND state NOT IN ('active','disabled','deleting') ORDER BY created DESC LIMIT 1",
+                "AND state='draft' AND waiting=1 ORDER BY created DESC LIMIT 1",
                 (account, str(user_id), str(dm_id)),
             ).fetchone()
         )
 
+    def expire_drafts(self, account, user_id, dm_id, now=None):
+        now = time.time() if now is None else now
+        with self.transaction():
+            rows = self.db.execute(
+                "SELECT * FROM sources WHERE account=? AND user_id=? AND dm_id=? "
+                "AND state='draft' AND waiting=1 AND updated<=? AND channel_id IS NULL "
+                "AND NOT EXISTS (SELECT 1 FROM operations WHERE source_id=sources.id)",
+                (account, str(user_id), str(dm_id), now - 1800),
+            ).fetchall()
+            for row in rows:
+                source = self._source(row)
+                self.update(source["id"], state="disabled", waiting=0)
+                self.notify_setup(
+                    source,
+                    "Setup expired after 30 minutes without an answer. "
+                    "You can chat normally or start again with /alerts create.",
+                    "expired",
+                )
+        return bool(rows)
+
     def begin(self, owner, user_id, account, dm_id):
         with self.transaction():
-            old = self.draft(account, user_id, dm_id)
+            old = self._source(
+                self.db.execute(
+                    "SELECT * FROM sources WHERE account=? AND user_id=? AND dm_id=? AND state='draft' "
+                    "ORDER BY created DESC LIMIT 1",
+                    (account, str(user_id), str(dm_id)),
+                ).fetchone()
+            )
             if old:
                 return old
             source_id, nonce, now = str(uuid.uuid4()), uuid.uuid4().hex, time.time()
@@ -131,7 +163,7 @@ class AlertStore:
         return self.get(source_id)
 
     def update(self, source_id, **values):
-        permitted = {"config", "guild_id", "channel_id", "webhook_id", "state"}
+        permitted = {"config", "guild_id", "channel_id", "webhook_id", "state", "waiting"}
         if not values or set(values) - permitted:
             raise AlertError("Invalid source update")
         if "config" in values:
@@ -217,12 +249,23 @@ class AlertStore:
             "UPDATE teardowns SET state='pending',attempts=0,available=0,error=NULL WHERE source_id=?", (source_id,)
         )
 
-    def notify_lifecycle(self, source, text, condition=None):
+    def notify_setup(self, source, text, outcome):
+        self.notify_lifecycle(source, text, f"setup:{source['id']}:{source['revision']}:{outcome}", target="dm")
+
+    def notify_lifecycle(self, source, text, condition=None, target="home"):
         with nullcontext() if self.db.in_transaction else self.transaction():
             if condition:
                 if not self.db.execute("INSERT OR IGNORE INTO lifecycle_conditions VALUES(?)", (condition,)).rowcount:
                     return
             context = {k: source[k] for k in ("id", "owner", "account", "channel_id")}
+            if target == "dm":
+                context.update(
+                    target="dm",
+                    dm_id=source["dm_id"],
+                    user_id=source["user_id"],
+                    revision=source["revision"],
+                    outcome=condition.rsplit(":", 1)[-1],
+                )
             self.db.execute(
                 "INSERT INTO lifecycle_notices(id,context,text) VALUES(?,?,?)",
                 (str(uuid.uuid4()), json.dumps(context), text),
@@ -266,7 +309,7 @@ class AlertStore:
             (json.dumps(result), time.time(), source["id"], source["revision"], step),
         )
 
-    def receive(self, source, *, event_id, issue_id, kind, message_id, now=None):
+    def receive(self, source, *, event_id, issue_id, kind, message_id, now=None, drill=False):
         now = time.time() if now is None else now
         with self.transaction():
             current = self.get(source["id"])
@@ -287,10 +330,15 @@ class AlertStore:
             ).fetchone()[0]
             if pending >= 1000:
                 self.update(source["id"], state="paused", config={**current["config"], "paused_from": current["state"]})
+                self.notify_setup(
+                    current,
+                    "Alert monitoring paused because the queue is full. Review the pending diagnoses.",
+                    "overflow",
+                )
                 return "overflow"
             changed = self.db.execute(
                 "INSERT OR IGNORE INTO receipts(id,source_id,revision,event_id,issue_id,kind,"
-                "message_id,state,available,created,updated) VALUES(?,?,?,?,?,?,?,'pending',?,?,?)",
+                "message_id,state,available,created,updated,presentation) VALUES(?,?,?,?,?,?,?,'pending',?,?,?,?)",
                 (
                     str(uuid.uuid4()),
                     source["id"],
@@ -302,6 +350,7 @@ class AlertStore:
                     now,
                     now,
                     now,
+                    json.dumps({"drill": drill is True}),
                 ),
             ).rowcount
             return "queued" if changed else "duplicate"
@@ -341,6 +390,11 @@ class AlertStore:
             scope = "diagnosis:" + row["source_id"]
             used = self.db.execute("SELECT used FROM budgets WHERE scope=? AND bucket=?", (scope, bucket)).fetchone()
             if used and used[0] >= 12:
+                self.notify_lifecycle(
+                    self.get(row["source_id"]),
+                    "Diagnosis deferred until the next hour: this app has used its 12 diagnoses for this hour.",
+                    f"budget:{row['source_id']}:{bucket}",
+                )
                 self.db.execute(
                     "UPDATE receipts SET available=? WHERE source_id=? AND state='pending' AND available<?",
                     ((bucket + 1) * 3600, row["source_id"], (bucket + 1) * 3600),
@@ -354,7 +408,18 @@ class AlertStore:
                 "UPDATE receipts SET state='running',lease=?,lease_until=?,attempts=attempts+1,updated=? WHERE id=?",
                 (lease, now + lease_seconds, now, row["id"]),
             )
-            return dict(self.db.execute("SELECT * FROM receipts WHERE id=?", (row["id"],)).fetchone())
+            receipt = dict(self.db.execute("SELECT * FROM receipts WHERE id=?", (row["id"],)).fetchone())
+            return {**receipt, **json.loads(receipt["presentation"])}
+
+    def annotate(self, receipt, **values):
+        allowed = {"issue_name", "setup_test", "drill"}
+        if set(values) - allowed:
+            raise AlertError("Invalid incident presentation")
+        self.db.execute(
+            "UPDATE receipts SET presentation=? WHERE id=? AND lease=? AND state='running'",
+            (json.dumps(values), receipt["id"], receipt["lease"]),
+        )
+        receipt.update(values)
 
     def save_result(self, receipt, result, success=True):
         return (
@@ -367,10 +432,23 @@ class AlertStore:
             == 1
         )
 
-    def ready(self, accounts=None):
+    def pending(self, accounts=None):
         account_filter, account_values = self._accounts(accounts)
         return [
             dict(r)
+            for r in self.db.execute(
+                "SELECT r.* FROM receipts r JOIN sources s ON s.id=r.source_id "
+                "WHERE r.state='pending' AND r.revision=s.revision AND s.state IN ('active','provisional')"
+                + account_filter
+                + " ORDER BY r.created LIMIT 20",
+                account_values,
+            )
+        ]
+
+    def ready(self, accounts=None):
+        account_filter, account_values = self._accounts(accounts)
+        return [
+            {**dict(r), **json.loads(r["presentation"])}
             for r in self.db.execute(
                 "SELECT r.* FROM receipts r JOIN sources s ON s.id=r.source_id "
                 "WHERE r.state='ready' AND r.revision=s.revision "
@@ -390,10 +468,20 @@ class AlertStore:
                 return
             expected_test = str(uuid.uuid5(uuid.UUID(source["id"]), source["nonce"]))
             if changed and receipt["success"] and receipt["event_id"] == expected_test:
-                self.db.execute(
+                activated = self.db.execute(
                     "UPDATE sources SET state='active',updated=? WHERE id=? AND state='provisional' AND revision=?",
                     (time.time(), receipt["source_id"], receipt["revision"]),
-                )
+                ).rowcount
+                if activated:
+                    link = f"https://discord.com/channels/{source['guild_id']}/{source['channel_id']}"
+                    self.notify_setup(
+                        source,
+                        f"Alerts for {source['config'].get('app', 'your app')} are active. "
+                        f"The setup test and diagnosis were delivered. {link}",
+                        "active",
+                    )
+            elif changed and not receipt["success"] and receipt["event_id"] == expected_test:
+                self.notify_setup(source, "Alert setup is held: " + receipt["result"], "diagnosis-held")
 
     def counts(self, source_id):
         return {

@@ -4,6 +4,7 @@ import asyncio
 import importlib
 import json
 import re
+import time
 import unicodedata
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from discord.state import ConnectionState
 from src.core.alert_channels import AlertError, AlertStore, ensure_operation
 from src.core.alert_credentials import CredentialEntry
 from src.core.alert_diagnosis import AlertWorker, public_text
+from src.core.alert_errors import failure_reason, log_failure
 from src.core.alert_lifecycle import AlertLifecycle
 from src.core.alert_repositories import resolve_repository
 
@@ -70,9 +72,26 @@ class AlertChannelClient(discord.Client):
         )
 
 
+def has_marker(message, marker):
+    return (message.content.endswith(marker) or message.content.endswith("||" + marker + "||")) or any(
+        getattr(getattr(embed, "footer", None), "text", None) == marker for embed in getattr(message, "embeds", [])
+    )
+
+
+def marked_message(text, marker, channel):
+    guild = getattr(channel, "guild", None)
+    member = getattr(guild, "me", None)
+    embeds = guild is None or (member is not None and channel.permissions_for(member).embed_links is True)
+    return {
+        "content": public_text(text, 1920) + ("" if embeds else "\n||" + marker + "||"),
+        "embed": discord.Embed().set_footer(text=marker) if embeds else None,
+    }
+
+
 class DiscordAlertTransport:
     def __init__(self, connector, store):
         self.connector, self.store = connector, store
+        self.message_locks = {}
 
     def bot(self, source):
         bot = self.connector.bots.get(source["account"])
@@ -131,23 +150,42 @@ class DiscordAlertTransport:
 
     async def lifecycle_notice(self, notice):
         source = json.loads(notice["context"])
-        home = await self.connector._agent_manager._resolve_home_channel(source["owner"])
-        if (
-            not home
-            or home[0] != "discord"
-            or home[2] not in {None, source["account"]}
-            or home[1] == source["channel_id"]
-            or self.store.channel(home[1])
-        ):
-            raise AlertError("Responsible agent home channel is unavailable; lifecycle notice retained")
         client = self.bot(source).client
-        async with asyncio.timeout(20):
+        if source.get("target") == "dm":
+            current = self.store.get(source["id"])
+            if source.get("outcome") != "expired" and (
+                not current
+                or current["revision"] != source.get("revision")
+                or current["state"] in {"disabled", "deleting"}
+                or (source.get("outcome") == "active" and current["state"] != "active")
+                or (source.get("outcome", "").endswith("held") and current["state"] == "active")
+            ):
+                self.store.db.execute("UPDATE lifecycle_notices SET state='cancelled' WHERE id=?", (notice["id"],))
+                return
+            channel = await client.fetch_channel(int(source["dm_id"]))
+            if (
+                getattr(channel, "guild", None) is not None
+                or str(getattr(getattr(channel, "recipient", None), "id", "")) != source["user_id"]
+                or str(channel.id) != source["dm_id"]
+            ):
+                raise AlertError("Setup DM identity could not be verified; notice retained")
+        else:
+            home = await self.connector._agent_manager._resolve_home_channel(source["owner"])
+            if (
+                not home
+                or home[0] != "discord"
+                or home[2] not in {None, source["account"]}
+                or home[1] == source["channel_id"]
+                or self.store.channel(home[1])
+            ):
+                raise AlertError("Responsible agent home channel is unavailable; lifecycle notice retained")
             channel = await client.fetch_channel(int(home[1]))
+        async with asyncio.timeout(20):
             marker = f"[alert-lifecycle:{notice['id']}]"
             matches = [
                 str(m.id)
                 async for m in channel.history(limit=100)
-                if m.author.id == client.user.id and not m.webhook_id and m.content.endswith(marker)
+                if m.author.id == client.user.id and not m.webhook_id and has_marker(m, marker)
             ]
             if matches:
                 message_id = matches[0]
@@ -157,7 +195,7 @@ class DiscordAlertTransport:
                 self.store.db.execute("UPDATE lifecycle_notices SET state='sending' WHERE id=?", (notice["id"],))
                 try:
                     message = await channel.send(
-                        public_text(notice["text"], 1750) + "\n" + marker,
+                        **marked_message(notice["text"], marker, channel),
                         allowed_mentions=discord.AllowedMentions.none(),
                     )
                 except (discord.Forbidden, discord.NotFound):
@@ -202,7 +240,13 @@ class DiscordAlertTransport:
                             view_channel=True, send_messages=True, read_message_history=True
                         ),
                         bot_member: discord.PermissionOverwrite(
-                            view_channel=True, send_messages=True, manage_webhooks=True, read_message_history=True
+                            view_channel=True,
+                            send_messages=True,
+                            manage_webhooks=True,
+                            read_message_history=True,
+                            embed_links=True
+                            if getattr(getattr(bot_member, "guild_permissions", None), "embed_links", False)
+                            else None,
                         ),
                     },
                 )
@@ -244,44 +288,111 @@ class DiscordAlertTransport:
         return source, url
 
     async def _notice(self, source, receipt, step, text):
-        marker = f"[alert:{receipt['id']}:{step}]"
-        channel = await self.channel(source)
-        bot_id = self.bot(source).client.user.id
-
-        async def find():
-            return [
-                {"id": str(m.id)}
-                async for m in channel.history(limit=100)
-                if m.author.id == bot_id and not m.webhook_id and m.content.endswith(marker)
-            ]
-
-        async def create():
+        """One editable status per receipt; recover old start/result messages too."""
+        async with self.message_locks.setdefault(receipt["id"], asyncio.Lock()):
             current = self.store.get(source["id"])
+            row = self.store.db.execute("SELECT state FROM receipts WHERE id=?", (receipt["id"],)).fetchone()
             if (
                 not current
                 or current["revision"] != source["revision"]
                 or current["state"] not in {"active", "provisional"}
             ):
                 raise AlertError("Registration changed before posting")
-            message = await channel.send(
-                public_text(text, 1750) + "\n" + marker, allowed_mentions=discord.AllowedMentions.none()
-            )
-            return {"id": str(message.id)}
+            if row and (row["state"] == "complete" or (step != "result" and row["state"] == "ready")):
+                return None
+            if step == "queued" and row and row["state"] != "pending":
+                return None
+            channel = await self.channel(source)
+            bot_id = self.bot(source).client.user.id
+            marker = f"[alert:{receipt['id']}:status]"
+            old_result = f"[alert:{receipt['id']}:result]"
+            old_start = f"[alert:{receipt['id']}:start]"
 
-        return await ensure_operation(self.store, source, step + ":" + receipt["id"], find, create)
+            async def find():
+                messages = [m async for m in channel.history(limit=100) if m.author.id == bot_id and not m.webhook_id]
+                for tag in (marker, old_result, old_start):
+                    matches = [{"id": str(m.id)} for m in messages if has_marker(m, tag)]
+                    if matches:
+                        return matches
+                return []
+
+            async def create():
+                current = self.store.get(source["id"])
+                if (
+                    not current
+                    or current["revision"] != source["revision"]
+                    or current["state"] not in {"active", "provisional"}
+                ):
+                    raise AlertError("Registration changed before posting")
+                message = await channel.send(
+                    **marked_message(text, marker, channel), allowed_mentions=discord.AllowedMentions.none()
+                )
+                return {"id": str(message.id)}
+
+            # A completed legacy result is already delivered; never duplicate it.
+            legacy = self.store.db.execute(
+                "SELECT state,result FROM operations WHERE source_id=? AND revision=? AND step=?",
+                (source["id"], source["revision"], "result:" + receipt["id"]),
+            ).fetchone()
+            if step == "result" and legacy and legacy["state"] == "complete":
+                return json.loads(legacy["result"])
+            result = await ensure_operation(self.store, source, "status:" + receipt["id"], find, create)
+            message = await channel.fetch_message(int(result["id"]))
+            if (
+                message.author.id != bot_id
+                or message.webhook_id
+                or not any(has_marker(message, tag) for tag in (marker, old_result, old_start))
+            ):
+                raise AlertError("Diagnosis status message changed; refusing to edit it")
+            # Repeat edits are safe after a lost edit response. Repeat sends are not.
+            formatted = marked_message(text, marker, channel)
+            if message.content != formatted["content"] or not has_marker(message, marker):
+                current = self.store.get(source["id"])
+                if (
+                    not current
+                    or current["revision"] != source["revision"]
+                    or current["state"] not in {"active", "provisional"}
+                ):
+                    raise AlertError("Registration changed before editing")
+                await message.edit(
+                    **formatted,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            return result
+
+    @staticmethod
+    def incident_title(source, receipt):
+        config = source["config"]
+        label = receipt.get("issue_name") or config.get("app", "Application issue")
+        title = public_text(label, 80).replace("[", "(").replace("]", ")")
+        if config.get("host") and config.get("project"):
+            title = f"[{title}]({config['host']}/project/{config['project']}/error_tracking/{receipt['issue_id']})"
+        return title
+
+    async def queued(self, source, receipt):
+        status = "Queued for diagnosis."
+        if receipt["available"] > time.time():
+            until = time.strftime("%H:%M UTC", time.gmtime(receipt["available"]))
+            status = f"Queued until {until}: this app has reached its 12 diagnoses per hour."
+        return await self._notice(source, receipt, "queued", self.incident_title(source, receipt) + "\n" + status)
 
     async def progress(self, source, receipt, stage=0):
+        label = "Setup test. " if receipt.get("setup_test") else "Drill. " if receipt.get("drill") else ""
         return await self._notice(
             source,
             receipt,
-            "start" if not stage else f"progress-{stage}",
-            f"Investigating issue {receipt['issue_id']}. "
-            + ("Reading incident and source evidence." if not stage else "Diagnosis is still running; no fix applied."),
+            "progress",
+            self.incident_title(source, receipt)
+            + "\n"
+            + label
+            + ("Investigating." if not stage else "Diagnosis is still running."),
         )
 
     async def report(self, source, receipt):
         prefix = "Diagnosis complete. Proposed fix for review:\n" if receipt["success"] else "Diagnosis held:\n"
-        return await self._notice(source, receipt, "result", prefix + receipt["result"])
+        return await self._notice(
+            source, receipt, "result", self.incident_title(source, receipt) + "\n" + prefix + receipt["result"]
+        )
 
 
 class DiscordAlerts:
@@ -343,19 +454,19 @@ class DiscordAlerts:
             await self.begin(bot, interaction, selected)
 
         @group.command(name="status", description="Show alert setup and pending incidents")
-        async def status(interaction: discord.Interaction, source_id: str):
+        async def status(interaction: discord.Interaction, source_id: str = ""):
             await self.command(bot, interaction, "status", source_id)
 
         @group.command(name="resume", description="Resume a previously confirmed setup")
-        async def resume(interaction: discord.Interaction, source_id: str):
+        async def resume(interaction: discord.Interaction, source_id: str = ""):
             await self.command(bot, interaction, "resume", source_id)
 
         @group.command(name="unsubscribe", description="Stop this registration and disable its destination")
-        async def unsubscribe(interaction: discord.Interaction, source_id: str):
+        async def unsubscribe(interaction: discord.Interaction, source_id: str = ""):
             await self.command(bot, interaction, "unsubscribe", source_id)
 
         @group.command(name="rotate", description="Replace an owned alert webhook and destination")
-        async def rotate(interaction: discord.Interaction, source_id: str):
+        async def rotate(interaction: discord.Interaction, source_id: str = ""):
             await self.command(bot, interaction, "rotate", source_id)
 
         bot.tree.add_command(group)
@@ -381,50 +492,91 @@ class DiscordAlerts:
         if not owner or service not in self.adapters:
             await interaction.response.send_message("This service adapter or responsible agent is not configured.")
             return
+        self.store.expire_drafts(bot.account_name, interaction.user.id, interaction.channel_id)
         source = self.store.begin(owner, interaction.user.id, bot.account_name, interaction.channel_id)
+        if not source["waiting"]:
+            await interaction.response.send_message(
+                "I am still checking the previous setup answer. You can chat normally."
+            )
+            return
         if not source["config"]:
-            source = self.store.update(source["id"], config={"service": service})
+            source = self.store.update(source["id"], config={"service": service, "message_format": 2})
         await interaction.response.send_message(
             self.question(source, bot), allowed_mentions=discord.AllowedMentions.none()
         )
 
+    def credential_names(self, service):
+        listing = getattr(self.connector.vault, "list_keys", None)
+        return sorted(
+            k
+            for k in (listing() if listing else [])
+            if isinstance(k, str)
+            and service.casefold() in k.casefold()
+            and re.fullmatch(r"secrets/[A-Za-z0-9_-]{1,100}", k)
+        )
+
     def question(self, source, bot):
-        config = source["config"]
+        config = dict(source["config"])
         adapter = self.adapters[config["service"]]
+        notices = []
+        if "project" in config and "api_key" not in config:
+            choices = self.credential_names(config["service"])
+            config["credential_choices"] = choices
+            if len(choices) == 1:
+                config["api_key"] = choices[0]
+                notices.append(f"Using the existing vault key {choices[0]}.")
+            source = self.store.update(source["id"], config=config)
+        if "api_key" in config and not source["guild_id"] and bot:
+            if len(bot.client.guilds) == 1:
+                guild = bot.client.guilds[0]
+                source = self.store.update(source["id"], guild_id=str(guild.id))
+                notices.append(f"Using server {public_text(guild.name, 100)}.")
         if "app" not in config:
-            return (
+            prompt = (
                 "What is the app called? Spaces and capitals are fine; I will format its alert channel name. "
                 "Type CANCEL to stop setup."
             )
-        if "repo" not in config:
-            return (
-                "Send the app's Git repository URL (for example https://github.com/owner/repo.git), "
-                "or its local filesystem path."
+        elif "repo" not in config:
+            prompt = "Send the app's Git repository URL, or its local filesystem path. I will find the clone."
+        elif "project" not in config:
+            prompt = adapter.project_prompt
+        elif "api_key" not in config:
+            choices = config.get("credential_choices", [])
+            if choices:
+                prompt = (
+                    "I found these existing vault keys. Choose a number or name (never paste a key value):\n"
+                    + "\n".join(f"{i}. {name}" for i, name in enumerate(choices, 1))
+                )
+            else:
+                prompt = (
+                    "No matching vault key was found. Send an existing secrets/name reference, "
+                    "or enter a new key privately with scripts/alert-credential.py "
+                    f"--socket {self.credentials.path} and the project's API host. Never paste the key here."
+                )
+        elif not source["guild_id"]:
+            prompt = "Which server? Choose its number, name or server ID:\n" + "\n".join(
+                f"{i}. {public_text(g.name, 100)} ({g.id})" for i, g in enumerate(bot.client.guilds, 1)
             )
-        if "project" not in config:
-            return adapter.project_prompt
-        if "api_key" not in config:
-            return (
-                "Which existing vault reference holds the service API key? "
-                "Send its secrets/name reference only, never the secret value. "
-                "For a new key, use scripts/alert-credential.py "
-                f"with --socket {self.credentials.path} and the project's API host."
+        elif "triggers" not in config:
+            prompt = (
+                "Alert on all issue events: created, reopened and spiking? Reply yes or all (the default), "
+                "or choose a comma-separated subset."
             )
-        if not source["guild_id"]:
-            choices = ", ".join(f"{g.name} ({g.id})" for g in bot.client.guilds)
-            return "Which server should contain the private alert channel? Reply with its ID: " + public_text(choices)
-        if "triggers" not in config:
-            return "Which issues should trigger alerts? Choose a comma-separated combination: " + ", ".join(
-                adapter.triggers
+        else:
+            guild = (
+                next((g.name for g in bot.client.guilds if str(g.id) == source["guild_id"]), source["guild_id"])
+                if bot
+                else source["guild_id"]
             )
-        return (
-            f"Create alerts-{config['app']} in server {source['guild_id']} "
-            f"for {config['service']} project {config['project']}? "
-            f"Events: {', '.join(config['triggers'])}. Repo: {config['repo']}. "
-            f"API host: {config['host']}. Key reference: {config['api_key']}. "
-            "This creates a private channel, webhook and service destination, then sends a diagnostic test. "
-            f"Reply CREATE to proceed or CANCEL to stop. Setup ID: {source['id']}"
-        )
+            prompt = (
+                f"Create alerts-{config['app']} in server {public_text(guild, 100)} "
+                f"for {config['service']} project {config['project']}? "
+                f"Events: {', '.join(config['triggers'])}. "
+                f"Project: {config['host']}/project/{config['project']}. Key: {config['api_key']}. "
+                "This creates a private channel, webhook and service destination, then sends a diagnostic test. "
+                "Reply CREATE to proceed or CANCEL to stop."
+            )
+        return "\n".join([*notices, prompt])
 
     async def answer(self, source, bot, text):
         if text.strip().upper() == "CANCEL":
@@ -445,17 +597,37 @@ class DiscordAlerts:
         elif "project" not in config:
             config.update(self.adapters[config["service"]].parse_project(text))
         elif "api_key" not in config:
+            choices = config.get("credential_choices", self.credential_names(config["service"]))
+            if text.isdigit() and 1 <= int(text) <= len(choices):
+                text = choices[int(text) - 1]
+            if text.casefold() in {
+                "use existing one",
+                "use the existing one",
+                "look for posthog",
+            } or not text.startswith("secrets/"):
+                return self.question(source, bot)
             if not re.fullmatch(r"secrets/[A-Za-z0-9_-]{1,100}", text):
-                raise AlertError("Supply one vault reference; never paste credential values here")
+                raise AlertError("Choose a vault key by number or name; never paste credential values")
+            listing = getattr(self.connector.vault, "list_keys", None)
+            if listing and text not in listing():
+                raise AlertError("That vault key name was not found. Choose one of the listed names")
             config["api_key"] = text
         elif not source["guild_id"]:
-            if text not in {str(g.id) for g in bot.client.guilds}:
-                raise AlertError("Select a server available to this bot")
-            source = self.store.update(source["id"], guild_id=text)
+            guilds = bot.client.guilds
+            matches = [g for g in guilds if str(g.id) == text or g.name.casefold() == text.casefold()]
+            if not matches and text.isdigit() and 1 <= int(text) <= len(guilds):
+                matches = [guilds[int(text) - 1]]
+            if len(matches) != 1:
+                raise AlertError("Choose a listed server by number, name or server ID. A channel ID is not a server ID")
+            source = self.store.update(source["id"], guild_id=str(matches[0].id))
         elif "triggers" not in config:
-            kinds = list(dict.fromkeys(x.strip() for x in text.split(",")))
+            kinds = (
+                list(self.adapters[config["service"]].triggers)
+                if text.casefold() in {"", "yes", "all"}
+                else list(dict.fromkeys(x.strip().lower() for x in text.split(",")))
+            )
             if not kinds or set(kinds) - set(self.adapters[config["service"]].triggers):
-                raise AlertError("Choose lifecycle events from the setup prompt")
+                raise AlertError("Choose created, reopened, spiking, or all")
             config["triggers"] = kinds
         elif text.upper() == "CREATE":
             for row in self.store.db.execute(
@@ -464,7 +636,7 @@ class DiscordAlerts:
             ):
                 other = self.store.get(row["id"])
                 if all(other["config"].get(k) == config.get(k) for k in ("service", "host", "project", "repo")):
-                    raise AlertError(f"This application is already registered as {other['id']}; use status or rotate")
+                    raise AlertError("This app already has an alert registration. Use /alerts status or /alerts rotate")
             await self.adapters[config["service"]].check_credentials(config)
             source = self.store.update(source["id"], state="provisioning")
             return await self.provision(source)
@@ -484,8 +656,8 @@ class DiscordAlerts:
         await adapter.test_delivery(source, destination["id"])
         self.worker.wake.set()
         return (
-            f"Setup {source['id']} is provisional. Waiting for a real test delivery and completed diagnosis "
-            f"in <#{source['channel_id']}>. It is not active yet."
+            f"The channel is ready: https://discord.com/channels/{source['guild_id']}/{source['channel_id']}. "
+            "Checking test delivery and diagnosis now. I will confirm here when alerts are active."
         )
 
     def status(self, source):
@@ -494,14 +666,44 @@ class DiscordAlerts:
         job = self.store.db.execute(
             "SELECT state,attempts,error FROM teardowns WHERE source_id=?", (source["id"],)
         ).fetchone()
-        cleanup = " Cleanup: " + json.dumps(dict(job)) + "." if job else ""
+        waiting = sum(self.store.counts(source["id"]).get(k, 0) for k in ("pending", "running", "ready"))
+        cleanup = f" Cleanup {job['state']} after {job['attempts']} attempts." if job else ""
         return (
-            f"Setup {source['id']}: {source['state']}. Receipts: {json.dumps(self.store.counts(source['id']))}."
-            + cleanup
+            f"Alerts for {source['config'].get('app', 'your app')}: {source['state']}. "
+            f"{waiting} diagnoses pending." + cleanup
         )
 
     async def command(self, bot, interaction, action, source_id):
-        source = self.store.get(source_id)
+        if interaction.user.bot or not self.admin(interaction.user.id):
+            await interaction.response.send_message(
+                "This registration is not managed by you through this bot.", ephemeral=True
+            )
+            return
+        candidates = [
+            self.store.get(row["id"])
+            for row in self.store.db.execute(
+                "SELECT id FROM sources WHERE account=? AND user_id=? ORDER BY created DESC",
+                (bot.account_name, str(interaction.user.id)),
+            )
+        ]
+        if source_id:
+            candidates = [s for s in candidates if source_id in {s["id"], s["channel_id"], s["config"].get("app")}]
+        else:
+            candidates = [s for s in candidates if s["state"] != "disabled"]
+        if len(candidates) > 1:
+            choices = "\n".join(
+                f"{s['config'].get('app', 'Unnamed setup')}: {s['state']}"
+                + (f" <#{s['channel_id']}>" if s["channel_id"] else "")
+                for s in candidates
+            )
+            await interaction.response.send_message(
+                "Choose an app name or its alert-channel ID in source_id:\n" + public_text(choices),
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            return
+        source = candidates[0] if candidates else None
+        source_id = source["id"] if source else source_id
         if (
             not source
             or interaction.user.bot
@@ -546,10 +748,9 @@ class DiscordAlerts:
                         raise AlertError("Only previously confirmed setup can resume")
                     await self.provision(source)
                 response = self.status(self.store.get(source_id))
-            except AlertError as error:
-                response = str(error)
-            except Exception:
-                response = "Operation failed or has an unknown outcome. Inspect setup status before retrying."
+            except Exception as error:
+                log_failure(error, action)
+                response = public_text(failure_reason(error))
         await interaction.followup.send(response, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     async def on_message(self, bot, message):
@@ -573,13 +774,6 @@ class DiscordAlerts:
                 event = adapter.parse_event(source, message.content)
                 outcome = self.store.receive(source, message_id=message.id, **event)
                 if outcome == "queued":
-                    waiting = self.store.counts(source["id"]).get("pending", 0)
-                    await self.transport.say(
-                        source,
-                        f"Received issue {event['issue_id']}. "
-                        f"Queued for read-only diagnosis; {waiting} pending. "
-                        "Processing is limited to 12 diagnoses per hour.",
-                    )
                     self.worker.wake.set()
                 elif outcome == "overflow":
                     await self.transport.say(source, "Alert queue is full. Registration paused; review required.")
@@ -588,15 +782,29 @@ class DiscordAlerts:
             return True
         if message.guild or message.author.bot or not self.admin(message.author.id):
             return False
+        self.store.expire_drafts(bot.account_name, message.author.id, channel_id)
         source = self.store.draft(bot.account_name, message.author.id, channel_id)
         if not source:
             return False
         async with self.locks.setdefault(source["id"], asyncio.Lock()):
+            current = self.store.get(source["id"])
+            if not current or current["state"] != "draft" or not current["waiting"]:
+                return False
+            self.store.update(source["id"], waiting=0)
             try:
                 response = await self.answer(self.store.get(source["id"]), bot, message.content)
-            except AlertError as error:
-                response = str(error)
-            except Exception:
-                response = "Setup could not continue. No successful outcome is assumed; use /alerts status."
-        await message.channel.send(response, allowed_mentions=discord.AllowedMentions.none())
+            except Exception as error:
+                log_failure(error, "setup")
+                response = public_text(failure_reason(error))
+                current = self.store.get(source["id"])
+                if current and current["state"] in {"provisioning", "provisional"}:
+                    self.store.notify_setup(current, "Alert setup is held: " + response, "provision-held")
+                    self.lifecycle.wake.set()
+                    response = None
+            finally:
+                current = self.store.get(source["id"])
+                if current and current["state"] == "draft":
+                    self.store.update(source["id"], waiting=1)
+        if response is not None:
+            await message.channel.send(response, allowed_mentions=discord.AllowedMentions.none())
         return True

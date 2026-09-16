@@ -45,9 +45,16 @@ class Harness:
             for message in reversed(self.home_messages):
                 yield message
 
-        async def send(text, **kwargs):
+        async def send(text=None, **kwargs):
+            text = kwargs.pop("content", text)
             assert kwargs["allowed_mentions"].everyone is False
-            message = SimpleNamespace(id=800 + len(self.home_messages), author=self.user, webhook_id=None, content=text)
+            message = SimpleNamespace(
+                id=800 + len(self.home_messages),
+                author=self.user,
+                webhook_id=None,
+                content=text,
+                embeds=[kwargs["embed"]] if kwargs.get("embed") is not None else [],
+            )
             self.home_messages.append(message)
             return message
 
@@ -787,9 +794,9 @@ async def test_completed_removal_of_old_revision_survives_retry_of_new_revision(
     h.lifecycle.request(first["id"], "deleted")
     await h.lifecycle.cleanup_due()
     assert first_id not in h.remote and second_id in h.remote
-    assert [tuple(row) for row in h.store.db.execute(
-        "SELECT revision,removed FROM alert_revisions ORDER BY revision"
-    )] == [(1, 1), (2, 0)]
+    assert [
+        tuple(row) for row in h.store.db.execute("SELECT revision,removed FROM alert_revisions ORDER BY revision")
+    ] == [(1, 1), (2, 0)]
     assert len(h.secrets) == 3  # Retain recovery references until terminal cleanup.
     h.calls.clear()
     h.adapter._request = original
