@@ -28,11 +28,24 @@ class AlertLifecycle:
 
     def inaccessible(self, source, scope, reason):
         key = f"{scope}:{source['account']}:" + (source["guild_id"] if scope == "guild" else source["id"])
-        subject = f"guild {source['guild_id']}" if scope == "guild" else f"channel {source['channel_id']}"
+        subject = f"server {source['guild_id']}" if scope == "guild" else f"channel {source['channel_id']}"
+        explanation = {
+            "access denied": "Discord denied permission. Check the bot's server membership and channel permissions.",
+            "guild unavailable": "Discord could not find the server, or the bot is no longer a member.",
+            "membership missing": "Discord could not find the bot's server membership.",
+            "resource unavailable": "Discord could not find a required resource; channel deletion is not confirmed.",
+            "temporarily unavailable": "Discord or the network is temporarily unavailable after one retry. "
+            "The access check will run again automatically.",
+            "request refused": "Discord refused the access check. "
+            "The engine log records the exception type and location.",
+            "bot unavailable": "The configured bot is not connected. The access check will run again automatically.",
+            "identity mismatch": "Discord returned a different server or channel; its identity could not be verified.",
+            "obfuscated": "Discord has hidden the channel's details (obfuscated). Check the bot's channel permissions.",
+        }.get(reason, "The access check failed internally. The engine log records the exception type and location.")
         self.store.notify_lifecycle(
             source,
-            f"Alert access could not be verified for {subject} ({reason}). "
-            "Registrations are retained; no destination was disabled. Check bot access.",
+            f"Alert access could not be verified for {subject}. {explanation} "
+            "Registrations are retained; no destination was disabled.",
             condition=key,
         )
 
@@ -106,7 +119,12 @@ class AlertLifecycle:
             "SELECT id FROM sources WHERE account=? AND guild_id=? LIMIT 1", (account, str(guild_id))
         ).fetchone()
         if row:
-            self.inaccessible(self.store.get(row["id"]), "guild", "guild unavailable")
+            source = self.store.get(row["id"])
+            status = await self.transport.guild_status(source)
+            if status != "present":
+                self.inaccessible(source, "guild", status)
+            else:
+                self.store.clear_condition(f"guild:{account}:{guild_id}")
         self.wake.set()
 
     async def _cleanup(self, source, job):

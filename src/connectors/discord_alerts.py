@@ -14,7 +14,7 @@ from discord.state import ConnectionState
 
 from src.core.alert_channels import AlertError, AlertStore, ensure_operation
 from src.core.alert_credentials import CredentialEntry
-from src.core.alert_diagnosis import AlertWorker, incident_label, public_text
+from src.core.alert_diagnosis import AlertWorker, incident_label, public_prose, public_text
 from src.core.alert_errors import failure_reason, log_failure
 from src.core.alert_lifecycle import AlertLifecycle
 from src.core.alert_operator import OperatorRehearsal
@@ -84,7 +84,8 @@ def marked_message(text, marker, channel):
     member = getattr(guild, "me", None)
     embeds = guild is None or (member is not None and channel.permissions_for(member).embed_links is True)
     return {
-        "content": public_text(text, 1920) + ("" if embeds else "\n||" + marker + "||"),
+        "content": public_prose(text, min(1920, 2000 - len(marker) - 5) if not embeds else 1920)
+        + ("" if embeds else "\n||" + marker + "||"),
         "embed": discord.Embed().set_footer(text=marker) if embeds else None,
     }
 
@@ -106,21 +107,50 @@ class DiscordAlertTransport:
             raise AlertError("Alert channel is in a different guild")
         return channel
 
+    access_retry_delay = 1
+
+    async def access_status(self, scope, check):
+        """Retry a transient read once. Only a specific channel 404 proves absence."""
+        for attempt in range(2):
+            try:
+                async with asyncio.timeout(15):
+                    return await check()
+            except Exception as error:
+                status = getattr(error, "status", None)
+                transient = isinstance(error, (TimeoutError, OSError)) or (
+                    isinstance(error, discord.HTTPException) and (status == 429 or status >= 500)
+                )
+                if transient and attempt == 0:
+                    await asyncio.sleep(self.access_retry_delay)
+                    continue
+                if isinstance(error, discord.NotFound) and scope == "channel" and status == 404 and error.code == 10003:
+                    return "missing"
+                log_failure(error, f"{scope} access check")
+                if isinstance(error, discord.Forbidden):
+                    return "access denied"
+                if isinstance(error, discord.NotFound):
+                    if scope == "guild" and error.code == 10007:
+                        return "membership missing"
+                    return "guild unavailable" if scope == "guild" or error.code == 10004 else "resource unavailable"
+                if transient:
+                    return "temporarily unavailable"
+                if isinstance(error, discord.HTTPException):
+                    return "request refused"
+                return "check failed"
+
     async def guild_status(self, source):
-        try:
-            async with asyncio.timeout(15):
-                client = self.bot(source).client
-                guild = await client.fetch_guild(int(source["guild_id"]))
-                if str(guild.id) != source["guild_id"]:
-                    return "unknown"
-                await guild.fetch_member(client.user.id)
+        async def check():
+            bot = self.connector.bots.get(source["account"])
+            if not bot or not bot.client.user:
+                return "bot unavailable"
+            client = bot.client
+            guild = await client.fetch_guild(int(source["guild_id"]))
+            if str(guild.id) != source["guild_id"]:
+                return "identity mismatch"
+            await guild.fetch_member(client.user.id)
             return "present"
-        except discord.Forbidden:
-            return "access denied"
-        except discord.NotFound:
-            return "guild unavailable"
-        except Exception:
-            return "unknown"
+
+        return await self.access_status("guild", check)
 
     @staticmethod
     def obfuscated(channel):
@@ -128,26 +158,25 @@ class DiscordAlertTransport:
         return bool(getattr(flags, "value", flags) & (1 << 17))
 
     async def channel_status(self, source, event=None):
-        client = self.bot(source).client
-        state = getattr(client, "_connection", None)
-        if source["channel_id"] in getattr(state, "alert_obfuscated", {}):
-            return "obfuscated"
-        cached = getattr(client, "get_channel", lambda _: None)(int(source["channel_id"]))
-        if cached is not None and self.obfuscated(cached):
-            return "obfuscated"
-        if event is not None and self.obfuscated(event):
-            return "obfuscated"
-        try:
-            async with asyncio.timeout(15):
-                channel = await self.channel(source)
+        async def check():
+            bot = self.connector.bots.get(source["account"])
+            if not bot or not bot.client.user:
+                return "bot unavailable"
+            client = bot.client
+            state = getattr(client, "_connection", None)
+            if source["channel_id"] in getattr(state, "alert_obfuscated", {}):
+                return "obfuscated"
+            cached = getattr(client, "get_channel", lambda _: None)(int(source["channel_id"]))
+            if cached is not None and self.obfuscated(cached):
+                return "obfuscated"
+            if event is not None and self.obfuscated(event):
+                return "obfuscated"
+            channel = await client.fetch_channel(int(source["channel_id"]))
+            if str(getattr(getattr(channel, "guild", None), "id", "")) != source["guild_id"]:
+                return "identity mismatch"
             return "obfuscated" if self.obfuscated(channel) else "present"
-        except discord.NotFound as error:
-            # Other 404 codes can describe lost guild access rather than this channel.
-            return "missing" if error.status == 404 and error.code == 10003 else "unknown"
-        except discord.Forbidden:
-            return "access denied"
-        except Exception:
-            return "unknown"
+
+        return await self.access_status("channel", check)
 
     async def lifecycle_notice(self, notice):
         source = json.loads(notice["context"])
@@ -560,6 +589,15 @@ class DiscordAlerts:
             and re.fullmatch(r"secrets/[A-Za-z0-9_-]{1,100}", k)
         )
 
+    @staticmethod
+    def repository_label(path):
+        root = Path(path)
+        try:
+            label = str(Path("~") / root.relative_to(Path.home()))
+        except ValueError:
+            label = str(root)
+        return public_text(label, 300).replace("`", "'").replace("\n", " ").replace("\r", " ")
+
     def question(self, source, bot):
         config = dict(source["config"])
         adapter = self.adapters[config["service"]]
@@ -616,6 +654,7 @@ class DiscordAlerts:
             prompt = (
                 f"Create alerts-{config['app']} in server {public_text(guild, 100)} "
                 f"for {config['service']} project {config['project']}? "
+                f"Repository: `{self.repository_label(config['repo'])}`. "
                 f"Events: {', '.join(config['triggers'])}. "
                 f"Project: {config['host']}/project/{config['project']}. Key: {config['api_key']}. "
                 "This creates a private channel, webhook and service destination, then sends a diagnostic test. "
@@ -631,6 +670,7 @@ class DiscordAlerts:
             return self.status(source) + " Use /alerts resume with the setup ID to continue."
         config = dict(source["config"])
         text = text.strip()
+        repo_notice = ""
         if "app" not in config:
             config["app"] = channel_app_name(text)
         elif "repo" not in config:
@@ -639,6 +679,7 @@ class DiscordAlerts:
             if not current or current["state"] != "draft" or current["config"] != config:
                 raise AlertError("Setup changed during repository lookup; continue from its current prompt")
             config["repo"] = str(root)
+            repo_notice = f"Found the clone at `{self.repository_label(root)}`.\n\n"
         elif "project" not in config:
             config.update(self.adapters[config["service"]].parse_project(text))
         elif "api_key" not in config:
@@ -691,7 +732,7 @@ class DiscordAlerts:
         else:
             return self.question(source, bot)
         source = self.store.update(source["id"], config=config)
-        return self.question(source, bot)
+        return repo_notice + self.question(source, bot)
 
     async def provision(self, source):
         source, webhook = await self.transport.provision(source)

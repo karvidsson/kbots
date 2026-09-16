@@ -25,6 +25,22 @@ def public_text(value, limit=1800):
     return _SECRET.sub("[redacted]", str(value or ""))[:limit].replace("@", "＠")
 
 
+def public_prose(value, limit=1800):
+    """Redact first, then trim at a readable boundary within Discord's budget."""
+    text = _SECRET.sub("[redacted]", str(value or "")).replace("@", "＠")
+    # Count UTF-16 units too, so astral symbols cannot overrun the wire budget.
+    encoded = text.encode("utf-16-le", errors="replace")
+    if len(encoded) <= limit * 2:
+        return text
+    prefix = encoded[: max(0, limit - 1) * 2].decode("utf-16-le", errors="ignore")
+    boundaries = [m.start() for m in re.finditer(r"\n|(?<=[.!?])\s+", prefix)]
+    if boundaries:
+        end = boundaries[-1]
+    else:
+        end = max((m.start() for m in re.finditer(r"\s+", prefix)), default=0)
+    return prefix[:end].rstrip() + "…"
+
+
 def incident_label(source, issue):
     """A bounded plain-text link label, chosen once from the first issue read."""
     description = str(issue.get("description") or "").strip()
@@ -229,7 +245,7 @@ async def diagnose(manager, source, issue, directory):
         )
     if response.tool_calls or response.stop_reason == "error" or not response.content.strip():
         raise AlertError("Restricted diagnosis did not produce a usable result")
-    text = public_text(human_diagnosis(response.content), 1600)
+    text = public_prose(human_diagnosis(response.content), 1600)
     if text.strip() == "NO_REPLY":
         raise AlertError("Restricted diagnosis returned no explanation")
     return text

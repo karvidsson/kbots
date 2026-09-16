@@ -64,6 +64,9 @@ Exactly one match is required. No match names the searched roots; multiple
 matches list candidate paths so the administrator can choose one explicitly.
 The stored value remains an absolute local path. Setup never fetches or clones.
 Local paths, including repositories without remotes, remain supported.
+Setup announces the resolved clone before asking for the project URL and repeats
+it in the CREATE confirmation. Paths under the invoking home directory display
+with `~`; the stored path remains absolute.
 
 Discovery searches at most four directory levels below each root, skips Git
 metadata and common dependency/build directories, and is bounded to 2,000
@@ -310,6 +313,12 @@ before and after that response, establishes deletion. HTTP 403, lost guild
 access, another 404 code, timeouts and server failures retain the registration.
 A whole-guild access failure reports once per bot account and guild, rather than
 once per channel. A later successful check clears that episode's notice guard.
+Timeouts, connection failures, HTTP 429 and server errors get one retry after
+one second before notifying. Each read attempt has a 15-second timeout. Permission
+denials and missing resources are not retried in that check. Gateway server-loss
+events also verify current access before notifying. Notices explain the reason;
+exception types and stack locations go to the engine log without exception values.
+These retries do not relax the specific channel-404 and fresh membership checks.
 
 Absence from a guild channel list proves nothing: Discord omits channels the
 client cannot view from HTTP listings. A gateway channel with
@@ -434,6 +443,10 @@ Before that metadata arrives, the status shows plain app context without an issu
 link label. Verdicts and headings occupy separate paragraphs. A declared drill
 leads with reporting-path confirmation instead of a proposed-fix heading; a drill
 sample not bound to the trigger is explicitly described as a sample.
+Long diagnosis text is redacted and trimmed at a line or sentence boundary with
+an ellipsis, falling back to a whole word when necessary. The final Discord
+message is bounded separately, including its recovery marker when embeds are
+unavailable. The budget also counts UTF-16 units so emoji cannot overrun it.
 
 The deterministic delivery test is labelled as a setup test. New PostHog
 created/reopened notifications carry an explicit drill bit derived only from
