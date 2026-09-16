@@ -5,8 +5,9 @@ private API host `eu.posthog.com` or `us.posthog.com`, not the ingestion host.
 One vault reference supplies the API key for provisioning and diagnosis.
 An existing token can be used directly, including an all-access key, without
 rewriting it. Its name is not evidence of scope. The runtime adapter permits
-fixed issue GETs and one fixed read-only issue-sample POST; the diagnostic model receives neither the key nor an
-HTTP tool. Provisioning needs Hog function read/write access for reconciliation,
+fixed issue GETs and two fixed read-only issue-sample POST shapes; the diagnostic
+model receives neither the key nor an HTTP tool. Provisioning needs Hog function
+read/write access for reconciliation,
 creation, test invocation, disabling and soft-deleting the owned destination.
 A successful issue GET proves read access to that endpoint; it does not establish the key's
 complete scope set or prove write access.
@@ -80,30 +81,40 @@ event has boolean `test: true`; otherwise it is `unknown`. The referenced event
 contract spreads originating exception properties onto created/reopened events,
 but not spiking events. Manual transitions can also lack the marker. The setup
 invocation supplies a test name/marker and is independently recognized by its
-deterministic event UUID. The drill bit comes from the bound lifecycle envelope; the fixed sampled-event
-read described below does not return custom event properties such as `test`.
+deterministic event UUID. The trigger-specific drill bit comes from the bound
+lifecycle envelope. The sampled-event
+read does not return custom properties such as `test`, but its fixed property filter
+can classify the sampled exception as described below.
 
 Sources without `message_format: 2` retain the exact original `KBOTS_ALERT_V1`
 content. The adapter does not accept an arbitrary alternate payload during an
 ownership check: it reconstructs the one template selected by that revision.
 Existing revisions, their snapshots and vendor resources require no migration.
-Their original envelope lacks a drill bit, so natural drill classification is
-unknown until a fresh format-2 registration is explicitly provisioned. The new
+Their original envelope lacks a trigger-specific drill bit. The fixed filtered
+query can still classify a matching recent sampled exception without changing
+the destination template; that classification never covers the whole issue. The new
 Hog content expression and natural event delivery require live acceptance on the
 deployed revision; offline transport doubles are not evidence of vendor delivery.
 
 ## Exception evidence
 
 In addition to the summary GET, incident processing may POST only to
-`error_tracking/query/issue_events/` with exactly this body:
+`error_tracking/query/issue_events/` with either of these two body shapes. Both
+requests share one absolute seven-day UTC window ending when the sample fetch
+starts:
 
 ```json
-{"issueId":"<canonical issue UUID>","limit":1,"onlyAppFrames":true,"filterTestAccounts":false,"include":["exception","stacktrace","release"]}
+{"issueId":"<canonical issue UUID>","limit":1,"onlyAppFrames":true,"filterTestAccounts":false,"include":["exception","stacktrace","release"],"dateRange":{"date_from":"<UTC start>","date_to":"<UTC end>"}}
 ```
 
 The pinned [query view](https://github.com/PostHog/posthog/blob/e4aa96a7ea4679a5004a0ad1c2630c7992f5af80/products/error_tracking/backend/presentation/views/query.py)
-marks this as `error_tracking:read`. It samples the most recent event in a default
-seven-day window. This is not necessarily the exception that triggered the
+marks this as `error_tracking:read`. It samples the most recent event in the explicit
+seven-day window. The filtered request adds only
+`"filterGroup":[{"key":"test","value":["true"],"operator":"exact","type":"event"}]`.
+The runtime accepts only canonical UTC second-resolution endpoints exactly seven
+days apart, ending within five minutes of request time (one minute of future
+clock tolerance). Caller-selected wider, relative or historical windows are refused.
+This is not necessarily the exception that triggered the
 lifecycle notification. Missing samples are stated explicitly.
 
 The runtime rejects any extra field, larger limit, different include group,
@@ -116,4 +127,26 @@ mandatory. Only up to three exception type/value pairs and 24 application frames
 sessions and arbitrary release metadata are not forwarded. Up to three release
 versions and validated Git commit hashes are retained for revision comparison. Frame URL query strings and
 credentials are discarded. Existing response-size, credential-host, redirect and
-request-budget limits apply to this read too.
+request-budget limits apply to both reads.
+
+Classification is `drill` only when the filtered result has the same exception
+UUID as the unfiltered sample. The UUID is compared internally and discarded,
+never passed to the model. An available sample with no filtered match is
+`unmarked`, meaning no declared test marker, not proof of a production defect.
+No sample, malformed classification responses, missing identities or different
+UUIDs are `unknown`. A different filtered event may be an older drill in a mixed
+issue or reflect ingestion between queries; neither can classify the sampled
+event. The channel, durable receipt and prompt keep this sample scope explicit.
+The original bound lifecycle drill bit still identifies a declared triggering
+event, separately from the sample. Diagnosis runs for drills too, explaining
+the reporting path rather than proposing removal of the intentional debug route.
+
+
+The exception query can lag the lifecycle notification. Empty results expose
+`availability: empty`, an observation rather than proof that no events exist.
+The worker durably schedules bounded retries before diagnosis, as documented in
+[alert evidence selection](../../docs/ALERTS.md#selecting-diagnostic-source-evidence).
+It skips the filtered drill read while the unfiltered result is empty. Each read
+attempt gets a fresh absolute seven-day window; its unfiltered and filtered reads
+share that window exactly. Existing API budgets count every retry. A summary GET
+returning HTTP 404 is a distinct held result, never an empty-sample retry.

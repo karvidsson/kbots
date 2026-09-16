@@ -371,13 +371,21 @@ class DiscordAlertTransport:
 
     async def queued(self, source, receipt):
         status = "Queued for diagnosis."
-        if receipt["available"] > time.time():
+        if receipt.get("evidence", {}).get("status") == "waiting":
+            status = "Waiting for stack trace. PostHog has not returned the exception evidence yet."
+        elif receipt["available"] > time.time():
             until = time.strftime("%H:%M UTC", time.gmtime(receipt["available"]))
             status = f"Queued until {until}: this app has reached its 12 diagnoses per hour."
         return await self._notice(source, receipt, "queued", self.incident_title(source, receipt) + "\n" + status)
 
     async def progress(self, source, receipt, stage=0):
         label = "Setup test. " if receipt.get("setup_test") else "Drill. " if receipt.get("drill") else ""
+        if not label:
+            label = {
+                "drill": "Sampled exception: declared drill. ",
+                "unmarked": "Sampled exception: no declared drill marker. ",
+                "unknown": "Sampled exception: drill status unknown. ",
+            }.get(receipt.get("sample_drill_status"), "")
         return await self._notice(
             source,
             receipt,
@@ -385,7 +393,13 @@ class DiscordAlertTransport:
             self.incident_title(source, receipt)
             + "\n"
             + label
-            + ("Investigating." if not stage else "Diagnosis is still running."),
+            + (
+                "Waiting for stack trace. PostHog has not returned the exception evidence yet."
+                if receipt.get("evidence", {}).get("status") == "waiting"
+                else "Investigating."
+                if not stage
+                else "Diagnosis is still running."
+            ),
         )
 
     async def report(self, source, receipt):

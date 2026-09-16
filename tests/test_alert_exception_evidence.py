@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from extras.posthog.alerts import PostHogAdapter, sampled_exception
+from extras.posthog.alerts import PostHogAdapter, sample_drill_status, sampled_exception
 from src.core.alert_channels import AlertError, AlertStore
 from src.core.alert_diagnosis import source_evidence
 from tests.test_posthog_alerts import FakeResponse, FakeSession
@@ -33,7 +33,7 @@ def response(source=".output/server/chunks/routes/api/debug/boom.get.mjs"):
     return {
         "results": [
             {
-                "uuid": "private-event-id",
+                "uuid": "00000000-0000-4000-8000-000000000001",
                 "distinct_id": "private-person",
                 "timestamp": "unused",
                 "properties": {
@@ -92,6 +92,7 @@ async def test_sample_post_is_fixed_read_scope_and_uses_no_provisioning_bypass(a
         "onlyAppFrames": True,
         "filterTestAccounts": False,
         "include": ["exception", "stacktrace", "release"],
+        "dateRange": options["json"]["dateRange"],
     }
     assert options["allow_redirects"] is False
 
@@ -197,13 +198,18 @@ def test_invalid_sample_cannot_be_presented_as_verified_evidence(data):
 
 async def test_issue_fetch_returns_only_projected_sample(adapter):
     issue = str(uuid.uuid4())
-    adapter._request = AsyncMock(side_effect=[{"id": issue, "name": "Error"}, response()])
+    adapter._request = AsyncMock(side_effect=[{"id": issue, "name": "Error"}, response(), response()])
     source = {"config": adapter.test_config}
     result = await adapter.issue(source, issue)
     assert result["sample"]["exceptions"][0]["frames"][0]["source"].endswith("boom.get.mjs")
     assert "private" not in json.dumps(result)
-    assert len(adapter._request.call_args_list) == 2
-    assert adapter._request.call_args.kwargs == {"payload": adapter.sample_request(issue)}
+    assert len(adapter._request.call_args_list) == 3
+    query = adapter._request.call_args_list[1].kwargs["payload"]
+    assert adapter._request.call_args.kwargs == {
+        "payload": adapter.sample_request(issue, date_range=query["dateRange"], drill=True)
+    }
+    assert result["sample"]["drill_status"] == "drill"
+    assert "uuid" not in json.dumps(result) and "distinct_id" not in json.dumps(result)
 
 
 def tracked_repo(tmp_path, files):
@@ -264,3 +270,206 @@ def test_frames_never_read_untracked_symlink_or_parent_escape(tmp_path):
         evidence = source_evidence(str(repo), {"name": "Absent", "sample": sampled_exception(response(path))})
         assert "DO NOT READ" not in json.dumps(evidence)
         assert not evidence["snippets"]
+
+
+@pytest.mark.parametrize(
+    "sample_kind,filtered_kind,expected",
+    [
+        ("present", "same", "drill"),
+        ("present", "empty", "unmarked"),
+        ("empty", "empty", "unknown"),
+        ("empty", "same", "unknown"),
+        ("present", "different", "unknown"),
+        ("present", "invalid", "unknown"),
+        ("invalid", "same", "unknown"),
+        ("present", "incomplete_empty", "unknown"),
+    ],
+)
+def test_sample_classification_never_confuses_issue_membership_with_event_identity(
+    sample_kind, filtered_kind, expected
+):
+    def data(kind):
+        if kind in {"empty", "incomplete_empty"}:
+            return {"results": [], "hasMore": kind == "incomplete_empty"}
+        value = response()
+        if kind == "different":
+            value["results"][0]["uuid"] = str(uuid.uuid4())
+        elif kind == "invalid":
+            value["results"][0]["uuid"] = "not-a-uuid"
+        return value
+
+    assert sample_drill_status(data(sample_kind), data(filtered_kind)) == expected
+
+
+@pytest.mark.parametrize("bad", [{}, {"results": None}, {"results": [None]}, {"results": [{}, {}]}])
+def test_malformed_filter_response_is_unknown(bad):
+    assert sample_drill_status(response(), bad) == "unknown"
+
+
+@pytest.mark.parametrize("drill", [False, True])
+async def test_both_exact_sample_queries_share_the_fixed_absolute_window(adapter, drill):
+    from datetime import datetime, timedelta
+
+    body = adapter.sample_request(str(uuid.uuid4()), drill=drill)
+    window = body["dateRange"]
+    dates = [datetime.fromisoformat(window[name]) for name in ("date_from", "date_to")]
+    assert dates[1] - dates[0] == timedelta(days=7)
+    session = FakeSession(FakeResponse(200, [b'{"results":[]}']))
+    adapter.session_factory = lambda: session
+    await adapter._request(adapter.test_config, "POST", "error_tracking/query/issue_events/", payload=body)
+    assert session.calls[0][1]["json"] == body
+    if drill:
+        assert body["filterGroup"] == [{"key": "test", "value": ["true"], "operator": "exact", "type": "event"}]
+    else:
+        assert "filterGroup" not in body
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "other_key",
+        "false_value",
+        "bool_value",
+        "operator",
+        "hogql",
+        "extra_filter",
+        "empty_filter",
+        "extra_filter_field",
+        "relative_date",
+        "missing_end",
+        "wide_window",
+        "stale_window",
+        "invalid_date",
+        "extra_date_field",
+        "numeric_date",
+    ],
+)
+async def test_drill_query_admits_no_arbitrary_filter_or_time_range(adapter, change):
+    from datetime import datetime, timedelta
+
+    body = adapter.sample_request(str(uuid.uuid4()), drill=True)
+    clause = body["filterGroup"][0]
+    if change == "other_key":
+        clause["key"] = "email"
+    elif change == "false_value":
+        clause["value"] = ["false"]
+    elif change == "bool_value":
+        clause["value"] = [True]
+    elif change == "operator":
+        clause["operator"] = "is_not"
+    elif change == "hogql":
+        clause["type"] = "hogql"
+    elif change == "extra_filter":
+        body["filterGroup"].append(dict(clause))
+    elif change == "empty_filter":
+        body["filterGroup"] = []
+    elif change == "extra_filter_field":
+        clause["other"] = "field"
+    elif change == "relative_date":
+        body["dateRange"]["date_from"] = "-7d"
+    elif change == "missing_end":
+        del body["dateRange"]["date_to"]
+    elif change == "invalid_date":
+        body["dateRange"]["date_to"] = "2026-99-99T00:00:00Z"
+    elif change == "extra_date_field":
+        body["dateRange"]["other"] = "date"
+    elif change == "numeric_date":
+        body["dateRange"]["date_to"] = 1
+    else:
+        names = ("date_from",) if change == "wide_window" else ("date_from", "date_to")
+        for name in names:
+            value = datetime.fromisoformat(body["dateRange"][name]) - timedelta(days=1)
+            body["dateRange"][name] = value.strftime("%Y-%m-%dT%H:%M:%SZ")
+    adapter.session_factory = lambda: pytest.fail("Rejected query opened a network session")
+    with pytest.raises(AlertError):
+        await adapter._request(adapter.test_config, "POST", "error_tracking/query/issue_events/", payload=body)
+
+
+async def test_two_queries_use_same_cutoff_even_when_clock_moves(adapter, monkeypatch):
+    import extras.posthog.alerts as module
+
+    now = module.time.time()
+    clock = [now]
+    monkeypatch.setattr(module.time, "time", lambda: clock[0])
+    issue = str(uuid.uuid4())
+    calls = []
+
+    async def request(config, method, path, **kwargs):
+        calls.append((method, path, kwargs))
+        clock[0] += 2
+        if method == "GET":
+            return {"id": issue, "name": "Error"}
+        return response()
+
+    adapter._request = request
+    result = await adapter.issue({"config": adapter.test_config}, issue)
+    first, second = (call[2]["payload"] for call in calls[1:])
+    assert first["dateRange"] == second["dateRange"]
+    assert result["sample"]["drill_status"] == "drill"
+    assert "00000000-0000-4000-8000-000000000001" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "sample_status,trigger_drill,prefix",
+    [
+        ("drill", False, "The sampled exception is a declared drill."),
+        ("unmarked", False, "The sampled exception has no declared drill marker."),
+        ("unknown", False, "Drill status of the sampled exception is unknown."),
+        ("unknown", True, "Deliberate drill."),
+    ],
+)
+async def test_worker_preserves_sample_scope_through_model_and_restart(
+    tmp_path, monkeypatch, sample_status, trigger_drill, prefix
+):
+    from src.core import alert_diagnosis
+    from src.core.base import LLMResponse
+    from tests.test_alert_lifecycle import Harness
+    from tests.test_alert_setup_ux import MemoryChannel
+
+    h = Harness(tmp_path)
+    room = MemoryChannel(401, guild=h.guild)
+    h.bot.client.fetch_channel = AsyncMock(return_value=room)
+    try:
+        source = h.source()
+        source = h.store.update(source["id"], config={**source["config"], "repo": str(tmp_path)})
+        h.store.receive(
+            source,
+            event_id=str(uuid.uuid4()),
+            issue_id=str(uuid.uuid4()),
+            kind="$error_tracking_issue_created",
+            message_id="600",
+            drill=trigger_drill,
+        )
+        provider = SimpleNamespace(
+            supports_tool_free=True, complete=AsyncMock(return_value=LLMResponse(content="Observed reporting path."))
+        )
+        manager = SimpleNamespace(
+            agent_configs={"worker": {"llm": {"model": "fixture"}}},
+            defaults={},
+            storage=None,
+            _apply_provider_override=lambda *args: None,
+            _get_agent_llm=lambda *args: provider,
+            _effective_model=lambda *args: "fixture",
+            active_turns=0,
+        )
+        monkeypatch.setattr(alert_diagnosis, "source_evidence", lambda *args: {"snippets": []})
+        adapter = SimpleNamespace(
+            issue=AsyncMock(return_value={"name": "Error", "sample": {"drill_status": sample_status}})
+        )
+        worker = alert_diagnosis.AlertWorker(h.store, {"posthog": adapter}, manager, h.alerts.transport, str(tmp_path))
+        await worker.once()
+        issue = json.loads(provider.complete.call_args.args[0][1].content)["issue"]
+        assert issue["sample"]["drill_status"] == sample_status
+        assert ("Deliberate drill:" in issue["alert_context"]) == trigger_drill
+        assert "test" not in issue and "setup_test" not in issue
+        assert provider.complete.call_args.kwargs["tool_free"] is True
+        h.store.close()
+        h.store = AlertStore(tmp_path)
+        h.alerts.transport.store = h.store
+        receipt = h.store.ready()[0]
+        assert receipt["sample_drill_status"] == sample_status
+        assert receipt["result"].startswith(prefix)
+        await h.alerts.transport.report(h.store.get(source["id"]), receipt)
+        assert len(room.messages) == 1 and prefix in room.messages[0].content
+    finally:
+        h.store.close()

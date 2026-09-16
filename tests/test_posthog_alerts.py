@@ -133,7 +133,10 @@ async def test_issues_use_fixed_get_and_positive_projection(fixture):
     assert WEBHOOK not in json.dumps(result) and KEY not in json.dumps(result)
     assert adapter._request.call_args_list[0].args[1:] == ("GET", f"error_tracking/issues/{issue}/")
     assert adapter._request.call_args.args[1:] == ("POST", "error_tracking/query/issue_events/")
-    assert adapter._request.call_args.kwargs["payload"] == adapter.sample_request(issue)
+    query = adapter._request.call_args_list[1].kwargs["payload"]
+    assert adapter._request.call_args.kwargs["payload"] == adapter.sample_request(issue, date_range=query["dateRange"])
+    assert adapter._request.await_count == 2  # No filtered query before an exception is available.
+    assert result["sample"]["availability"] == "empty" and result["sample"]["drill_status"] == "unknown"
     assert not adapter._request.call_args.kwargs.get("provisioning")
 
 
@@ -232,7 +235,8 @@ async def test_one_existing_key_serves_reads_and_provisioning_without_rewriting_
     session = FakeSession(FakeResponse(200, [b'{"results":[]}']))
     adapter.session_factory = lambda: session
     assert await adapter.check_credentials(source["config"]) == {
-        "read_access": True, "write_access": "not yet exercised"
+        "read_access": True,
+        "write_access": "not yet exercised",
     }
     await adapter._request(source["config"], "POST", "hog_functions/", provisioning=True, payload={})
     assert len(session.calls) == 2
@@ -268,11 +272,24 @@ async def test_mutation_requires_exact_completed_creation_record(fixture, operat
 
 
 @pytest.mark.parametrize("operation", ["test_delivery", "disable", "remove"])
-@pytest.mark.parametrize("changed", [
-    "id", "name", "webhook", "content", "template", "filters", "inputs_shape",
-    "template_missing", "template_null", "template_string", "template_no_id",
-    "template_conflict", "template_request_echo",
-])
+@pytest.mark.parametrize(
+    "changed",
+    [
+        "id",
+        "name",
+        "webhook",
+        "content",
+        "template",
+        "filters",
+        "inputs_shape",
+        "template_missing",
+        "template_null",
+        "template_string",
+        "template_no_id",
+        "template_conflict",
+        "template_request_echo",
+    ],
+)
 async def test_foreign_or_changed_destination_never_receives_mutation(fixture, operation, changed):
     store, source, adapter, _ = fixture
     destination_id = str(uuid.uuid4())
@@ -347,7 +364,7 @@ async def test_incident_request_rejects_malformed_uuid_before_http(fixture, issu
 async def test_incident_uuid_read_uses_default_path_and_ownership_get_is_explicit(fixture):
     _, source, adapter, _ = fixture
     issue_id, destination_id = str(uuid.uuid4()), str(uuid.uuid4())
-    session = FakeSession(FakeResponse(200, [b'{}']))
+    session = FakeSession(FakeResponse(200, [b"{}"]))
     adapter.session_factory = lambda: session
     await adapter._request(source["config"], "GET", f"error_tracking/issues/{issue_id}/")
     await adapter._request(source["config"], "GET", f"hog_functions/{destination_id}/", provisioning=True)
@@ -364,7 +381,8 @@ async def test_recovery_reads_full_candidate_after_minimal_list_card(fixture):
     adapter._request = AsyncMock(side_effect=[{"results": [card], "next": None}, full])
     assert await adapter.destination(source, WEBHOOK) == {"id": destination_id}
     assert [(c.args[1], c.args[2]) for c in adapter._request.call_args_list] == [
-        ("GET", "hog_functions/?limit=100&offset=0"), ("GET", f"hog_functions/{destination_id}/")
+        ("GET", "hog_functions/?limit=100&offset=0"),
+        ("GET", f"hog_functions/{destination_id}/"),
     ]
 
 
@@ -403,10 +421,15 @@ async def test_remove_uses_soft_delete_then_exact_404_and_complete_listing(fixtu
     destination_id = str(uuid.uuid4())
     remote = owned_destination(store, source, destination_id)
     remote["enabled"] = enabled
-    sessions = scripted_http(adapter, [
-        (200, remote), (200, {**remote, "enabled": False}),
-        (404, WEBHOOK.encode()), (200, {"results": [], "next": None}),
-    ])
+    sessions = scripted_http(
+        adapter,
+        [
+            (200, remote),
+            (200, {**remote, "enabled": False}),
+            (404, WEBHOOK.encode()),
+            (200, {"results": [], "next": None}),
+        ],
+    )
     await adapter.remove(source, destination_id)
     calls = [session.calls[0] for session in sessions]
     assert [args[0] for args, _ in calls] == ["GET", "PATCH", "GET", "GET"]
@@ -469,13 +492,19 @@ async def test_missing_destination_needs_all_list_pages_without_repeating_patch(
         await adapter.remove(source, destination_id)
 
 
-@pytest.mark.parametrize("page", [
-    {}, {"results": []}, {"results": [], "next": False}, {"results": [], "next": "more"},
-    {"results": [{"name": "missing id"}], "next": None},
-    {"results": [{"id": "bad"}], "next": None},
-    {"results": None, "next": None},
-    {"results": [{"id": "00000000-0000-0000-0000-000000000001"}] * 2, "next": None},
-])
+@pytest.mark.parametrize(
+    "page",
+    [
+        {},
+        {"results": []},
+        {"results": [], "next": False},
+        {"results": [], "next": "more"},
+        {"results": [{"name": "missing id"}], "next": None},
+        {"results": [{"id": "bad"}], "next": None},
+        {"results": None, "next": None},
+        {"results": [{"id": "00000000-0000-0000-0000-000000000001"}] * 2, "next": None},
+    ],
+)
 async def test_missing_destination_with_incomplete_listing_never_confirms_removal(fixture, page):
     store, source, adapter, _ = fixture
     destination_id = str(uuid.uuid4())
@@ -489,9 +518,12 @@ async def test_removal_scan_limit_is_not_absence(fixture):
     store, source, adapter, _ = fixture
     destination_id = str(uuid.uuid4())
     owned_destination(store, source, destination_id)
-    adapter._request = AsyncMock(side_effect=[DestinationNotFoundError("HTTP 404"), *[
-        {"results": [{"id": str(uuid.uuid4())} for _ in range(100)], "next": "more"} for _ in range(20)
-    ]])
+    adapter._request = AsyncMock(
+        side_effect=[
+            DestinationNotFoundError("HTTP 404"),
+            *[{"results": [{"id": str(uuid.uuid4())} for _ in range(100)], "next": "more"} for _ in range(20)],
+        ]
+    )
     with pytest.raises(AlertError, match="bounded scan"):
         await adapter.remove(source, destination_id)
     assert adapter._request.await_count == 21

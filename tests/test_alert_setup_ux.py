@@ -533,7 +533,8 @@ async def test_drill_marker_survives_restart_and_title_alone_does_not_classify(t
         )
         await worker.once()
         issue = json.loads(provider.complete.call_args.args[0][1].content)["issue"]
-        assert (issue.get("test") is True) == drill
+        assert ("Deliberate drill:" in issue["alert_context"]) == drill
+        assert "test" not in issue and "setup_test" not in issue
         assert h.store.ready()[0]["result"].startswith("Deliberate drill.") == drill
         assert provider.complete.call_args.kwargs["tools"] is None
     finally:
