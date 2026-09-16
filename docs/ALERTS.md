@@ -53,7 +53,7 @@ for example `secrets/posthog-api-key`. Existing plain tokens are accepted withou
 rewriting the vault or requiring the key to be entered again. The final setup
 confirmation includes the API host and reference. Credential names do not prove
 scopes; an all-access key remains all-access, while the incident path permits
-only fixed issue reads and one strictly shaped read-only sample POST, and
+only fixed issue reads and two strictly shaped read-only sample POST variants, and
 never gives that key to the model.
 
 For a repository URL, setup finds local clones under `repository_roots` by
@@ -182,7 +182,7 @@ Phase 1. Inspect the recorded setup rather than deleting its journal.
   queued and visible, instead of falling into the normal bot-chain suppression.
   A queue at 1,000 outstanding receipts pauses intake and reports overflow.
   Events arriving while paused are not queued; review the vendor for that gap.
-  The worker edits one status message through queued, investigating, progress and
+  The worker edits one status message through queued, waiting for stack trace, investigating, progress and
   the final diagnosis or held result. A rate-limit notice appears only after
   actual deferral. API request budgets are shared across sources on the same host.
 
@@ -327,7 +327,14 @@ in the guild. Legacy start/result markers remain recoverable.
 The deterministic delivery test is labelled as a setup test. New PostHog
 created/reopened notifications carry an explicit drill bit derived only from
 `event.properties.test == true`; names containing "test" are not evidence.
-Spiking and manual transitions can lack exception properties and remain unknown.
+Spiking and manual transitions can lack trigger-specific exception properties.
+A second fixed `test=true` filtered query can classify the recent sample, including
+for legacy destinations, only when its exception UUID matches the unfiltered
+sample. The event IDs are compared internally and excluded from model input.
+A sample with no filtered match is unmarked, not proven to be a production fault.
+Empty windows or mismatched identities remain unknown. Both requests use the
+same explicit seven-day UTC window, and channel wording distinguishes a sampled
+drill from the triggering event or the issue as a whole.
 The diagnostic prompt distinguishes a marked drill from a production fault and
 asks for verification of the reporting path. It never authorizes execution,
 fixes, resolving an issue or changing the debug route.
@@ -350,3 +357,36 @@ Compiled line numbers are explicitly not presented as source-map resolutions.
 When no frame resolves, the old bounded keyword fallback remains, labelled as a
 fallback with the unresolved frames exposed. The sample is recent evidence, not
 proof that it is the exact lifecycle-triggering exception.
+
+
+Lifecycle notifications can precede exception-query indexing. Before invoking
+its diagnostic model, the worker waits for a nonempty exception sample for up to
+90 seconds from its first read attempt. Confirmed empty reads schedule retries
+after 5, 10, 15, 20 and 30 seconds, capped at that original deadline. A scheduled
+receipt releases its lease and the worker; there is no per-source lock or task
+sleep across the delay. The same status message says "Waiting for stack trace."
+
+The deadline, next scheduled time, empty-read count and projected evidence are
+stored in SQLite. Restarting between polls preserves the wait. A process killed
+during a read or model call still follows the existing six-minute interrupted
+lease recovery and three-interruption limit; neither restart nor lease recovery
+resets the evidence deadline. Once obtained, the bounded projected sample is
+checkpointed for model retries, without raw event/person/session identifiers or
+captured variables. This uses two idempotent receipt-column migrations; existing
+registrations, receipt IDs, state and destination ownership are preserved.
+
+Scheduled evidence reads reuse their receipt's diagnosis reservation because no
+model has run yet. Genuine interrupted attempts still consume another diagnosis
+reservation. Every vendor request retains the shared host API budget. No filtered
+drill query is sent for an empty sample; a nonempty sample receives the same fixed
+filtered query and identity comparison as before. A returned exception without
+application frames can proceed with an explicitly limited source fallback.
+
+At the deadline, a previously observed empty response permits a limited keyword
+diagnosis that plainly says the stack trace was not yet available. An empty read
+cannot distinguish indexing delay from no matching events in the checked window.
+An issue-summary HTTP 404 instead holds diagnosis with "could not find this issue".
+Other read errors and timeouts before any sample response are held, not reported
+as empty evidence. Network reads are bounded by the remaining wait time; service
+load, Discord delivery, interrupted leases and model execution can add time to
+the overall alert. Human-facing drill wording avoids implementation field names.

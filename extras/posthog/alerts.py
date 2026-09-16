@@ -9,6 +9,7 @@ import json
 import re
 import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from urllib.parse import urlparse
 
 import aiohttp
@@ -78,7 +79,12 @@ def sampled_exception(data):
     if not isinstance(data, dict) or not isinstance(data.get("results"), list) or len(data["results"]) > 1:
         raise AlertError("PostHog sampled-event response changed; diagnosis has no verified stack")
     if not data["results"]:
-        return {"exceptions": [], "status": "No sampled event in the endpoint's default seven-day window"}
+        return {
+            "exceptions": [],
+            "availability": "empty",
+            "status": "No exception sample returned yet in the checked seven-day window. "
+            "This can mean indexing delay or no matching events; an empty read does not distinguish them.",
+        }
     event = data["results"][0]
     if not isinstance(event, dict) or not isinstance(event.get("properties"), dict):
         raise AlertError("PostHog sampled-event properties are unavailable")
@@ -143,9 +149,32 @@ def sampled_exception(data):
             releases.append(release)
     return {
         "exceptions": exceptions,
+        "availability": "available",
         "releases": releases,
         "status": "One recent sampled exception event; not necessarily the triggering event",
     }
+
+
+def sample_drill_status(sample, filtered):
+    """Classify only the same sampled exception, never every event in its issue."""
+    for data in (sample, filtered):
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("results"), list)
+            or len(data["results"]) > 1
+            or any(not isinstance(row, dict) for row in data["results"])
+        ):
+            return "unknown"
+    if not sample["results"]:
+        return "unknown"
+    try:
+        event_id = str(uuid.UUID(sample["results"][0]["uuid"]))
+        if not filtered["results"]:
+            return "unknown" if filtered.get("hasMore") else "unmarked"
+        filtered_id = str(uuid.UUID(filtered["results"][0]["uuid"]))
+    except (ValueError, TypeError, AttributeError, KeyError):
+        return "unknown"
+    return "drill" if event_id == filtered_id else "unknown"
 
 
 class DestinationNotFoundError(AlertError):
@@ -237,22 +266,43 @@ class PostHogAdapter:
             return False
 
     @staticmethod
-    def sample_request(issue_id):
-        return {
+    def sample_request(issue_id, *, date_range=None, drill=False):
+        if date_range is None:
+            end = datetime.fromtimestamp(time.time(), UTC).replace(microsecond=0)
+            date_range = {
+                "date_from": (end - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "date_to": end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        body = {
             "issueId": str(uuid.UUID(issue_id)),
             "limit": 1,
             "onlyAppFrames": True,
             "filterTestAccounts": False,
             "include": ["exception", "stacktrace", "release"],
+            "dateRange": dict(date_range),
         }
+        if drill:
+            body["filterGroup"] = [{"key": "test", "value": ["true"], "operator": "exact", "type": "event"}]
+        return body
 
     @classmethod
     def _sample_request_allowed(cls, resource, payload):
         if resource != "error_tracking/query/issue_events/" or not isinstance(payload, dict):
             return False
         try:
+            window = payload["dateRange"]
+            if not isinstance(window, dict) or set(window) != {"date_from", "date_to"}:
+                return False
+            dates = []
+            for name in ("date_from", "date_to"):
+                value = window[name]
+                if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", value):
+                    return False
+                dates.append(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC))
+            if dates[1] - dates[0] != timedelta(days=7) or not -60 <= time.time() - dates[1].timestamp() <= 300:
+                return False
             return (
-                payload == cls.sample_request(payload["issueId"])
+                payload == cls.sample_request(payload["issueId"], date_range=window, drill="filterGroup" in payload)
                 and type(payload["limit"]) is int
                 and payload["onlyAppFrames"] is True
                 and payload["filterTestAccounts"] is False
@@ -289,6 +339,13 @@ class PostHogAdapter:
                         and re.fullmatch(r"hog_functions/[0-9a-f-]{36}/", resource)
                     ):
                         raise DestinationNotFoundError("PostHog destination GET returned HTTP 404")
+                    if (
+                        response.status == 404
+                        and not provisioning
+                        and method == "GET"
+                        and re.fullmatch(r"error_tracking/issues/[0-9a-f-]{36}/", resource)
+                    ):
+                        raise AlertError("PostHog could not find this issue (HTTP 404); diagnosis is held")
                     if response.status not in (200, 201, 204):
                         # Never include response bodies, request data, or exceptions.
                         raise AlertError(
@@ -560,10 +617,25 @@ class PostHogAdapter:
             "volume",
         )
         issue = {key: clean_text(data[key]) for key in fields if isinstance(data.get(key), (str, int, float))}
-        sample = await self._request(
-            source["config"], "POST", "error_tracking/query/issue_events/", payload=self.sample_request(issue_id)
-        )
+        query = self.sample_request(issue_id)
+        sample = await self._request(source["config"], "POST", "error_tracking/query/issue_events/", payload=query)
         issue["sample"] = sampled_exception(sample)
+        if issue["sample"]["availability"] == "empty":
+            issue["sample"]["drill_status"] = "unknown"
+            return issue
+        # Both reads share an absolute window; a later ingestion can still change
+        # membership, so matching the sampled event identity remains necessary.
+        filtered = await self._request(
+            source["config"],
+            "POST",
+            "error_tracking/query/issue_events/",
+            payload=self.sample_request(issue_id, date_range=query["dateRange"], drill=True),
+        )
+        issue["sample"]["drill_status"] = sample_drill_status(sample, filtered)
+        issue["sample"]["drill_scope"] = (
+            "The recent sampled exception only, not the triggering lifecycle event or every event in this issue. "
+            "Unmarked means no declared test=true match; it is not proof of a production defect."
+        )
         return issue
 
     async def disable(self, source, destination_id):

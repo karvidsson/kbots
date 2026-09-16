@@ -80,6 +80,11 @@ class AlertStore:
             self.db.execute("ALTER TABLE sources ADD COLUMN waiting INTEGER NOT NULL DEFAULT 1")
         if "presentation" not in {row["name"] for row in self.db.execute("PRAGMA table_info(receipts)")}:
             self.db.execute("ALTER TABLE receipts ADD COLUMN presentation TEXT NOT NULL DEFAULT '{}'")
+        receipt_columns = {row["name"] for row in self.db.execute("PRAGMA table_info(receipts)")}
+        if "evidence" not in receipt_columns:
+            self.db.execute("ALTER TABLE receipts ADD COLUMN evidence TEXT NOT NULL DEFAULT '{}'")
+        if "evidence_retry" not in receipt_columns:
+            self.db.execute("ALTER TABLE receipts ADD COLUMN evidence_retry INTEGER NOT NULL DEFAULT 0")
         # A restart during local lookup must not strand an unfinished draft.
         self.db.execute("UPDATE sources SET waiting=1 WHERE state='draft' AND waiting=0")
         # Existing cleaned rows only establish a disable, never a removal.
@@ -379,7 +384,9 @@ class AlertStore:
             row = self.db.execute(
                 "SELECT r.* FROM receipts r JOIN sources s ON s.id=r.source_id "
                 "WHERE r.state='pending' AND r.available<=? AND r.revision=s.revision "
-                "AND s.state IN ('active','provisional')" + account_filter + " ORDER BY r.created LIMIT 1",
+                "AND s.state IN ('active','provisional')"
+                + account_filter
+                + " ORDER BY r.evidence_retry DESC,r.created LIMIT 1",
                 (now, *account_values),
             ).fetchone()
             if not row:
@@ -389,30 +396,84 @@ class AlertStore:
             bucket = int(now // 3600)
             scope = "diagnosis:" + row["source_id"]
             used = self.db.execute("SELECT used FROM budgets WHERE scope=? AND bucket=?", (scope, bucket)).fetchone()
-            if used and used[0] >= 12:
+            if not row["evidence_retry"] and used and used[0] >= 12:
                 self.notify_lifecycle(
                     self.get(row["source_id"]),
                     "Diagnosis deferred until the next hour: this app has used its 12 diagnoses for this hour.",
                     f"budget:{row['source_id']}:{bucket}",
                 )
                 self.db.execute(
-                    "UPDATE receipts SET available=? WHERE source_id=? AND state='pending' AND available<?",
+                    "UPDATE receipts SET available=? WHERE source_id=? AND state='pending' "
+                    "AND evidence_retry=0 AND available<?",
                     ((bucket + 1) * 3600, row["source_id"], (bucket + 1) * 3600),
                 )
                 return None
-            self.db.execute(
-                "INSERT INTO budgets VALUES(?,?,1) ON CONFLICT(scope,bucket) DO UPDATE SET used=used+1", (scope, bucket)
-            )
+            # An empty evidence read has not invoked a model. Its scheduled
+            # continuation uses the original diagnosis reservation. Interrupted
+            # leases still consume another reservation, as before.
+            if not row["evidence_retry"]:
+                self.db.execute(
+                    "INSERT INTO budgets VALUES(?,?,1) ON CONFLICT(scope,bucket) DO UPDATE SET used=used+1",
+                    (scope, bucket),
+                )
             lease = uuid.uuid4().hex
             self.db.execute(
-                "UPDATE receipts SET state='running',lease=?,lease_until=?,attempts=attempts+1,updated=? WHERE id=?",
+                "UPDATE receipts SET state='running',lease=?,lease_until=?,attempts=attempts+1,"
+                "evidence_retry=0,updated=? WHERE id=?",
                 (lease, now + lease_seconds, now, row["id"]),
             )
             receipt = dict(self.db.execute("SELECT * FROM receipts WHERE id=?", (row["id"],)).fetchone())
-            return {**receipt, **json.loads(receipt["presentation"])}
+            return self._receipt(receipt)
+
+    @staticmethod
+    def _receipt(row):
+        return {**dict(row), **json.loads(row["presentation"]), "evidence": json.loads(row["evidence"])}
+
+    def checkpoint_evidence(self, receipt, evidence):
+        changed = self.db.execute(
+            "UPDATE receipts SET evidence=?,updated=? WHERE id=? AND lease=? AND state='running' "
+            "AND EXISTS (SELECT 1 FROM sources s WHERE s.id=source_id AND s.revision=receipts.revision "
+            "AND s.state IN ('active','provisional'))",
+            (json.dumps(evidence), time.time(), receipt["id"], receipt["lease"]),
+        ).rowcount
+        if changed:
+            receipt["evidence"] = evidence
+        return changed == 1
+
+    def defer_evidence(self, receipt, issue, now=None):
+        """Yield the lease after a confirmed empty read; no sleep or I/O in a transaction."""
+        now = time.time() if now is None else now
+        evidence = dict(receipt["evidence"])
+        if evidence["deadline"] <= now:
+            return False
+        delays = (5, 10, 15, 20, 30)
+        poll = evidence.get("empty_reads", 0)
+        available = min(evidence["deadline"], now + delays[min(poll, len(delays) - 1)])
+        evidence.update(status="waiting", issue=issue, empty_reads=poll + 1)
+        changed = self.db.execute(
+            "UPDATE receipts SET evidence=?,evidence_retry=1,state='pending',available=?,"
+            "lease=NULL,lease_until=NULL,attempts=attempts-1,updated=? "
+            "WHERE id=? AND lease=? AND state='running' AND EXISTS "
+            "(SELECT 1 FROM sources s WHERE s.id=source_id AND s.revision=receipts.revision "
+            "AND s.state IN ('active','provisional'))",
+            (json.dumps(evidence), available, now, receipt["id"], receipt["lease"]),
+        ).rowcount
+        if changed:
+            receipt.update(evidence=evidence, state="pending", available=available)
+        return changed == 1
+
+    def next_delay(self, accounts=None):
+        account_filter, account_values = self._accounts(accounts)
+        row = self.db.execute(
+            "SELECT min(r.available) FROM receipts r JOIN sources s ON s.id=r.source_id "
+            "WHERE r.state='pending' AND r.revision=s.revision "
+            "AND s.state IN ('active','provisional')" + account_filter,
+            account_values,
+        ).fetchone()
+        return 15 if row[0] is None else max(0.1, min(15, row[0] - time.time()))
 
     def annotate(self, receipt, **values):
-        allowed = {"issue_name", "setup_test", "drill"}
+        allowed = {"issue_name", "setup_test", "drill", "sample_drill_status"}
         if set(values) - allowed:
             raise AlertError("Invalid incident presentation")
         self.db.execute(
@@ -435,7 +496,7 @@ class AlertStore:
     def pending(self, accounts=None):
         account_filter, account_values = self._accounts(accounts)
         return [
-            dict(r)
+            self._receipt(r)
             for r in self.db.execute(
                 "SELECT r.* FROM receipts r JOIN sources s ON s.id=r.source_id "
                 "WHERE r.state='pending' AND r.revision=s.revision AND s.state IN ('active','provisional')"
@@ -448,7 +509,7 @@ class AlertStore:
     def ready(self, accounts=None):
         account_filter, account_values = self._accounts(accounts)
         return [
-            {**dict(r), **json.loads(r["presentation"])}
+            self._receipt(r)
             for r in self.db.execute(
                 "SELECT r.* FROM receipts r JOIN sources s ON s.id=r.source_id "
                 "WHERE r.state='ready' AND r.revision=s.revision "

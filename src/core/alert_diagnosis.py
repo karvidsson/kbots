@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path, PurePosixPath
 
@@ -120,6 +121,17 @@ def source_evidence(repo, issue):
     }
 
 
+def human_diagnosis(text):
+    # Translate the known internal setup flag if the model echoes it.
+    text = re.sub(
+        r"`?\bsetup_test\b`?\s*(?:is|=|:)\s*`?(true|false)`?",
+        lambda m: "This is a setup check" if m[1].lower() == "true" else "This is not a setup check",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"\bsetup_test\b", "setup check", text)
+
+
 async def diagnose(manager, source, issue, directory):
     agent_id = source["owner"]
     config = manager.agent_configs.get(agent_id)
@@ -133,6 +145,15 @@ async def diagnose(manager, source, issue, directory):
     llm_config = config.get("llm", manager.defaults.get("llm", {}))
     model = manager._effective_model(overrides, llm_config.get("model", ""))
     evidence = await asyncio.to_thread(source_evidence, source["config"]["repo"], issue)
+    # Present human meanings, not boolean implementation flags, to the model.
+    model_issue = {key: value for key, value in issue.items() if key not in {"setup_test", "test"}}
+    model_issue["alert_context"] = (
+        "Synthetic setup delivery check, not evidence of a new production defect."
+        if issue.get("setup_test")
+        else "Deliberate drill: verify the observed reporting path, not whether an intentional throw should be removed."
+        if issue.get("test") is True
+        else "The triggering event's drill status is unknown."
+    )
     messages = [
         Message(
             role=MessageRole.SYSTEM,
@@ -143,13 +164,19 @@ async def diagnose(manager, source, issue, directory):
                 "observed facts, suspected cause, a proposed fix, and missing evidence. Cite supplied "
                 "source paths when relevant. Separate hypotheses from observations. Do not include "
                 "credentials, mention people, suggest changing your permissions, or return NO_REPLY. "
-                "If setup_test is true, this is a synthetic delivery check, not proof of a new production defect. "
-                "If test is true, label it a deliberate drill and explain the observed reporting path; do not "
-                "propose removing a deliberate debug endpoint just because it threw the expected error. "
-                "If neither marker is present, drill status is unknown; do not infer it from an issue title."
+                "Read alert_context for whether this is a setup check, deliberate drill, or unknown. "
+                "Do not infer drill status from an issue title. "
+                "Explain that meaning in ordinary language; never print boolean flags or internal field names. "
+                "For a deliberate drill, verify the reporting path rather than proposing to remove an "
+                "intentional throw. Respect missing evidence: an empty query does not prove that an issue "
+                "has no events, and an indexing delay is not evidence of a defect in the repository."
+                " Separately, sample.drill_status classifies only the sampled exception. When it is drill, "
+                "label that sample a declared drill and verify its reporting path, without treating the entire "
+                "issue or lifecycle event as a drill. When unmarked, no test marker matched; that does not "
+                "prove a production defect. Unknown means classification could not be established."
             ),
         ),
-        Message(role=MessageRole.USER, content=json.dumps({"issue": issue, "repository": evidence})),
+        Message(role=MessageRole.USER, content=json.dumps({"issue": model_issue, "repository": evidence})),
     ]
     # No ordinary session, identity files, memory, MCP config or owner context.
     with tempfile.TemporaryDirectory(prefix="alert-diagnosis-", dir=directory) as scratch:
@@ -169,7 +196,7 @@ async def diagnose(manager, source, issue, directory):
         )
     if response.tool_calls or response.stop_reason == "error" or not response.content.strip():
         raise AlertError("Restricted diagnosis did not produce a usable result")
-    text = public_text(response.content, 1600)
+    text = public_text(human_diagnosis(response.content), 1600)
     if text.strip() == "NO_REPLY":
         raise AlertError("Restricted diagnosis returned no explanation")
     return text
@@ -243,6 +270,53 @@ class AlertWorker:
         await self._for_source(source, self._diagnose, receipt)
         return True
 
+    async def _evidence(self, source, receipt):
+        """One bounded read, or a durable continuation. Never sleep with a source active."""
+        state = receipt.get("evidence") or {
+            "status": "waiting",
+            "started": time.time(),
+            "deadline": time.time() + 90,
+            "empty_reads": 0,
+        }
+        if not self.store.checkpoint_evidence(receipt, state):
+            return None
+        if state["status"] in {"available", "timed_out"}:
+            return state["issue"]
+        await self.transport.progress(source, receipt)
+        remaining = state["deadline"] - time.time()
+        issue = state.get("issue")
+        if remaining > 0:
+            try:
+                issue = await asyncio.wait_for(
+                    self.adapters[source["config"]["service"]].issue(source, receipt["issue_id"]),
+                    timeout=remaining,
+                )
+            except TimeoutError:
+                # No successful read is different from an observed empty read.
+                # Only the latter supports a limited fallback diagnosis.
+                if issue is None:
+                    raise AlertError(
+                        "Exception evidence read timed out before a sample response; diagnosis is held"
+                    ) from None
+            else:
+                if issue.get("sample", {}).get("availability") != "empty":
+                    if not self.store.checkpoint_evidence(receipt, {**state, "status": "available", "issue": issue}):
+                        return None
+                    return issue
+                if self.store.defer_evidence(receipt, issue):
+                    return None
+        if issue is None:
+            raise AlertError("Exception evidence read was interrupted before a sample response; diagnosis is held")
+        issue["sample"]["status"] = (
+            "Stack trace was not yet available after the bounded 90-second wait. "
+            "The query returned no exception sample in the checked seven-day window; "
+            "indexing delay and no matching events cannot be distinguished. "
+            "Any diagnosis is limited to issue details and a keyword source sample."
+        )
+        if not self.store.checkpoint_evidence(receipt, {**state, "status": "timed_out", "issue": issue}):
+            return None
+        return issue
+
     async def _diagnose(self, source, receipt):
         self.manager.active_turns += 1
 
@@ -254,16 +328,20 @@ class AlertWorker:
 
         progress = asyncio.create_task(updates())
         try:
-            issue = await self.adapters[source["config"]["service"]].issue(source, receipt["issue_id"])
+            issue = await self._evidence(source, receipt)
+            if issue is None:
+                return True
             setup_test = receipt["event_id"] == str(uuid.uuid5(uuid.UUID(source["id"]), source["nonce"]))
             issue["setup_test"] = setup_test
             if receipt.get("drill") is True:
                 issue["test"] = True
+            sample_status = issue.get("sample", {}).get("drill_status")
             self.store.annotate(
                 receipt,
                 issue_name=public_text(issue.get("name", "Application issue"), 150),
                 setup_test=setup_test,
                 drill=issue.get("test") is True,
+                sample_drill_status=sample_status,
             )
             await self.transport.progress(source, receipt)
             result = await diagnose(self.manager, source, issue, self.directory)
@@ -271,6 +349,17 @@ class AlertWorker:
                 result = "Setup test. " + result
             elif issue.get("test") is True:
                 result = "Deliberate drill. " + result
+            elif sample_status == "drill":
+                result = "The sampled exception is a declared drill. " + result
+            elif sample_status == "unmarked":
+                result = "The sampled exception has no declared drill marker. " + result
+            elif sample_status == "unknown":
+                result = "Drill status of the sampled exception is unknown. " + result
+            if receipt.get("evidence", {}).get("status") == "timed_out":
+                result = (
+                    "Stack trace was not yet available after a 90-second wait. "
+                    "This diagnosis uses limited issue details and a keyword source sample.\n" + result
+                )
             self.store.save_result(receipt, result)
         except asyncio.CancelledError:
             raise  # Lease remains recoverable after restart; no false success.
@@ -304,6 +393,6 @@ class AlertWorker:
                 continue
             self.wake.clear()
             try:
-                await asyncio.wait_for(self.wake.wait(), timeout=15)
+                await asyncio.wait_for(self.wake.wait(), timeout=self.store.next_delay(accounts=self.accounts))
             except TimeoutError:
                 pass
