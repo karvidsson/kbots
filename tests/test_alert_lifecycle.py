@@ -37,7 +37,7 @@ class Harness:
         self.connector._alerts = self.alerts
         self.bot = DiscordBot("one", self.connector, admin_users=["101"])
         self.user = SimpleNamespace(id=999)
-        self.guild = SimpleNamespace(id=301, fetch_member=AsyncMock(return_value=self.user))
+        self.guild = SimpleNamespace(id=301, me=self.user, fetch_member=AsyncMock(return_value=self.user))
         self.room = SimpleNamespace(id=401, guild=self.guild, flags=0, name="sample")
         self.home_messages = []
 

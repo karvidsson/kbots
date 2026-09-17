@@ -12,9 +12,10 @@ import discord
 from discord import app_commands
 from discord.state import ConnectionState
 
+from src.connectors.alert_embeds import incident_embed, incident_message, status_nonce
 from src.core.alert_channels import AlertError, AlertStore, ensure_operation
 from src.core.alert_credentials import CredentialEntry
-from src.core.alert_diagnosis import AlertWorker, incident_label, public_prose, public_text
+from src.core.alert_diagnosis import AlertWorker, public_prose, public_text
 from src.core.alert_errors import failure_reason, log_failure
 from src.core.alert_lifecycle import AlertLifecycle
 from src.core.alert_operator import OperatorRehearsal
@@ -74,7 +75,7 @@ class AlertChannelClient(discord.Client):
 
 
 def has_marker(message, marker):
-    return (message.content.endswith(marker) or message.content.endswith("||" + marker + "||")) or any(
+    return ((message.content or "").endswith(marker) or (message.content or "").endswith("||" + marker + "||")) or any(
         getattr(getattr(embed, "footer", None), "text", None) == marker for embed in getattr(message, "embeds", [])
     )
 
@@ -94,6 +95,7 @@ class DiscordAlertTransport:
     def __init__(self, connector, store):
         self.connector, self.store = connector, store
         self.message_locks = {}
+        self.named_webhooks = set()
 
     def bot(self, source):
         bot = self.connector.bots.get(source["account"])
@@ -246,6 +248,100 @@ class DiscordAlertTransport:
         channel = await self.channel(source)
         return await channel.send(public_text(text), allowed_mentions=discord.AllowedMentions.none())
 
+    @staticmethod
+    def webhook_name(source):
+        return "PostHog alerts" if source["config"]["service"] == "posthog" else "Application alerts"
+
+    def webhook_url(self, source):
+        url = self.connector.vault.get(f"secrets/alert-webhook-{source['id']}-r{source['revision']}")
+        match = re.fullmatch(
+            r"https://(?:canary\.|ptb\.)?discord(?:app)?\.com/api(?:/v[0-9]+)?/webhooks/"
+            r"([1-9][0-9]{0,19})/([A-Za-z0-9._-]{1,256})",
+            url if isinstance(url, str) else "",
+        )
+        if not match or (source.get("webhook_id") and match[1] != source["webhook_id"]):
+            raise AlertError("Owned webhook credential is unavailable or changed")
+        return url, match[1]
+
+    def current_webhook(self, source):
+        current = self.store.get(source["id"])
+        if not current or any(
+            current[k] != source[k] for k in ("revision", "account", "guild_id", "channel_id", "webhook_id")
+        ):
+            raise AlertError("Registration changed before webhook operation")
+        if current["state"] not in {"active", "provisional"}:
+            raise AlertError("Registration is no longer active")
+        operation = self.store.db.execute(
+            "SELECT state,result FROM operations WHERE source_id=? AND revision=? AND step='webhook'",
+            (source["id"], source["revision"]),
+        ).fetchone()
+        if (
+            not operation
+            or operation["state"] != "complete"
+            or json.loads(operation["result"]) != {"id": source["webhook_id"]}
+        ):
+            raise AlertError("Webhook creation ownership is not confirmed")
+        return current
+
+    async def discard_accepted(self, source, message, event):
+        """Delete only an owned parsed envelope whose exact incident is committed."""
+        try:
+            self.current_webhook(source)
+            if self.store.db.in_transaction:
+                raise AlertError("Receipt is not committed; raw alert retained")
+            accepted = self.store.db.execute(
+                "SELECT id FROM receipts WHERE source_id=? AND revision=? AND event_id=? AND issue_id=? AND kind=?",
+                (source["id"], source["revision"], event["event_id"], event["issue_id"], event["kind"]),
+            ).fetchone()
+            if (
+                not accepted
+                or str(message.webhook_id) != source["webhook_id"]
+                or str(message.channel.id) != source["channel_id"]
+            ):
+                raise AlertError("Raw message is not an accepted owned alert")
+            url, _ = self.webhook_url(source)
+            hook = discord.Webhook.from_url(url, client=self.bot(source).client)
+            async with asyncio.timeout(10):
+                await hook.delete_message(int(message.id))
+        except discord.NotFound as error:
+            if error.code != 10008:  # The exact message is already absent.
+                log_failure(error, "accepted webhook message deletion")
+        except Exception as error:
+            log_failure(error, "accepted webhook message deletion")
+
+    async def refresh_webhook_name(self, source):
+        key = (source["id"], source["revision"])
+        if (
+            key in self.named_webhooks
+            or not source.get("webhook_id")
+            or source["state"] not in {"active", "provisional"}
+        ):
+            return
+        try:
+            self.current_webhook(source)
+            url, _ = self.webhook_url(source)
+            client = self.bot(source).client
+            async with asyncio.timeout(10):
+                remote = await client.fetch_webhook(int(source["webhook_id"]))
+                if (
+                    str(remote.id) != source["webhook_id"]
+                    or str(remote.channel_id) != source["channel_id"]
+                    or str(remote.guild_id) != source["guild_id"]
+                    or not remote.user
+                    or remote.user.id != client.user.id
+                    or remote.name not in {self.webhook_name(source), f"kbots-{source['id']}-r{source['revision']}"}
+                ):
+                    raise AlertError("Webhook ownership or name changed; rename refused")
+                self.current_webhook(source)
+                if remote.name != self.webhook_name(source):
+                    hook = discord.Webhook.from_url(url, client=client)
+                    updated = await hook.edit(name=self.webhook_name(source), prefer_auth=False)
+                    if str(updated.id) != source["webhook_id"] or updated.name != self.webhook_name(source):
+                        raise AlertError("Webhook rename was not confirmed")
+                self.named_webhooks.add(key)
+        except Exception as error:
+            log_failure(error, "webhook display name")
+
     async def provision(self, source):
         source = self.store.require_setup(source)
         bot = self.bot(source)
@@ -293,7 +389,8 @@ class DiscordAlertTransport:
         channel = await self.channel(source)
         if getattr(channel, "topic", None) != marker:
             raise AlertError("Channel setup marker changed; refusing provisioning")
-        webhook_name = f"kbots-{source['id']}-r{source['revision']}"
+        legacy_name = f"kbots-{source['id']}-r{source['revision']}"
+        webhook_name = self.webhook_name(source)
         secret_ref = f"secrets/alert-webhook-{source['id']}-r{source['revision']}"
 
         def retain(webhook):
@@ -303,15 +400,24 @@ class DiscordAlertTransport:
             return {"id": str(webhook.id)}
 
         async def find_webhook():
+            saved_id = None
+            if self.connector.vault.get(secret_ref):
+                _, saved_id = self.webhook_url(source)
+            # A human name alone cannot recover an ambiguous create. The legacy
+            # unique name or the durable credential's ID is required.
             return [
                 retain(w)
                 for w in await channel.webhooks()
-                if w.name == webhook_name and w.user and w.user.id == bot.client.user.id
+                if (str(w.id) == saved_id if saved_id else w.name == legacy_name)
+                and w.user
+                and w.user.id == bot.client.user.id
             ]
 
         async def create_webhook():
             self.store.require_setup(source)
-            return retain(await channel.create_webhook(name=webhook_name))
+            result = retain(await channel.create_webhook(name=webhook_name))
+            self.named_webhooks.add((source["id"], source["revision"]))
+            return result
 
         self.store.require_setup(source)
         webhook = await ensure_operation(self.store, source, "webhook", find_webhook, create_webhook)
@@ -322,7 +428,7 @@ class DiscordAlertTransport:
             raise AlertError("Setup webhook credential is unavailable; rotate the registration")
         return source, url
 
-    async def _notice(self, source, receipt, step, text):
+    async def _notice(self, source, receipt, step, embed):
         """One editable status per receipt; recover old start/result messages too."""
         async with self.message_locks.setdefault(receipt["id"], asyncio.Lock()):
             current = self.store.get(source["id"])
@@ -339,12 +445,16 @@ class DiscordAlertTransport:
                 return None
             channel = await self.channel(source)
             bot_id = self.bot(source).client.user.id
+            nonce = status_nonce(receipt)
             marker = f"[alert:{receipt['id']}:status]"
             old_result = f"[alert:{receipt['id']}:result]"
             old_start = f"[alert:{receipt['id']}:start]"
 
             async def find():
                 messages = [m async for m in channel.history(limit=100) if m.author.id == bot_id and not m.webhook_id]
+                matches = [{"id": str(m.id)} for m in messages if getattr(m, "nonce", None) == nonce]
+                if matches:
+                    return matches
                 for tag in (marker, old_result, old_start):
                     matches = [{"id": str(m.id)} for m in messages if has_marker(m, tag)]
                     if matches:
@@ -360,7 +470,7 @@ class DiscordAlertTransport:
                 ):
                     raise AlertError("Registration changed before posting")
                 message = await channel.send(
-                    **marked_message(text, marker, channel), allowed_mentions=discord.AllowedMentions.none()
+                    **incident_message(embed, channel), nonce=nonce, allowed_mentions=discord.AllowedMentions.none()
                 )
                 return {"id": str(message.id)}
 
@@ -373,15 +483,14 @@ class DiscordAlertTransport:
                 return json.loads(legacy["result"])
             result = await ensure_operation(self.store, source, "status:" + receipt["id"], find, create)
             message = await channel.fetch_message(int(result["id"]))
-            if (
-                message.author.id != bot_id
-                or message.webhook_id
-                or not any(has_marker(message, tag) for tag in (marker, old_result, old_start))
-            ):
+            if message.author.id != bot_id or message.webhook_id or str(message.id) != result["id"]:
                 raise AlertError("Diagnosis status message changed; refusing to edit it")
             # Repeat edits are safe after a lost edit response. Repeat sends are not.
-            formatted = marked_message(text, marker, channel)
-            if message.content != formatted["content"] or not has_marker(message, marker):
+            formatted = incident_message(embed, channel)
+            expected_embeds = [formatted["embed"].to_dict()] if formatted["embed"] else []
+            if (message.content or "") != formatted["content"] or [
+                e.to_dict() for e in message.embeds
+            ] != expected_embeds:
                 current = self.store.get(source["id"])
                 if (
                     not current
@@ -395,69 +504,27 @@ class DiscordAlertTransport:
                 )
             return result
 
-    @staticmethod
-    def incident_title(source, receipt):
-        config = source["config"]
-        label = receipt.get("issue_title")
-        if not label:
-            if not receipt.get("issue_name"):
-                # Before the first issue read, show status without inventing a link label.
-                return public_text(config.get("app", "Application"), 80)
-            label = incident_label(source, {"name": receipt["issue_name"]})
-        title = public_text(label, 80).replace("[", "(").replace("]", ")")
-        if config.get("host") and config.get("project"):
-            title = f"[{title}]({config['host']}/project/{config['project']}/error_tracking/{receipt['issue_id']})"
-        return title
-
     async def queued(self, source, receipt):
         status = "Queued for diagnosis."
         if receipt.get("evidence", {}).get("status") == "waiting":
-            status = "Waiting for stack trace. PostHog has not returned the exception evidence yet."
+            status = "Waiting for stack trace."
         elif receipt["available"] > time.time():
             until = time.strftime("%H:%M UTC", time.gmtime(receipt["available"]))
             status = f"Queued until {until}: this app has reached its 12 diagnoses per hour."
-        return await self._notice(source, receipt, "queued", self.incident_title(source, receipt) + "\n" + status)
+        return await self._notice(source, receipt, "queued", incident_embed(source, receipt, "queued", status))
 
     async def progress(self, source, receipt, stage=0):
-        label = "Setup test. " if receipt.get("setup_test") else "Drill. " if receipt.get("drill") else ""
-        if not label:
-            label = {
-                "drill": "Sampled exception: declared drill. ",
-                "unmarked": "Sampled exception: no declared drill marker. ",
-                "unknown": "Sampled exception: drill status unknown. ",
-            }.get(receipt.get("sample_drill_status"), "")
-        return await self._notice(
-            source,
-            receipt,
-            "progress",
-            self.incident_title(source, receipt)
-            + "\n"
-            + label
-            + (
-                "Waiting for stack trace. PostHog has not returned the exception evidence yet."
-                if receipt.get("evidence", {}).get("status") == "waiting"
-                else "Investigating."
-                if not stage
-                else "Diagnosis is still running."
-            ),
+        status = (
+            "Waiting for stack trace."
+            if receipt.get("evidence", {}).get("status") == "waiting"
+            else "Investigating."
+            if not stage
+            else "Diagnosis is still running."
         )
+        return await self._notice(source, receipt, "progress", incident_embed(source, receipt, "progress", status))
 
     async def report(self, source, receipt):
-        prefix = "Diagnosis held:"
-        if receipt["success"]:
-            prefix = (
-                "Setup check received. Alert path works."
-                if receipt.get("setup_test")
-                else "Drill received. Alert path works; no fix needed."
-                if receipt.get("drill")
-                else "Drill sample received. Alert path works; no fix needed for this sample."
-                if receipt.get("sample_drill_status") == "drill"
-                else "Diagnosis complete. Proposed fix for review:"
-            )
-        prefix += "\n\n"
-        return await self._notice(
-            source, receipt, "result", self.incident_title(source, receipt) + "\n" + prefix + receipt["result"]
-        )
+        return await self._notice(source, receipt, "result", incident_embed(source, receipt, "result"))
 
 
 class DiscordAlerts:
@@ -864,6 +931,8 @@ class DiscordAlerts:
                 outcome = self.store.receive(source, message_id=message.id, **event)
                 if outcome == "queued":
                     self.worker.wake.set()
+                if outcome in {"queued", "duplicate"}:
+                    await self.transport.discard_accepted(source, message, event)
                 elif outcome == "overflow":
                     await self.transport.say(source, "Alert queue is full. Registration paused; review required.")
             except AlertError:

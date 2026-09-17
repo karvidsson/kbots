@@ -357,7 +357,12 @@ class AlertStore:
                     now,
                     now,
                     now,
-                    json.dumps({"drill": drill is True}),
+                    json.dumps(
+                        {
+                            "drill": drill is True,
+                            "setup_test": event_id == str(uuid.uuid5(uuid.UUID(source["id"]), source["nonce"])),
+                        }
+                    ),
                 ),
             ).rowcount
             return "queued" if changed else "duplicate"
@@ -475,7 +480,7 @@ class AlertStore:
         return 15 if row[0] is None else max(0.1, min(15, row[0] - time.time()))
 
     def annotate(self, receipt, **values):
-        allowed = {"issue_name", "issue_title", "setup_test", "drill", "sample_drill_status"}
+        allowed = {"issue_name", "issue_title", "setup_test", "drill", "sample_drill_status", "source_summary"}
         if set(values) - allowed:
             raise AlertError("Invalid incident presentation")
         row = self.db.execute(

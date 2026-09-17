@@ -22,7 +22,7 @@ from src.core.alert_operator import OperatorRehearsal, proof_key, signature
 from src.core.base import LLMResponse
 from tests.test_alert_exception_evidence import response
 from tests.test_alert_lifecycle import Harness, http_error
-from tests.test_alert_setup_ux import MemoryChannel
+from tests.test_alert_setup_ux import MemoryChannel, visible_text
 
 
 def cli_module():
@@ -239,7 +239,7 @@ async def test_cli_drives_real_setup_worker_and_teardown_without_touching_parent
     status = await call(o, "status", journal["session"])
     assert status["source_state"] == "active"
     assert any("active" in n["text"] and n["state"] == "complete" for n in status["notices"])
-    assert len(o.room.messages) == 1 and "boom.get.ts" in o.room.messages[0].content
+    assert len(o.room.messages) == 1 and "boom.get.ts" in visible_text(o.room.messages[0])
     assert o.h.home_messages == []  # No parent, home-channel or human-DM transcript was borrowed.
     o.provider.complete.assert_awaited_once()
     captured = capsys.readouterr().out

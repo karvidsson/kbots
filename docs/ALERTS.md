@@ -429,24 +429,48 @@ exact v1 template for all ownership checks and subsequent cleanup; no existing
 vendor object is rewritten by this upgrade. New format markers are not accepted
 for old revisions, and old markers are not accepted for new ones.
 
-Bot status messages use the same persisted message ID for updates. Recovery
-still needs a remote marker to find a send whose acknowledgement was lost; an ID
-alone cannot recover that case. Embed footers carry it where the bot has Embed
-Links. Other rooms use a spoiler and require no permission changes. Provisioning
-only adds an embed permission overwrite if the bot already has that permission
-in the guild. Legacy start/result markers remain recoverable.
+Accepted webhook messages are deleted with the owned webhook token only after
+receipt and deduplication state commit. A duplicate envelope must match the stored
+source, revision, event, issue and lifecycle kind before deletion. Invalid or
+foreign messages, inactive intake and queue overflow are not deleted. A failed
+delete is logged without exception values and leaves the raw message in place;
+no Manage Messages permission is needed. There is no retroactive history sweep.
 
-The first issue-summary read fixes the linked label as app name plus the first
-line of the description, or the issue name when no description exists. It is
-sanitized, bounded to 80 characters and retained across waits, restarts and edits.
-Before that metadata arrives, the status shows plain app context without an issue
-link label. Verdicts and headings occupy separate paragraphs. A declared drill
-leads with reporting-path confirmation instead of a proposed-fix heading; a drill
-sample not bound to the trigger is explicitly described as a sample.
-Long diagnosis text is redacted and trimmed at a line or sentence boundary with
-an ellipsis, falling back to a whole word when necessary. The final Discord
-message is bounded separately, including its recovery marker when embeds are
-unavailable. The budget also counts UTF-16 units so emoji cannot overrun it.
+New webhooks are named "PostHog alerts". Creation recovery still requires the
+legacy unique name or a durably saved webhook ID; a friendly name alone cannot
+establish ownership. When reconciliation confirms a channel is present, the
+current webhook is renamed once per process only after its creation journal,
+vault reference, bot owner, channel, server and current revision agree. A custom
+or changed name is retained. This does not change the PostHog destination inputs,
+webhook URL, legacy template comparison or cleanup ownership checks.
+
+Each incident has one bot message with one embed, edited from queued through
+waiting, investigation and result. Real-incident cards are red; declared drill
+and setup cards are grey; held results are amber. The linked title uses the first
+issue summary's app and description, falling back to its name. The title is
+sanitized, bounded to 80 characters and retained across waits and restarts. Before
+that metadata arrives, the linked title shows the app name.
+
+A regular result has a one-line verdict and bounded Cause, Fix and Missing
+evidence fields. Drill and setup results show only a verdict and the tracked
+source file mapped from an in-app frame, or a truthful no-source explanation.
+The restricted diagnosis and full stored result remain part of the acceptance
+path; compact presentation does not bypass diagnosis or its success requirement.
+The footer shows service, lifecycle kind and a short issue ID, without a protocol
+marker. Rooms lacking Embed Links receive a bounded plain-text version of the
+same content. No permission change is made.
+
+Acknowledged sends are recovered by their persisted message ID and bot author.
+New sends also use Discord's invisible, receipt-specific nonce (22 characters).
+After a lost acknowledgement, a matching nonce in channel history can recover the
+message; old status/start/result markers remain recognized for upgrade recovery.
+Discord guarantees the nonce on Message Create, but it is optional on later reads.
+If neither the persisted ID nor a matching nonce/legacy marker establishes the
+message, the send remains uncertain and no duplicate is posted. No visible marker
+or separate marker embed is emitted by new incident cards.
+
+Text is redacted before trimming at readable boundaries, with an ellipsis. The
+budgets count UTF-16 units too and stay within Discord embed and message limits.
 
 The deterministic delivery test is labelled as a setup test. New PostHog
 created/reopened notifications carry an explicit drill bit derived only from

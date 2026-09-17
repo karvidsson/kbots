@@ -102,14 +102,18 @@ async def test_reaction_cannot_wake_privileged_session(setup):
     connector.emit.assert_not_awaited()
 
 
-async def test_bounded_diagnosis_is_delivered_in_full_without_shortener(setup):
+async def test_bounded_diagnosis_card_bypasses_shortener(setup):
     connector, alerts, _, source = setup
     connector._shortener.shorten = Mock(side_effect=AssertionError("no hidden remainder"))
     from tests.test_alert_setup_ux import MemoryChannel
 
     room = MemoryChannel()
     alerts.transport.channel = AsyncMock(return_value=room)
-    result = "x" * 1590 + " RESULTEND"
+    result = (
+        "**Verdict**\nReview the handler.\n**Cause**\n"
+        + "Cause sentence. " * 110
+        + "\n**Fix**\nCheck input.\n**Missing evidence**\nA reproduction."
+    )
     source = alerts.store.update(
         source["id"],
         config={**source["config"], "host": "https://eu.posthog.com", "project": "123456789012", "app": "sample"},
@@ -123,8 +127,12 @@ async def test_bounded_diagnosis_is_delivered_in_full_without_shortener(setup):
     }
     await alerts.transport.report(source, receipt)
     content = room.messages[0].content
-    assert result in content and len(content) < 2000
-    assert room.messages[0].embeds[0].footer.text == f"[alert:{receipt['id']}:status]"
+    assert content == "" and len(room.messages[0].embeds) == 1
+    embed = room.messages[0].embeds[0]
+    assert [field.name for field in embed.fields] == ["Cause", "Fix", "Missing evidence"]
+    assert embed.fields[0].value.endswith("…")
+    assert all(len(field.value) <= 700 for field in embed.fields)
+    assert "[alert:" not in embed.footer.text
     connector._shortener.shorten.assert_not_called()
 
 

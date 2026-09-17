@@ -157,3 +157,18 @@ It skips the filtered drill read while the unfiltered result is empty. Each read
 attempt gets a fresh absolute seven-day window; its unfiltered and filtered reads
 share that window exactly. Existing API budgets count every retry. A summary GET
 returning HTTP 404 is a distinct held result, never an empty-sample retry.
+
+
+### Incident cards and raw delivery messages
+
+After durable receipt acceptance, the Discord integration removes the raw webhook
+message with its own token. Delete failures leave it intact; unparsed, foreign or
+unaccepted messages are never deleted. The bot then maintains one editable card.
+Renaming the owned Discord webhook to "PostHog alerts" changes its display name
+only, not these destination inputs or the exact legacy ownership matcher.
+
+The first issue-summary label stays stable. Regular results show bounded Cause,
+Fix and Missing evidence fields. Drill/setup cards show only the reporting-path
+verdict and a tracked file resolved from in-app frames. Full diagnosis stays in
+the receipt, and source lookup still refuses unrelated keyword snippets when
+frames exist but do not resolve.

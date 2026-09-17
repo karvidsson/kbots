@@ -424,7 +424,7 @@ async def test_worker_preserves_sample_scope_through_model_and_restart(
     from src.core import alert_diagnosis
     from src.core.base import LLMResponse
     from tests.test_alert_lifecycle import Harness
-    from tests.test_alert_setup_ux import MemoryChannel
+    from tests.test_alert_setup_ux import MemoryChannel, visible_text
 
     h = Harness(tmp_path)
     room = MemoryChannel(401, guild=h.guild)
@@ -470,6 +470,12 @@ async def test_worker_preserves_sample_scope_through_model_and_restart(
         assert receipt["sample_drill_status"] == sample_status
         assert receipt["result"].startswith(prefix)
         await h.alerts.transport.report(h.store.get(source["id"]), receipt)
-        assert len(room.messages) == 1 and prefix in room.messages[0].content
+        assert len(room.messages) == 1
+        if trigger_drill or sample_status == "drill":
+            assert "Alert path works" in visible_text(room.messages[0])
+            assert prefix not in visible_text(room.messages[0])
+        else:
+            # The full scoped explanation remains in the durable result above.
+            assert prefix in visible_text(room.messages[0])
     finally:
         h.store.close()

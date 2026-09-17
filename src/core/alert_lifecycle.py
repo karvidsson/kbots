@@ -109,6 +109,7 @@ class AlertLifecycle:
                         self.store.update(source["id"], channel_id=source["channel_id"])
                     self.request(source["id"], "deleted")
                 elif status == "present":
+                    await self.transport.refresh_webhook_name(source)
                     self.store.clear_condition(f"channel:{account}:{source['id']}")
                 else:
                     self.inaccessible(source, "channel", status)

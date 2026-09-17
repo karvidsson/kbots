@@ -16,7 +16,7 @@ from src.core.alert_channels import AlertError, AlertStore
 from src.core.base import LLMResponse
 from tests.test_alert_exception_evidence import response
 from tests.test_alert_lifecycle import Harness
-from tests.test_alert_setup_ux import MemoryChannel
+from tests.test_alert_setup_ux import MemoryChannel, visible_text
 from tests.test_posthog_alerts import FakeResponse, FakeSession
 
 
@@ -140,8 +140,8 @@ async def test_late_stack_waits_across_restart_and_selects_real_handler(delayed)
         assert pending["evidence"]["deadline"] == 1090
         assert pending["attempts"] == 0
         assert diagnosis_uses(d) == 1
-        assert "Waiting for stack trace" in d.room.messages[0].content
-        assert "12 diagnoses" not in d.room.messages[0].content
+        assert "Waiting for stack trace" in visible_text(d.room.messages[0])
+        assert "12 diagnoses" not in visible_text(d.room.messages[0])
         assert not d.worker.running and d.manager.active_turns == 0
         assert all(not lock.locked() for lock in d.h.alerts.transport.message_locks.values())
         assert d.worker.store.next_delay() == min(15, next_time - moment)
@@ -169,7 +169,7 @@ async def test_late_stack_waits_across_restart_and_selects_real_handler(delayed)
         > 0
     )
     await d.worker.once()
-    assert len(d.room.messages) == 1 and "boom.get.ts" in d.room.messages[0].content
+    assert len(d.room.messages) == 1 and "boom.get.ts" in visible_text(d.room.messages[0])
 
 
 async def test_deadline_fallback_is_durable_and_does_not_claim_no_events(delayed):
