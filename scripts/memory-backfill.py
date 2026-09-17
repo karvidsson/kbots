@@ -9,13 +9,14 @@ same thing sitting side by side and no anchors joining any of it to the 234
 memories in sqlite. Shipping the code alone would leave the old corpus
 fragmented forever and make the improvement invisible.
 
-Five passes, each independently skippable, each reporting what it would do:
+Seven passes, each independently skippable, each reporting what it would do:
 
   relations   collapse synonym relation names onto the shared vocabulary
   timestamps  give pre-existing edges a valid_from so history is orderable
   entities    merge entities that differ only by case, punctuation or spacing
   supersede   close older values of single-valued facts that have several
   anchors     link memories to the entities they mention, both directions
+  sources     attach inferred source memories to edges that have none
   embeddings  compute the vectors that were never generated
 
 Dry run by default. Nothing is written without --apply, and --apply refuses to
@@ -28,6 +29,7 @@ single-writer and the running engine is the other writer.
 
 import argparse
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -40,9 +42,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.lib.canonical import SINGLE_VALUED, entity_key, normalize_rel  # noqa: E402
-from src.lib.graph_store import GraphMemory, _rows  # noqa: E402
+from src.lib.graph_store import (  # noqa: E402
+    INFERRED_PREFIX,
+    MAX_SOURCES,
+    GraphMemory,
+    _rows,
+    parse_sources,
+)
 
-PASSES = ("relations", "timestamps", "entities", "supersede", "anchors", "embeddings")
+PASSES = ("relations", "timestamps", "entities", "supersede", "anchors", "sources",
+          "embeddings")
 
 # An entity name shorter than this matches too much prose to anchor on. "AI"
 # appears in half the corpus and tells you nothing about which memory is about
@@ -293,6 +302,49 @@ async def pass_anchors(conn, memory, apply: bool, rep: Report) -> None:
             await memory.anchor_entities(row["id"], fresh)
 
 
+async def pass_sources(conn, memory, apply: bool, rep: Report) -> None:
+    """Give edges extracted before provenance existed a best-guess source.
+
+    The extractor's memory id was dropped at the write until link() took a
+    `source`, so every older edge has none. The closest surviving evidence is
+    a memory anchored to BOTH endpoints. That shows the memory mentions the
+    two entities, not that it states the relation, so each id is written with
+    INFERRED_PREFIX and the graph view labels it as inferred.
+    """
+    rows = _rows(await conn.execute(
+        "MATCH (a:Entity)-[r:Related]->(b:Entity) "
+        "RETURN a.name AS src, r.rel AS rel, b.name AS dst, r.sources AS sources"))
+    by_key: dict[str, set[str]] = defaultdict(set)
+    for mid, key in memory.db.execute(
+            "SELECT memory_id, entity_key FROM memory_entities").fetchall():
+        by_key[key].add(str(mid))
+
+    done: set[tuple[str, str, str]] = set()
+    for row in rows:
+        edge = (row["src"], row["rel"], row["dst"])
+        if parse_sources(row.get("sources")) or edge in done:
+            continue
+        done.add(edge)
+        both = sorted(by_key.get(entity_key(row["src"]), set())
+                      & by_key.get(entity_key(row["dst"]), set()))
+        if not both:
+            rep.note("edges with no inferable source")
+            continue
+        ids = [INFERRED_PREFIX + m for m in both[:MAX_SOURCES]]
+        rep.note("edges given inferred sources",
+                 f"{row['src']} {row['rel']} → {row['dst']}: {len(ids)}")
+        rep.note("inferred source ids written", n=len(ids))
+        if apply:
+            # Only rows still without sources: an expired twin of the same
+            # triple that already has exact provenance is left alone.
+            await conn.execute(
+                "MATCH (a:Entity {name: $a})-[r:Related {rel: $rel}]->"
+                "(b:Entity {name: $b}) WHERE r.sources IS NULL OR r.sources = '' "
+                "SET r.sources = $sources",
+                {"a": row["src"], "rel": row["rel"], "b": row["dst"],
+                 "sources": json.dumps(ids)})
+
+
 async def pass_embeddings(memory, apply: bool, rep: Report) -> None:
     """Compute the vectors for memories stored while the model was missing.
 
@@ -417,6 +469,9 @@ async def main() -> int:
             await pass_supersede(conn, args.apply, rep)
         if "anchors" in passes:
             await pass_anchors(conn, memory, args.apply, rep)
+        # After anchors, so memories anchored just now count as evidence.
+        if "sources" in passes:
+            await pass_sources(conn, memory, args.apply, rep)
         if "embeddings" in passes:
             await pass_embeddings(memory, args.apply, rep)
     finally:

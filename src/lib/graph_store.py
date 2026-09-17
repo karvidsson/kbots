@@ -14,6 +14,7 @@ pip install 'kbots[graph]'.
 """
 
 import asyncio
+import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
@@ -52,12 +53,38 @@ _MIGRATIONS = [
     "ALTER TABLE Entity ADD IF NOT EXISTS aliases STRING",
     "ALTER TABLE Related ADD IF NOT EXISTS valid_from STRING",
     "ALTER TABLE Related ADD IF NOT EXISTS valid_to STRING",
+    "ALTER TABLE Related ADD IF NOT EXISTS sources STRING",
 ]
+
+# Provenance: `sources` is a JSON list of the memory ids an edge was extracted
+# from. An id the backfill guessed by joining anchors, rather than one the
+# extractor reported, carries this prefix so the two are never confused.
+INFERRED_PREFIX = "inferred:"
+MAX_SOURCES = 20
 
 # Only edges that have not been superseded. Every read applies this unless it
 # is explicitly asking about history, so "what is true" never silently mixes
 # with "what was once true".
 _OPEN_ONLY = "r.valid_to IS NULL"
+
+
+def parse_sources(raw) -> list[str]:
+    """Decode a stored `sources` value. Anything unreadable is no provenance."""
+    if not raw:
+        return []
+    try:
+        ids = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(i) for i in ids if i] if isinstance(ids, list) else []
+
+
+def merge_sources(raw, source: str | None) -> str | None:
+    """Append `source` to a stored list without duplicating it."""
+    ids = parse_sources(raw)
+    if source and source not in ids and len(ids) < MAX_SOURCES:
+        ids.append(source)
+    return json.dumps(ids) if ids else None
 
 
 class GraphUnavailableError(RuntimeError):
@@ -91,6 +118,13 @@ def _normalize_scope(scope: str, created_by: str | None) -> str:
     raise ValueError(f"Invalid scope {scope!r} — use 'agent', 'global', or 'group:<name>'")
 
 
+def _with_sources(rows: list[dict]) -> list[dict]:
+    """Decode the stored JSON so callers, and the proxy, see a plain list."""
+    for row in rows:
+        row["sources"] = parse_sources(row.get("sources"))
+    return rows
+
+
 def _rows(result) -> list[dict]:
     """Convert a ladybug QueryResult to a list of dicts."""
     cols = result.get_column_names()
@@ -113,6 +147,9 @@ class GraphMemory:
         self._db = None
         self._conn = None
         self._open_lock = asyncio.Lock()
+        # link() reads an edge's sources, merges and writes them back; two
+        # links to the same edge interleaving between those steps drop an id.
+        self._write_lock = asyncio.Lock()
         self._entity_index: dict[str, str] = {}
 
     async def _ensure_open(self):
@@ -218,8 +255,13 @@ class GraphMemory:
             logger.debug(f"Graph: could not record alias {alias!r}: {e}")
 
     async def link(self, a: str, rel: str, b: str, *, confidence: float = 0.7,
-                   scope: str = "global", created_by: str | None = None) -> dict:
+                   scope: str = "global", created_by: str | None = None,
+                   source: str | None = None) -> dict:
         """Create or refresh a relationship. Idempotent per (a, rel, b).
+
+        `source` is the id of the memory the relationship was taken from. It is
+        appended to the open edge's sources, so an edge asserted by several
+        memories names all of them.
 
         Three things happen before the write that did not before:
 
@@ -233,6 +275,13 @@ class GraphMemory:
         """
         conn = await self._ensure_open()
         scope = _normalize_scope(scope, created_by)
+        source = str(source) if source else None
+        async with self._write_lock:
+            return await self._link(conn, a, rel, b, confidence=confidence,
+                                    scope=scope, created_by=created_by, source=source)
+
+    async def _link(self, conn, a: str, rel: str, b: str, *, confidence: float,
+                    scope: str, created_by: str | None, source: str | None) -> dict:
         ts = _now()
         by = created_by or ""
 
@@ -244,6 +293,8 @@ class GraphMemory:
         a = await self._resolve_entity(a, conn, scope, by, ts)
         b = await self._resolve_entity(b, conn, scope, by, ts)
 
+        # The superseded edge keeps its own sources: they back the old value,
+        # not the new one, which starts with only the memory that asserted it.
         superseded = 0
         if rel in SINGLE_VALUED:
             superseded = await self._expire_conflicting(conn, a, rel, b, ts)
@@ -254,24 +305,29 @@ class GraphMemory:
         # expired edge and revive it.
         result = await conn.execute(
             "MATCH (a:Entity {name: $a})-[r:Related {rel: $rel}]->(b:Entity {name: $b}) "
-            f"WHERE {_OPEN_ONLY} RETURN COUNT(*) AS n",
+            f"WHERE {_OPEN_ONLY} RETURN r.sources AS sources",
             {"a": a, "b": b, "rel": rel})
-        is_open = int(_rows(result)[0]["n"]) > 0
+        open_rows = _rows(result)
 
-        if is_open:
+        if open_rows:
+            sources = merge_sources(open_rows[0].get("sources"), source)
             await conn.execute(
                 "MATCH (a:Entity {name: $a})-[r:Related {rel: $rel}]->(b:Entity {name: $b}) "
-                f"WHERE {_OPEN_ONLY} SET r.confidence = $conf",
-                {"a": a, "b": b, "rel": rel, "conf": float(confidence)})
+                f"WHERE {_OPEN_ONLY} SET r.confidence = $conf, r.sources = $sources",
+                {"a": a, "b": b, "rel": rel, "conf": float(confidence),
+                 "sources": sources})
         else:
+            sources = merge_sources(None, source)
             await conn.execute(
                 "MATCH (a:Entity {name: $a}), (b:Entity {name: $b}) "
                 "CREATE (a)-[r:Related {rel: $rel, confidence: $conf, scope: $scope, "
-                "created_by: $by, created_at: $ts, valid_from: $ts}]->(b)",
+                "created_by: $by, created_at: $ts, valid_from: $ts, "
+                "sources: $sources}]->(b)",
                 {"a": a, "b": b, "rel": rel, "conf": float(confidence),
-                 "scope": scope, "by": by, "ts": ts})
+                 "scope": scope, "by": by, "ts": ts, "sources": sources})
 
-        out = {"a": a, "rel": rel, "b": b, "confidence": confidence, "scope": scope}
+        out = {"a": a, "rel": rel, "b": b, "confidence": confidence, "scope": scope,
+               "sources": parse_sources(sources)}
         if superseded:
             out["superseded"] = superseded
         return out
@@ -315,11 +371,11 @@ class GraphMemory:
             "RETURN a.name AS src, r.rel AS rel, b.name AS dst, "
             "r.confidence AS confidence, r.scope AS scope, "
             "r.created_by AS created_by, r.valid_from AS valid_from, "
-            "r.valid_to AS valid_to "
+            "r.valid_to AS valid_to, r.sources AS sources "
             f"ORDER BY r.valid_from DESC LIMIT {limit}",
             {"entity": entity, "agent_scope": agent_scope},
         )
-        rows = _rows(result)
+        rows = _with_sources(_rows(result))
         for row in rows:
             row["current"] = row.get("valid_to") is None
         return rows
@@ -348,11 +404,12 @@ class GraphMemory:
                 f"WHERE (list_contains($frontier, a.name) OR list_contains($frontier, b.name)) "
                 f"AND {_SCOPE_FILTER} AND {_OPEN_ONLY} "
                 "RETURN a.name AS src, r.rel AS rel, b.name AS dst, "
-                "r.confidence AS confidence, r.scope AS scope, r.created_by AS created_by",
+                "r.confidence AS confidence, r.scope AS scope, r.created_by AS created_by, "
+                "r.sources AS sources",
                 {"frontier": frontier, "agent_scope": agent_scope},
             )
             next_frontier = []
-            for row in _rows(result):
+            for row in _with_sources(_rows(result)):
                 key = (row["src"], row["rel"], row["dst"])
                 if key in seen_edges:
                     continue
@@ -439,11 +496,11 @@ class GraphMemory:
             f"WHERE {where} "
             "RETURN a.name AS src, a.type AS src_type, b.name AS dst, b.type AS dst_type, "
             "r.rel AS rel, r.confidence AS confidence, r.scope AS scope, "
-            "r.created_by AS created_by "
+            "r.created_by AS created_by, r.sources AS sources "
             f"LIMIT {limit}",
             params,
         )
-        edges = _rows(result)
+        edges = _with_sources(_rows(result))
         nodes: dict[str, dict] = {}
         for e in edges:
             for name, ntype in ((e["src"], e.pop("src_type")), (e["dst"], e.pop("dst_type"))):
@@ -478,11 +535,12 @@ class GraphMemory:
             "MATCH (a:Entity)-[r:Related]->(b:Entity) "
             f"WHERE {where} "
             "RETURN a.name AS src, r.rel AS rel, b.name AS dst, "
-            "r.confidence AS confidence, r.scope AS scope, r.created_by AS created_by "
+            "r.confidence AS confidence, r.scope AS scope, r.created_by AS created_by, "
+            "r.sources AS sources "
             f"LIMIT {limit}",
             params,
         )
-        return _rows(result)
+        return _with_sources(_rows(result))
 
     def close(self) -> None:
         """Close connection and database. Safe to call twice or before open."""
@@ -533,9 +591,10 @@ class GraphClient:
         return data.get("result")
 
     async def link(self, a: str, rel: str, b: str, *, confidence: float = 0.7,
-                   scope: str = "global", created_by: str | None = None) -> dict:
+                   scope: str = "global", created_by: str | None = None,
+                   source: str | None = None) -> dict:
         return await self._call("link", a=a, rel=rel, b=b, confidence=confidence,
-                                scope=scope, created_by=created_by)
+                                scope=scope, created_by=created_by, source=source)
 
     async def related(self, entity: str, depth: int = 1, *,
                       agent_id: str | None = None, limit: int = 50) -> list[dict]:

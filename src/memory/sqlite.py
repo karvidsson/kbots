@@ -547,6 +547,26 @@ class SQLiteMemory(MemoryBackend):
         row = self.db.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         return self._row_to_dict(row) if row else None
 
+    async def get_visible(self, memory_ids, agent_id: str | None,
+                          all_scopes: bool = False) -> dict[str, dict]:
+        """The memories among `memory_ids` that `agent_id` may read, by id.
+
+        An id that is missing from the result was forgotten or is out of the
+        reader's scope; callers must not be able to tell which. `all_scopes`
+        is the fleet view and its caller does the gating.
+        """
+        ids = list(dict.fromkeys(str(m) for m in memory_ids or [] if m))
+        if not ids:
+            return {}
+        where = f"id IN ({','.join('?' * len(ids))})"
+        params: list = list(ids)
+        if not all_scopes:
+            scope_sql, scope_params = self._scope_filter(agent_id)
+            where += f" AND ({scope_sql})"
+            params += scope_params
+        rows = self.db.execute(f"SELECT * FROM memories WHERE {where}", params).fetchall()
+        return {str(r["id"]): self._row_to_dict(r) for r in rows}
+
     async def list_by_category(self, agent_id: str, category: str,
                                limit: int = 100, own_only: bool = False) -> list[dict]:
         """List an agent's non-archived memories in a category (e.g. 'lesson').

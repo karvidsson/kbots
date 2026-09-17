@@ -223,6 +223,9 @@ async def test_extract_graph_links_edges_and_advances_cursor(overlay, tmp_path, 
         by_pair = {(e["src"], e["dst"]): e for e in data["edges"]}
         assert by_pair[("Kristian", "kbots")]["scope"] == "global"
         assert by_pair[("kbots", "LadybugDB")]["scope"] == "agent:jarvis"
+        # each edge names the memory it was extracted from
+        assert by_pair[("Kristian", "kbots")]["sources"] == ["m1"]
+        assert by_pair[("kbots", "LadybugDB")]["sources"] == ["m2"]
 
         # cursor persisted as (updated_at, id) of the last processed memory
         from src.core import runtime_state
@@ -231,6 +234,24 @@ async def test_extract_graph_links_edges_and_advances_cursor(overlay, tmp_path, 
 
         # next pass: nothing new → no LLM call beyond the first
         assert await r._extract_graph("jarvis") == 0
+    finally:
+        gm.close()
+
+
+@needs_ladybug
+async def test_extract_graph_drops_a_source_id_outside_the_batch(overlay, tmp_path, monkeypatch):
+    from src.lib import graph_store
+    from src.lib.graph_store import GraphMemory
+    gm = GraphMemory({"enabled": True, "path": str(tmp_path / "g.lbdb")})
+    monkeypatch.setattr(graph_store, "_graph", gm)
+    try:
+        mems = [{"id": "m1", "category": "general", "content": "A uses B.",
+                 "scope": "global", "updated_at": "2026-08-14 10:00:00"}]
+        payload = '[{"a": "A", "rel": "uses", "b": "B", "confidence": 0.9, "source": "m99"}]'
+        mgr = FakeMgr(FakeMemoryWithSince([], [mems]), tmp_path, ExtractLLM(payload))
+        r = Reflector(mgr, {}, graph_cfg={"enabled": True})
+        assert await r._extract_graph("jarvis") == 1
+        assert (await gm.export(agent_id="jarvis"))["edges"][0]["sources"] == []
     finally:
         gm.close()
 

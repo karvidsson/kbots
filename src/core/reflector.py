@@ -363,9 +363,12 @@ class Reflector:
             source = str(e.get("source"))
             scope = scope_by_id.get(source, f"agent:{agent_id}")
             try:
+                # Only an id from this batch is provenance; anything else the
+                # model wrote in the source field is not a memory we read.
                 result = await graph.link(
                     e["a"], e["rel"], e["b"], confidence=e["confidence"],
-                    scope=scope, created_by=agent_id)
+                    scope=scope, created_by=agent_id,
+                    source=source if source in known_ids else None)
                 linked += 1
                 if normalize_rel(e["rel"])[1] is False:
                     off_vocab += 1
