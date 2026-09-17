@@ -1,6 +1,7 @@
 """Discord connector — multi-bot, typing indicators, slash commands, no inline buttons."""
 
 import asyncio
+import contextlib
 import logging
 import os
 import re
@@ -732,6 +733,8 @@ class DiscordBot:
         self.client.event(self.on_guild_channel_delete)
         self.client.event(self.on_guild_channel_update)
         self.client.event(self.on_guild_remove)
+        self.client.event(self.on_interaction)
+        self.tree.on_error = self.on_app_command_error
 
         # Kept for server provisioning, which needs REST calls of its own.
         self._token = ""
@@ -826,6 +829,26 @@ class DiscordBot:
         alerts = getattr(self.connector, "_alerts", None)
         if alerts:
             await alerts.lifecycle.guild_lost(self.account_name, guild.id)
+
+    async def on_interaction(self, interaction: discord.Interaction) -> None:
+        # A slash command that "did not respond" leaves no other trace, so
+        # record that it arrived at all. IDs only; options can hold user text.
+        name = ""
+        if interaction.type == discord.InteractionType.application_command:
+            name = (interaction.data or {}).get("name", "")
+        logger.info(
+            f"[{self.account_name}] interaction {interaction.type.name} /{name} "
+            f"from {interaction.user.id} in {'DM' if interaction.guild_id is None else 'guild'}"
+        )
+
+    async def on_app_command_error(self, interaction: discord.Interaction, error: Exception) -> None:
+        name = interaction.command.qualified_name if interaction.command else "?"
+        logger.error(f"[{self.account_name}] slash command /{name} failed", exc_info=error)
+        if not interaction.response.is_done():
+            with contextlib.suppress(discord.HTTPException):
+                await interaction.response.send_message(
+                    "That command failed. The error is in the engine log.", ephemeral=True
+                )
 
     async def on_guild_join(self, guild) -> None:
         """A server invited this bot: provision the channels a fleet needs.
