@@ -15,7 +15,7 @@ from pathlib import Path
 
 from src.core.base import KBOTS_TMP, ToolContext
 from src.core.tools import tool
-from src.lib.graph_store import GraphUnavailableError, get_graph
+from src.lib.graph_store import INFERRED_PREFIX, GraphUnavailableError, get_graph
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ async def memory_link(
     b: str,
     confidence: float = 0.7,
     scope: str = "agent",
+    source: str = "",
 ) -> str:
     """Store a relationship between two entities in the shared memory graph.
 
@@ -37,10 +38,14 @@ async def memory_link(
         b: Target entity name
         confidence: How sure you are (0.0-1.0)
         scope: Visibility — agent (private to you), global, or group:<name>
+        source: Id of the memory this relationship comes from (optional)
     """
+    if source and ctx.memory is not None and await ctx.memory.get(source) is None:
+        return f"No memory with id {source!r} — link not stored."
     try:
         edge = await get_graph().link(a, rel, b, confidence=confidence,
-                                      scope=scope, created_by=ctx.agent_id)
+                                      scope=scope, created_by=ctx.agent_id,
+                                      source=source or None)
     except (GraphUnavailableError, ValueError) as e:
         return str(e)
     return f"Linked: {edge['a']} —{edge['rel']}→ {edge['b']} (confidence {edge['confidence']}, scope {edge['scope']})"
@@ -164,6 +169,12 @@ svg{width:100%;height:100%;display:block;cursor:grab}svg:active{cursor:grabbing}
 .link{stroke:var(--edge);stroke-opacity:.9;fill:none;transition:stroke .15s,stroke-opacity .15s}
 .link.hl{stroke:var(--edge-hl);stroke-width:2.2px}
 .link.dim{stroke-opacity:var(--dim)}
+.hit{stroke:transparent;stroke-width:12px;fill:none;cursor:pointer}
+.link.pick{stroke:var(--accent);stroke-width:3px}
+.src{margin:8px 0;padding:8px 10px;border:1px solid var(--edge);border-radius:6px;background:var(--bg)}
+.src p{margin:4px 0 0;white-space:pre-wrap;word-break:break-word}
+.src.inf{border-style:dashed}
+aside code.e{cursor:pointer}
 .elabel{fill:var(--muted);font-size:9px;text-anchor:middle;pointer-events:none;paint-order:stroke;stroke:var(--bg);stroke-width:3px;stroke-linejoin:round}
 .elabel.dim{opacity:0}
 .node{cursor:pointer}.node circle{stroke:var(--card);stroke-width:1.5px;transition:opacity .15s}
@@ -185,7 +196,7 @@ code{background:var(--bg);border:1px solid var(--edge);border-radius:4px;padding
 @media(max-width:760px){#wrap{flex-direction:column}aside{flex:0 0 40%;max-width:none;border-left:0;border-top:1px solid var(--edge)}}
 </style></head><body>
 <header>
-  <div><h1>__TITLE__</h1><div class="sub">__N_NODES__ entities · __N_EDGES__ relationships · drag to move · scroll to zoom · click a node</div></div>
+  <div><h1>__TITLE__</h1><div class="sub">__N_NODES__ entities · __N_EDGES__ relationships · drag to move · scroll to zoom · click a node or a line</div></div>
   <span class="sp"></span>
   <input id="q" type="search" placeholder="Search entities…" autocomplete="off">
   <button id="bLabels" class="on" title="Toggle relationship labels">Labels</button>
@@ -195,7 +206,7 @@ code{background:var(--bg);border:1px solid var(--edge);border-radius:4px;padding
 <div id="wrap">
   <div id="graph"><svg id="svg"></svg><div id="legend"></div>
     <div id="nod3"><div>Couldn't load the D3 library from the internet.<br>Open this file while online to see the interactive graph.</div></div></div>
-  <aside id="panel"><p class="hint">Select an entity to see its relationships.<br><br>Hover highlights the neighbourhood; click pins it. Click a type in the legend to hide it.</p></aside>
+  <aside id="panel"><p class="hint">Select an entity to see its relationships, or a line to see the memories it came from.<br><br>Hover highlights the neighbourhood; click pins it. Click a type in the legend to hide it.</p></aside>
 </div>
 <script src="__D3_URL__"></script>
 <script>
@@ -214,17 +225,20 @@ links.forEach(l=>{byName.get(l.src).degree++;byName.get(l.dst).degree++;});
 const R=n=>6+Math.min(14,Math.sqrt(n.degree||1)*2.5);
 const nbr=new Map(NODES.map(n=>[n.name,new Set([n.name])]));
 links.forEach(l=>{nbr.get(l.src).add(l.dst);nbr.get(l.dst).add(l.src);});
-const hidden=new Set(); let selected=null, hovered=null, frozen=false, showLabels=true, query='';
+const hidden=new Set(); let selected=null, hovered=null, picked=null, frozen=false, showLabels=true, query='';
 
 const svg=d3.select(svgEl), root=svg.append('g');
 svg.append('defs').append('marker').attr('id','arrow').attr('viewBox','0 -4 8 8').attr('refX',8).attr('refY',0)
   .attr('markerWidth',7).attr('markerHeight',7).attr('orient','auto')
   .append('path').attr('d','M0,-4L8,0L0,4').attr('fill','var(--edge)');
-const linkG=root.append('g'), labelG=root.append('g'), nodeG=root.append('g');
+const linkG=root.append('g'), hitG=root.append('g'), labelG=root.append('g'), nodeG=root.append('g');
 const zoom=d3.zoom().scaleExtent([.15,6]).on('zoom',ev=>root.attr('transform',ev.transform));
-svg.call(zoom).on('dblclick.zoom',null).on('click',()=>{selected=null;paint();panel.innerHTML='<p class="hint">Select an entity to see its relationships.</p>';});
+svg.call(zoom).on('dblclick.zoom',null).on('click',()=>{selected=null;picked=null;paint();panel.innerHTML='<p class="hint">Select an entity to see its relationships, or a line to see the memories it came from.</p>';});
 
 const link=linkG.selectAll('path').data(links).join('path').attr('class','link').attr('stroke-width',l=>1+Math.min(2,(l.confidence||0.5)*1.5)).attr('marker-end','url(#arrow)');
+hitG.selectAll('path').data(links).join('path').attr('class','hit')
+  .on('click',(ev,l)=>{ev.stopPropagation();pickEdge(l);}).append('title').text(l=>l.src+' '+l.rel+' '+l.dst);
+const hitPaths=hitG.selectAll('path');
 const elabel=labelG.selectAll('text').data(links).join('text').attr('class','elabel').text(l=>l.rel);
 const node=nodeG.selectAll('g').data(NODES).join('g').attr('class','node')
   .call(d3.drag().on('start',(ev,d)=>{if(!ev.active&&!frozen)sim.alphaTarget(.3).restart();d.fx=d.x;d.fy=d.y;})
@@ -249,6 +263,7 @@ let fitted=false;
 function tick(){
   link.attr('d',l=>{const s=l.source,t=l.target,dx=t.x-s.x,dy=t.y-s.y,d=Math.hypot(dx,dy)||1,tr=R(t)+2;
     return `M${s.x},${s.y}L${t.x-dx/d*tr},${t.y-dy/d*tr}`;});
+  hitPaths.attr('d',l=>`M${l.source.x},${l.source.y}L${l.target.x},${l.target.y}`);
   elabel.attr('x',l=>(l.source.x+l.target.x)/2).attr('y',l=>(l.source.y+l.target.y)/2-4);
   node.attr('transform',d=>`translate(${d.x},${d.y})`);
 }
@@ -264,21 +279,38 @@ function paint(){
     .classed('dim',d=>(keep&&!keep.has(d.name)))
     .style('display',d=>hidden.has(d.type)?'none':null);
   const linkVis=l=>!(hidden.has(l.source.type)||hidden.has(l.target.type));
-  link.classed('hl',l=>f&&(l.src===f.name||l.dst===f.name)).classed('dim',l=>f&&!(l.src===f.name||l.dst===f.name)).style('display',l=>linkVis(l)?null:'none');
+  hitPaths.style('display',l=>linkVis(l)?null:'none');
+  link.classed('pick',l=>l===picked).classed('hl',l=>f&&(l.src===f.name||l.dst===f.name)).classed('dim',l=>f&&!(l.src===f.name||l.dst===f.name)).style('display',l=>linkVis(l)?null:'none');
   elabel.classed('dim',l=>!showLabels||(f&&!(l.src===f.name||l.dst===f.name))||(!f&&links.length>80)).style('display',l=>linkVis(l)?null:'none');
 }
 function select(n){
   selected=n; paint();
   const rel=links.filter(l=>l.src===n.name||l.dst===n.name);
   const out=rel.filter(l=>l.src===n.name), inc=rel.filter(l=>l.dst===n.name);
-  const row=(l,o)=>`<div class="r">${o?'':'<a data-n="'+esc(l.src)+'">'+esc(l.src)+'</a>'}<code>${esc(l.rel)}</code>${o?'<a data-n="'+esc(l.dst)+'">'+esc(l.dst)+'</a>':''}`+
+  const row=(l,o)=>`<div class="r">${o?'':'<a data-n="'+esc(l.src)+'">'+esc(l.src)+'</a>'}<code class="e" data-e="${links.indexOf(l)}" title="Show source memories">${esc(l.rel)}</code>${o?'<a data-n="'+esc(l.dst)+'">'+esc(l.dst)+'</a>':''}`+
     `<div class="hint">conf ${Number(l.confidence).toFixed(2)} · ${esc(l.scope)}${l.created_by?' · by '+esc(l.created_by):''}</div></div>`;
   panel.innerHTML=`<h2>${esc(n.name)}</h2><div class="t"><i style="display:inline-block;width:9px;height:9px;border-radius:50%;background:${color(n.type)};margin-right:5px"></i>${esc(n.type)} · ${rel.length} relationship(s)</div>`+
     (out.length?`<h3>Outgoing (${out.length})</h3>`+out.map(l=>row(l,true)).join(''):'')+
     (inc.length?`<h3>Incoming (${inc.length})</h3>`+inc.map(l=>row(l,false)).join(''):'')+
     (rel.length?'':'<p class="hint">No relationships.</p>')+
     `<p class="hint" style="margin-top:14px">Double-click the node to centre on it.</p>`;
+  bindPanel();
+}
+function bindPanel(){
   panel.querySelectorAll('a[data-n]').forEach(a=>a.onclick=()=>{const m=byName.get(a.dataset.n);if(m){select(m);focusOn(m);}});
+  panel.querySelectorAll('code[data-e]').forEach(c=>c.onclick=()=>pickEdge(links[+c.dataset.e]));
+}
+function pickEdge(l){
+  picked=l; selected=null; paint();
+  const prov=l.provenance||[], hid=l.hidden_sources||0;
+  const card=p=>`<div class="src${p.inferred?' inf':''}"><div class="hint"><code>${esc(p.id)}</code>${p.created_by?' by '+esc(p.created_by):''}${p.created_at?' · '+esc(p.created_at):''}${p.inferred?' · inferred':''}</div><p>${esc(p.text)}</p></div>`;
+  panel.innerHTML=`<h2><a data-n="${esc(l.src)}">${esc(l.src)}</a> <code>${esc(l.rel)}</code> <a data-n="${esc(l.dst)}">${esc(l.dst)}</a></h2>`+
+    `<div class="t">conf ${Number(l.confidence).toFixed(2)} · ${esc(l.scope)}${l.created_by?' · by '+esc(l.created_by):''}</div>`+
+    `<h3>Source memories (${prov.length})</h3>`+prov.map(card).join('')+
+    (prov.some(p=>p.inferred)?'<p class="hint">Inferred: the memory mentions both entities; the edge was not extracted from it directly.</p>':'')+
+    (hid?`<p class="hint">${hid} source${hid===1?'':'s'} not visible.</p>`:'')+
+    (prov.length||hid?'':'<p class="hint">No source recorded for this relationship.</p>');
+  bindPanel();
 }
 function focusOn(n){
   const k=Math.max(1.2,d3.zoomTransform(svgEl).k);
@@ -318,6 +350,43 @@ def _render_graph_html(nodes: list[dict], edges: list[dict], title: str) -> str:
     }
     # Single pass so substituted content (e.g. a title) is never re-scanned.
     return re.sub("|".join(subs), lambda m: subs[m.group(0)], _HTML)
+
+
+_SNIPPET_CHARS = 300
+
+
+async def _attach_provenance(ctx: ToolContext, edges: list[dict], *,
+                             all_scopes: bool) -> None:
+    """Replace each edge's source ids with the memory text the viewer may read.
+
+    An edge is shared across scopes (link() matches the open edge on a, rel, b
+    alone), so its sources can name another agent's memory. Those, and ids
+    that were forgotten, are only counted: `hidden_sources`, never text, and
+    never which of the two it was.
+    """
+    ids = {s.removeprefix(INFERRED_PREFIX) for e in edges for s in e.get("sources") or []}
+    visible: dict[str, dict] = {}
+    if ids and ctx.memory is not None and hasattr(ctx.memory, "get_visible"):
+        try:
+            visible = await ctx.memory.get_visible(ids, ctx.agent_id, all_scopes=all_scopes)
+        except Exception as e:
+            logger.warning(f"memory_graph: could not resolve edge sources: {e}")
+    for e in edges:
+        prov, hidden = [], 0
+        for raw in e.pop("sources", None) or []:
+            mid = raw.removeprefix(INFERRED_PREFIX)
+            m = visible.get(mid)
+            if m is None:
+                hidden += 1
+                continue
+            text = (m.get("content") or "").strip()
+            if len(text) > _SNIPPET_CHARS:
+                text = text[:_SNIPPET_CHARS].rstrip() + "…"
+            prov.append({"id": mid, "created_by": m.get("created_by") or "",
+                         "created_at": str(m.get("created_at") or ""),
+                         "text": text, "inferred": raw != mid})
+        e["provenance"] = prov
+        e["hidden_sources"] = hidden
 
 
 def _may_view_all(agent_id: str) -> bool:
@@ -384,6 +453,7 @@ async def memory_graph(ctx: ToolContext, title: str = "Memory Graph", view: str 
             o = owners.get(n["name"], set())
             if o:
                 n["type"] = next(iter(o)) if len(o) == 1 else "mixed"
+    await _attach_provenance(ctx, data["edges"], all_scopes=(view == "all"))
     doc = _render_graph_html(data["nodes"], data["edges"], title)
     out_dir = Path(ctx.project_dir) if ctx.project_dir else KBOTS_TMP
     out_dir.mkdir(parents=True, exist_ok=True)
