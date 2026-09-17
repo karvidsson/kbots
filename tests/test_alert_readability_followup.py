@@ -13,7 +13,7 @@ from src.core.base import LLMResponse
 from tests.test_alert_evidence_wait import delayed as delayed_fixture
 from tests.test_alert_lifecycle import Harness, http_error
 from tests.test_alert_repositories import REMOTE, repository
-from tests.test_alert_setup_ux import MemoryChannel
+from tests.test_alert_setup_ux import MemoryChannel, visible_text
 from tests.test_alert_setup_ux import ux as ux_fixture
 
 delayed = delayed_fixture
@@ -61,10 +61,11 @@ async def test_long_model_result_is_trimmed_before_storage_and_delivered_once(de
     ready = d.h.store.ready()[0]
     assert ready["result"].endswith("pipeline.…")
     await d.worker.once()
-    text = d.room.messages[0].content
+    text = visible_text(d.room.messages[0])
     assert len(text.encode("utf-16-le")) // 2 <= 2000
-    assert "pipeline.…" in text and len(d.room.messages) == 1
-    assert has_marker(d.room.messages[0], f"[alert:{ready['id']}:status]")
+    assert "Drill sample received" in text and len(d.room.messages) == 1
+    assert "pipeline.…" not in text  # Full diagnosis remains stored; drills display compactly.
+    assert "[alert:" not in text
 
 
 def test_redaction_happens_before_prose_budget():

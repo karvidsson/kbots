@@ -12,6 +12,7 @@ from src.core.base import LLMResponse
 from tests.test_alert_evidence_wait import delayed as delayed_fixture
 from tests.test_alert_evidence_wait import restart
 from tests.test_alert_exception_evidence import response, tracked_repo
+from tests.test_alert_setup_ux import visible_text
 
 delayed = delayed_fixture
 
@@ -89,22 +90,24 @@ async def test_title_persists_from_first_summary_across_wait_restart_and_final_e
 
     d.h.adapter._request = described
     await d.worker.once()
-    first = d.room.messages[0].content.splitlines()[0]
-    assert first.startswith("[sample: Expected drill from /api/debug/boom](")
+    first = visible_text(d.room.messages[0]).splitlines()[0]
+    assert first == "sample: Expected drill from /api/debug/boom"
     assert "[Error]" not in first and "second line" not in first
     assert d.h.store.pending()[0]["issue_title"] == "sample: Expected drill from /api/debug/boom"
     description = "Changed later summary"
     d.clock.now = 1005
     restart(d)
     await d.worker.once()
-    assert d.room.messages[0].content.splitlines()[0] == first
+    assert visible_text(d.room.messages[0]).splitlines()[0] == first
     d.clock.now = 1030
     await d.worker.once()
     await d.worker.once()
     assert len(d.room.messages) == 1
-    assert d.room.messages[0].content.splitlines()[0] == first
-    assert "Drill sample received. Alert path works; no fix needed for this sample." in d.room.messages[0].content
-    assert "Proposed fix for review" not in d.room.messages[0].content
+    assert visible_text(d.room.messages[0]).splitlines()[0] == first
+    assert "Drill sample received. Alert path works; trigger identity is unconfirmed." in visible_text(
+        d.room.messages[0]
+    )
+    assert "Proposed fix for review" not in visible_text(d.room.messages[0])
 
 
 async def test_matched_drill_result_has_own_verdict_and_heading_paragraphs(delayed):
@@ -116,10 +119,10 @@ async def test_matched_drill_result_has_own_verdict_and_heading_paragraphs(delay
     )
     await d.worker.once()
     await d.worker.once()
-    text = d.room.messages[0].content
-    assert "Drill received. Alert path works; no fix needed.\n\n" in text
-    assert "The triggering event is a declared drill.\n\n**Observations**\n" in text
-    assert "\n\n**Missing evidence**\n" in text
+    text = visible_text(d.room.messages[0])
+    assert "Drill received. Alert path works; no fix needed.\nSource:" in text
+    assert "**Observations**" not in text and "**Missing evidence**" not in text
+    assert "The triggering event is a declared drill" not in text
     assert "Proposed fix for review" not in text
 
 
@@ -130,8 +133,8 @@ async def test_failed_diagnosis_of_drill_never_claims_path_works(delayed):
     d.provider.complete.return_value = LLMResponse(content="", stop_reason="error")
     await d.worker.once()
     await d.worker.once()
-    assert "Diagnosis held:\n\n" in d.room.messages[0].content
-    assert "Alert path works" not in d.room.messages[0].content
+    assert "Diagnosis is held." in visible_text(d.room.messages[0])
+    assert "Alert path works" not in visible_text(d.room.messages[0])
 
 
 @pytest.mark.parametrize("frame", ["[eval1]", "unknown/handler.mjs", "../outside.ts"])

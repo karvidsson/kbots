@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from extras.posthog.alerts import EVENTS, PostHogAdapter, alert_heading, issue_link, parse_event
-from src.connectors.discord_alerts import DiscordAlerts, has_marker
+from src.connectors.discord_alerts import DiscordAlerts
 from src.core.alert_channels import AlertError, AlertStore
 from src.core.alert_repositories import resolve_repository
 from tests.test_alert_lifecycle import Harness, http_error
@@ -36,6 +36,7 @@ class MemoryChannel:
             content=content,
             author=SimpleNamespace(id=999),
             webhook_id=None,
+            nonce=kwargs.get("nonce"),
             embeds=[kwargs["embed"]] if kwargs.get("embed") else [],
         )
 
@@ -51,6 +52,15 @@ class MemoryChannel:
 
     async def fetch_message(self, identifier):
         return next(m for m in self.messages if m.id == identifier)
+
+
+def visible_text(message):
+    parts = [message.content or ""]
+    for embed in message.embeds:
+        parts.extend([embed.title or "", embed.description or ""])
+        parts.extend(f"{field.name}: {field.value}" for field in embed.fields)
+        parts.append(embed.footer.text or "")
+    return "\n".join(p for p in parts if p)
 
 
 @pytest.fixture
@@ -355,13 +365,15 @@ async def test_status_is_one_message_through_queue_investigation_and_result(tmp_
         result = await h.alerts.transport.report(source, ready)
         await h.alerts.transport.queued(source, pending)  # Stale late callback cannot regress the result.
         assert len(room.messages) == 1 and result["id"] == str(room.messages[0].id)
-        assert "TypeError: sample" in room.messages[0].content and "Diagnosis complete" in room.messages[0].content
-        marker = f"[alert:{receipt['id']}:status]"
-        assert has_marker(room.messages[0], marker)
-        assert (
-            (marker not in room.messages[0].content) if embeds else ("||" + marker + "||" in room.messages[0].content)
+        assert "TypeError: sample" in visible_text(room.messages[0]) and "Inspect the supplied handler" in visible_text(
+            room.messages[0]
         )
-        assert "12 diagnoses" not in room.messages[0].content
+        from src.connectors.alert_embeds import status_nonce
+
+        assert room.messages[0].nonce == status_nonce(receipt)
+        assert "[alert:" not in visible_text(room.messages[0])
+        assert bool(room.messages[0].embeds) is embeds
+        assert "12 diagnoses" not in visible_text(room.messages[0])
     finally:
         h.close()
 
@@ -449,10 +461,10 @@ async def test_lost_status_send_response_is_recovered_and_edited_without_new_sen
             await h.alerts.transport.queued(source, pending)
         receipt = h.store.claim()
         await h.alerts.transport.progress(source, receipt)
-        assert len(room.messages) == 1 and "Investigating" in room.messages[0].content
+        assert len(room.messages) == 1 and "Investigating" in visible_text(room.messages[0])
         h.store.save_result(receipt, "Done")
         await h.alerts.transport.report(source, h.store.ready()[0])
-        assert len(room.messages) == 1 and "Diagnosis complete" in room.messages[0].content
+        assert len(room.messages) == 1 and "Done" in visible_text(room.messages[0])
     finally:
         h.close()
 
@@ -557,7 +569,7 @@ async def test_rate_limit_sentence_appears_only_after_real_budget_deferral(tmp_p
         )
         assert h.store.claim() is None
         await h.alerts.transport.queued(source, h.store.pending()[0])
-        assert "Queued until" in room.messages[0].content and "12 diagnoses" in room.messages[0].content
+        assert "Queued until" in visible_text(room.messages[0]) and "12 diagnoses" in visible_text(room.messages[0])
         assert len(room.messages) == 1
     finally:
         h.close()

@@ -85,6 +85,7 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         return room
 
     async def create_webhook(**kwargs):
+        assert kwargs["name"] == "PostHog alerts"
         hook = SimpleNamespace(
             id=501,
             name=kwargs["name"],
