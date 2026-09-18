@@ -35,7 +35,18 @@ def cli_module():
 
 
 @pytest.fixture
-async def operator():
+async def operator(monkeypatch):
+    from src.core.alert_git import AlertRepository
+
+    monkeypatch.setattr(
+        AlertRepository,
+        "fetch",
+        lambda self, source, issue=None: {
+            "repo": source["config"]["repo"],
+            "revision": "HEAD",
+            "selection": "offline fixture",
+        },
+    )
     # Short, owned paths for AF_UNIX on macOS. No install key/socket is used.
     with tempfile.TemporaryDirectory(prefix="ao-", dir="/tmp") as rawroot:
         root = Path(rawroot)
@@ -191,6 +202,7 @@ def answers():
         "use existing one",
         "1",
         "yes",
+        "no",
         "CREATE",
     ]
 
@@ -282,7 +294,9 @@ async def test_rehearsal_does_not_reuse_or_consume_human_draft(operator):
 async def test_normal_dm_duplicate_guard_is_unchanged(operator):
     o = operator
     ordinary = o.h.store.begin("worker", "101", "one", "201")
-    ordinary = o.h.store.update(ordinary["id"], guild_id="301", config={**o.parent["config"], "app": "other-name"})
+    ordinary = o.h.store.update(
+        ordinary["id"], guild_id="301", config={**o.parent["config"], "app": "other-name", "auto_fix_pr": False}
+    )
     with pytest.raises(AlertError, match="already has an alert"):
         await o.h.alerts.answer(ordinary, o.h.bot, "CREATE")
     assert o.posts == 0
@@ -319,7 +333,7 @@ async def test_expiry_revokes_only_child_and_retains_journal(operator):
     assert status["state"] == "expired" and status["channel_id"] == "402"
     assert any("expired" in n["text"] for n in status["notices"])
     with pytest.raises(ValueError, match="expired"):
-        await call(o, "answer", session, sequence=7, text="CREATE")
+        await call(o, "answer", session, sequence=8, text="CREATE")
 
 
 async def test_socket_reconnect_preserves_completed_steps_and_refuses_uncertain_replay(operator):
@@ -450,9 +464,9 @@ async def test_concurrent_create_shares_source_lock_and_has_no_open_sqlite_trans
         return await original(config)
 
     o.h.adapter.check_credentials = AsyncMock(side_effect=check)
-    first = asyncio.create_task(call(o, "answer", session, sequence=6, text="CREATE"))
+    first = asyncio.create_task(call(o, "answer", session, sequence=7, text="CREATE"))
     await asyncio.wait_for(entered.wait(), 2)
-    second = asyncio.create_task(call(o, "answer", session, sequence=6, text="CREATE"))
+    second = asyncio.create_task(call(o, "answer", session, sequence=7, text="CREATE"))
     # Ordinary work can write through the same connection while the API read waits.
     ordinary = o.h.store.begin("worker", "101", "one", "201")
     assert o.h.store.get(ordinary["id"])["state"] == "draft"
@@ -475,7 +489,7 @@ async def test_inflight_credential_check_cannot_revive_expired_or_changed_rehear
         await release.wait()
 
     o.h.adapter.check_credentials = check
-    pending = asyncio.create_task(call(o, "answer", session, sequence=6, text="CREATE"))
+    pending = asyncio.create_task(call(o, "answer", session, sequence=7, text="CREATE"))
     await asyncio.wait_for(entered.wait(), 2)
     if change == "expiry":
         o.h.store.db.execute("UPDATE operator_rehearsals SET expires=0 WHERE id=?", (session,))
@@ -500,7 +514,7 @@ async def test_shutdown_cancels_inflight_answer_and_restart_requires_explicit_re
         await asyncio.Event().wait()
 
     o.h.adapter.check_credentials = check
-    pending = asyncio.create_task(call(o, "answer", session, sequence=6, text="CREATE"))
+    pending = asyncio.create_task(call(o, "answer", session, sequence=7, text="CREATE"))
     await asyncio.wait_for(entered.wait(), 2)
     await asyncio.wait_for(o.bridge.stop(), 2)
     with pytest.raises((ValueError, OSError)):
@@ -510,11 +524,11 @@ async def test_shutdown_cancels_inflight_answer_and_restart_requires_explicit_re
     o.h.adapter.check_credentials = original
     await o.bridge.start()
     with pytest.raises(ValueError, match="uncertain"):
-        await call(o, "answer", session, sequence=6, text="CREATE")
+        await call(o, "answer", session, sequence=7, text="CREATE")
     assert (await call(o, "resume", session))["last_step_state"] == "complete"
     assert o.posts == 0
     # Resume presents the current draft prompt; a new explicit CREATE is required.
-    assert (await call(o, "answer", session, sequence=7, text="CREATE"))["source_state"] == "provisional"
+    assert (await call(o, "answer", session, sequence=8, text="CREATE"))["source_state"] == "provisional"
     assert o.posts == 1
 
 
@@ -532,12 +546,16 @@ async def test_reopened_database_retains_steps_parent_binding_and_local_activati
     o.h.store = AlertStore(o.root / "state")
     for component in (o.h.alerts, o.h.lifecycle, o.h.alerts.worker, o.h.alerts.transport, o.h.adapter):
         component.store = o.h.store
+    from src.core.alert_fix_store import FixJobs
+
+    o.h.alerts.fix_controls.store = o.h.store
+    o.h.alerts.fix_controls.jobs = FixJobs(o.h.store)
     o.bridge = OperatorRehearsal(o.h.alerts, o.root / "state", o.key)
     o.h.alerts.operator = o.bridge
     o.h.lifecycle.expire_rehearsals = o.bridge.expire
     await o.bridge.start()
     assert (await call(o, "status", session)) == before
-    replay = await call(o, "answer", session, sequence=6, text="CREATE")
+    replay = await call(o, "answer", session, sequence=7, text="CREATE")
     assert replay["replayed"] and replay["source_state"] == "active" and o.posts == 1
 
 

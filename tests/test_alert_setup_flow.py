@@ -123,6 +123,7 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         "https://eu.posthog.com/project/123",
         "secrets/posthog-api-key",
         "created,reopened",
+        "no",
     ):
         await alerts.answer(alerts.store.get(source["id"]), bot, text)
     source = alerts.store.get(source["id"])
@@ -196,6 +197,15 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
 
     alerts.adapters["posthog"]._request = request
     monkeypatch.setattr(alert_diagnosis, "source_evidence", lambda *a: {"revision": "test", "snippets": []})
+    monkeypatch.setattr(
+        alert_diagnosis.AlertRepository,
+        "fetch",
+        lambda self, source, issue=None: {
+            "repo": source["config"]["repo"],
+            "revision": "HEAD",
+            "selection": "offline fixture",
+        },
+    )
     try:
         reply = await alerts.answer(source, bot, "CREATE")
         assert "Checking test delivery" in reply
@@ -255,6 +265,7 @@ async def test_natural_app_name_normalized_before_creation_confirmation(tmp_path
                 "host": "https://eu.posthog.com",
                 "api_key": "secrets/service-key",
                 "triggers": ["created"],
+                "auto_fix_pr": False,
             },
         )
         assert "Spaces and capitals are fine" in alerts.question(source, None)

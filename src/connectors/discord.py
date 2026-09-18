@@ -1446,6 +1446,11 @@ class DiscordBot:
         if payload.user_id == self.client.user.id:
             return
 
+        alerts = getattr(self.connector, "_alerts", None)
+        setup_reactions = getattr(alerts, "setup_reactions", None)
+        if setup_reactions and await setup_reactions.react(self, payload):
+            return
+
         if DiscordConnector._reserved_alert(self.connector, str(payload.channel_id)):
             return  # Phase 1 never escalates a reaction into a coding session.
         emoji = str(payload.emoji)

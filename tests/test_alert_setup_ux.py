@@ -29,6 +29,10 @@ class MemoryChannel:
         for message in reversed(self.messages):
             yield message
 
+    @staticmethod
+    def components(view):
+        return [SimpleNamespace(to_dict=lambda value=value: value) for value in view.to_components()] if view else []
+
     async def send(self, content, **kwargs):
         assert kwargs["allowed_mentions"].everyone is False
         message = SimpleNamespace(
@@ -37,6 +41,7 @@ class MemoryChannel:
             author=SimpleNamespace(id=999),
             webhook_id=None,
             nonce=kwargs.get("nonce"),
+            components=self.components(kwargs.get("view")),
             embeds=[kwargs["embed"]] if kwargs.get("embed") else [],
         )
 
@@ -44,6 +49,7 @@ class MemoryChannel:
             assert options["allowed_mentions"].everyone is False
             self.edits.append(content)
             message.content, message.embeds = content, [embed] if embed else []
+            message.components = self.components(options.get("view"))
             return message
 
         message.edit = edit
@@ -107,6 +113,7 @@ async def test_conversational_setup_uses_url_names_and_defaults_without_reading_
         "Look for posthog",
         "1",
         "yes",
+        "no",
     ):
         assert await ux.alerts.on_message(ux.bot, ux.message(text))
         replies.append(ux.channel.messages[-1].content)
@@ -535,6 +542,15 @@ async def test_drill_marker_survives_restart_and_title_alone_does_not_classify(t
             active_turns=0,
         )
         monkeypatch.setattr(alert_diagnosis, "source_evidence", lambda *args: {"revision": "test", "snippets": []})
+        monkeypatch.setattr(
+            alert_diagnosis.AlertRepository,
+            "fetch",
+            lambda self, source, issue=None: {
+                "repo": source["config"]["repo"],
+                "revision": "HEAD",
+                "selection": "offline fixture",
+            },
+        )
         adapter = SimpleNamespace(issue=AsyncMock(return_value={"name": "Deliberate test error"}))
         worker = alert_diagnosis.AlertWorker(
             h.store,
@@ -573,3 +589,30 @@ async def test_rate_limit_sentence_appears_only_after_real_budget_deferral(tmp_p
         assert len(room.messages) == 1
     finally:
         h.close()
+
+
+@pytest.mark.parametrize("answer,expected", [("yes", True), ("no", False)])
+async def test_auto_fix_choice_is_required_and_visible_in_create_summary(ux, answer, expected):
+    clone = repository(ux.root / "clone")
+    ux.store.update(
+        ux.source_id,
+        guild_id="301",
+        config={
+            "service": "posthog",
+            "app": "sample",
+            "repo": str(clone),
+            "project": "123",
+            "host": "https://eu.posthog.com",
+            "api_key": ux.names[0],
+            "triggers": ["created"],
+        },
+    )
+    assert "Open a fix PR automatically" in ux.alerts.question(ux.current(), ux.bot)
+    with pytest.raises(AlertError, match="yes or no"):
+        await ux.alerts.answer(ux.current(), ux.bot, "CREATE")
+    assert ux.current()["state"] == "draft"
+    reply = await ux.alerts.answer(ux.current(), ux.bot, answer)
+    assert ux.current()["config"]["auto_fix_pr"] is expected
+    assert "Automatic fix PRs: " + ("yes" if expected else "no, use Fix it") in reply
+    assert "Reply CREATE" in reply
+    ux.vault.get.assert_not_called()

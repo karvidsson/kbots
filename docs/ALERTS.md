@@ -1,14 +1,16 @@
 # Application alert channels
 
-Phase 1 receives application incidents in a private Discord channel, reads a
-bounded incident/source sample and posts a diagnosis with a proposed fix.
-It does not edit repositories, open PRs, change production or resolve issues.
+The service receives application incidents in a private Discord channel, reads a
+bounded incident/source sample and posts a diagnosis. Eligible real incidents
+continue to an isolated, tested fix PR linked from that same card. The service
+does not merge PRs, change production or resolve issues.
 
 This feature is opt-in. The adapter lives in `extras/`; it is not a default
 tool, and no model can call its provisioning operations.
 
 The application incident feature uses `src/core/alert_channels.py`,
-`alert_credentials.py`, `alert_diagnosis.py` and `alert_lifecycle.py`, with Discord routing in
+`alert_credentials.py`, `alert_diagnosis.py`, `alert_lifecycle.py`, and the
+`alert_fix_*` modules, with Discord routing in
 `src/connectors/discord_alerts.py`. The existing `src/core/alerts.py` and
 `alert_details.py` handle the platform's operational alert notices and details;
 those modules retain their separate purpose.
@@ -39,7 +41,16 @@ a sentence is accepted. The bot finds existing vault key names, choosing a sole
 match or offering a numbered list. A sole server is selected automatically;
 multiple servers accept a number, name or ID. Event selection defaults to all
 three; reply `yes`, `all`, an empty message or a comma-separated subset. The bot shows the concrete resources and event
-selection and requires `CREATE` before any provisioning. `CANCEL` stops setup.
+selection, then asks "Open a fix PR automatically for real errors? (yes/no)".
+Both the automatic-PR question and the final summary have bot-seeded ✅ and 🔴
+reactions. On the question, these mean yes and no. On the summary, they mean
+create and cancel. Only the setup user's reaction on the exact saved DM prompt
+counts; bot seeds and other users do not authorize anything. Bindings persist
+across restart and are invalidated by typed answers or changed setup state.
+No provisioning happens before the final confirmation. Typed `yes`/`no` and
+`CREATE`/`CANCEL` remain supported, including in operator answer files.
+If seeding fails, the bot says reaction controls are unavailable and keeps the
+typed prompt usable. A failed seed does not fail setup.
 
 Enter the app's natural name, including spaces and capitals. For example,
 `Example App` becomes `alerts-example-app`. Setup lowercases the
@@ -165,6 +176,7 @@ For example, when the vault presents more than one matching name:
   "use existing one",
   "secrets/posthog-api-key",
   "all",
+  "no",
   "CREATE"
 ]
 ```
@@ -543,3 +555,148 @@ Other read errors and timeouts before any sample response are held, not reported
 as empty evidence. Network reads are bounded by the remaining wait time; service
 load, Discord delivery, interrupted leases and model execution can add time to
 the overall alert. Human-facing drill wording avoids implementation field names.
+
+## Fresh source revisions and automatic fix PRs
+
+Diagnosis fetches the registered GitHub origin's advertised default branch into
+an independent bare cache under the alert data directory. It reads Git tree
+objects at the pinned fetched revision, including files absent from the shared
+checkout. A single reported release commit is preferred only when verified in
+that fetched history. Fetch errors hold diagnosis instead of silently using an
+old checkout. The shared clone's HEAD, index, working files and refs stay alone.
+Origin URLs containing credentials or pointing outside GitHub are refused.
+
+After diagnosis delivery is committed, a separate worker can ask the owning
+agent for a fix. `auto_fix_pr: true` starts this automatically. Existing
+registrations migrate to `false`, and setup requires an explicit yes/no choice. Created/reopened incidents qualify only when the triggering
+sample is positively identified, has no declared-drill match, and resolved a
+tracked source file. Setup checks, drills, unknown trigger classification,
+missing source and held diagnoses get a short `No PR` explanation on the same
+card. An explicit Fix it click permits source searching when no tracked frame
+resolved; the other eligibility and publication gates still apply. Unmarked means no declared marker was found; it cannot prove intent.
+
+The owning agent uses its configured model in a fresh session without native
+provider tools. Its structured JSON actions can read source, write source and a
+new regression test, request validation, or finish. The controller mediates all
+paths. It supplies structured diagnosis sections and bounded evidence as data,
+not a raw vendor payload or an ordinary agent conversation. The agent cannot
+select shell commands, remotes, endpoints, credentials or publishing options.
+
+Diagnosis first tries a fresh origin tree. For local/non-GitHub origins or a
+fetch/authentication failure, it instead reads the local clone's committed HEAD
+through Git objects, leaving the working tree untouched. The model context and
+card footer explicitly say the source may be stale. Fix preparation still
+requires a successful fresh fetch; stale evidence never supplies the fix base.
+
+Repairs use new private clones under `application-alerts/fixes/`, on
+`alert-fix/<issue-short>-<scope>` branches from a newly fetched default revision.
+The first runner supports npm/pnpm repositories with Vitest, a `typecheck`
+script and `test:unit` (or `test`). It also runs `lint` and `format:check` when
+present. Nuxt projects receive an offline `nuxt prepare` in both private trees.
+A new regression must produce an assertion failure on the original tree, pass
+on the candidate, and then all gates must pass. Infrastructure failures do not
+count as reproductions. The committed blobs are checked against the tested
+hashes before publication, including after restart.
+
+Gates run through macOS Seatbelt (`sandbox-exec`). Source, existing tests, Git
+metadata and dependency files are read-only to test processes. Only generated
+contents beneath pre-created build directories, private temporary directories
+and tool caches are writable. Their root entries cannot be renamed or replaced.
+The model cannot read or write artifact or dependency paths. Controller source
+reads, writes and baseline regression copies walk directory descriptors with
+`O_NOFOLLOW` on each component and refuse symlinks or multiply linked files.
+Artifact directory identities are rechecked before controller access.
+Network, external project/home reads, external writes, keychain access and
+signals to processes outside the sandbox are denied. Provider transport and
+controller-owned Git/GitHub operations remain outside that test sandbox.
+Each gate has a fresh inherited sandbox permission identity. A trusted launcher
+waits for the controller to verify that identity before executing repository code.
+Cleanup enumerates matching same-user processes, freezes them, rescans for forks,
+and kills them, including detached and reparented children. Controller access
+resumes only after no matching process remains and artifact roots are unchanged.
+A failed process census or cleanup quarantines the workspace and opens no PR.
+This uses macOS sandbox/process APIs; inability to verify them fails closed.
+Metadata access is scoped to the allowed trees and their ancestors.
+Unsupported operating systems fail closed with `No PR`; they do not use an
+unrestricted shell fallback.
+
+Dependencies are copied privately from the registered clone's installed cache,
+only when its committed manifests and lockfiles match the fetched base. No
+installation or package-registry access occurs. Missing or mismatched caches,
+dependency changes, workflow/configuration edits and modifications of existing
+tests are refused. This initial runner does not automatically repair dependency
+bugs or repositories requiring other test runners. Those cases receive a reason
+for manual follow-up. Private dependency copies are not links into the shared
+clone. Repository hooks do not run in the privileged controller; the discovered
+repository gates run inside the sandbox instead.
+
+The controller alone pushes the exact validated commit, without force, to the
+registered origin. It opens a ready-for-review PR with the issue link, cause,
+fix, regression and gate summary. It never merges, enables auto-merge, deploys,
+or changes a PostHog issue. The card progresses through `Writing fix…` to
+`PR #n ready` or `No PR: <reason>`. An existing issue PR is linked with its actual
+state rather than claimed as a newly tested fix. The committed Discord message
+ID is mandatory; the fix stage never creates a replacement message.
+
+SQLite stores a project/repository/issue deduplication key, source revision,
+lease, test proof, immutable commit, publication intents and card outbox.
+No transaction is held over model, Git, gate or network work. One process owns
+the existing store. Jobs have a 40-minute lease and a 35-minute execution ceiling;
+a killed process resumes after the lease expires, at most three times. Completed
+validation is reused only for its exact immutable commit. A lost PR response
+is reconciled using paginated GitHub PR reads. If an earlier create intent has
+no confirmed PR, it is held for review rather than posted again blindly.
+Failed attempts retain candidate work locally for review. Repeated notifications
+do not retry automatically. An owner click can request a new attempt, charged
+to the same rolling limit. Durable per-issue cycles keep prior validation and
+publication evidence; retries never discard uncertain publication intents.
+
+`alerts.fix_runs_per_day` sets the per-registration rolling 24-hour cap (default
+3, maximum 20). A registration-specific `fix_runs_per_day` takes precedence.
+The cap counts first starts, including owner-requested retries, not receipt
+arrival times or restart continuations.
+Disabling, deleting or revising the source invalidates the fix lease before any
+new publication operation. Cancelling that job does not stop the shared fix worker.
+Gate cancellation waits for sandbox cleanup before ending the job. Service
+shutdown retains the durable running lease for restart recovery. Requests already dispatched can still finish; their
+saved intent remains available for review. Retained, committed non-drill cards gain manual controls on upgrade, including
+older receipts without the new fix context. They are not automatically repaired
+on upgrade. Older sampled evidence is checked for trigger identity; explicit
+clicks can search the freshly fetched repository when prior frame mapping failed.
+
+Residual risk: hostile exception text or repository content can still steer a
+model toward a bad code change or a misleading regression. Isolation restricts
+effects and the before/after gates establish an executable check, not semantic
+correctness. Generated code, tests, private dependency caches and build tooling
+remain review inputs. Human PR review and existing branch protection remain
+necessary. A tested PR is the endpoint; resolving on merge is a separate feature.
+
+
+### Manual Fix it and later settings
+
+With `auto_fix_pr: false`, non-drill incident cards carry a persistent **Fix it**
+button. The custom ID binds registration and issue, and the handler additionally
+checks the exact saved message ID, bot, server, channel and registration revision.
+Only the setup user's Discord identity can click; other users, including other
+administrators and bots, receive an ephemeral refusal. No normal agent turn or
+chat text can authorize the run. Setup checks and declared drills have no button.
+
+The button is disabled until diagnosis delivery is committed and while the issue
+has a pending/running fix. Restarts restore the view against the saved message
+ID; the durable card outbox restores its enabled/disabled state. Concurrent
+clicks share one issue job. If a PR exists, a further click returns its link. If
+no PR was opened, the button is enabled again so the owner can retry. A retry of
+an uncertain publication only reconciles the saved intent, without a blind new
+POST. If no frame resolved, the explicit click allows the restricted fixer to
+search literal text in tracked source and docs itself; it still cannot read
+hidden files, dependencies or paths outside the private checkout.
+
+Use `/alerts settings auto_fix_pr:true source_id:<app-name-or-channel-id>` to
+enable automatic fixes, or pass `false` for manual buttons. The command is
+restricted to the same setup owner, requires one active registration and updates
+only this preference. It does not recreate resources, rotate a webhook, change
+the source revision or alter destination ownership. Enabling it can start
+eligible retained incidents that were awaiting a click. Turning it off returns
+unstarted automatic jobs to manual mode; a running or explicitly requested repair
+continues. The operator/rehearsal script uses the same yes/no setup question and
+records that answer in its normal transcript.

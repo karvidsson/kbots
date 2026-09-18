@@ -24,6 +24,15 @@ from tests.test_posthog_alerts import FakeResponse, FakeSession
 def delayed(tmp_path, monkeypatch):
     clock = SimpleNamespace(now=1000.0)
     monkeypatch.setattr(alert_diagnosis.time, "time", lambda: clock.now)
+    monkeypatch.setattr(
+        alert_diagnosis.AlertRepository,
+        "fetch",
+        lambda self, source, issue=None: {
+            "repo": source["config"]["repo"],
+            "revision": "HEAD",
+            "selection": "offline fixture",
+        },
+    )
     h = Harness(tmp_path / "state")
     room = MemoryChannel(401, guild=h.guild)
     h.bot.client.fetch_channel = AsyncMock(return_value=room)
@@ -113,6 +122,10 @@ def restart(d):
     d.h.store.close()
     d.h.store = AlertStore(directory)
     d.h.alerts.transport.store = d.h.store
+    from src.core.alert_fix_store import FixJobs
+
+    d.h.alerts.fix_controls.store = d.h.store
+    d.h.alerts.fix_controls.jobs = FixJobs(d.h.store)
     d.h.adapter.store = d.h.store
     d.worker = alert_diagnosis.AlertWorker(
         d.h.store,

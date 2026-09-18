@@ -122,6 +122,7 @@ async def test_bounded_diagnosis_card_bypasses_shortener(setup):
         "id": str(uuid.uuid4()),
         "issue_id": str(uuid.uuid4()),
         "issue_name": "E" * 150,
+        "state": "ready",
         "success": True,
         "result": result,
     }
@@ -133,6 +134,7 @@ async def test_bounded_diagnosis_card_bypasses_shortener(setup):
     assert embed.fields[0].value.endswith("…")
     assert all(len(field.value) <= 700 for field in embed.fields)
     assert "[alert:" not in embed.footer.text
+    assert room.messages[0].components[0].to_dict()["components"][0]["disabled"]
     connector._shortener.shorten.assert_not_called()
 
 
@@ -198,6 +200,7 @@ def test_commands_registered_when_opted_in(setup):
     _, _, bot, _ = setup
     bot._register_commands()
     assert bot.tree.get_command("alerts")
+    assert bot.tree.get_command("alerts").get_command("settings")
     assert bot.tree.get_command("alert").get_command("posthog")
 
 

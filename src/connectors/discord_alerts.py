@@ -13,10 +13,13 @@ from discord import app_commands
 from discord.state import ConnectionState
 
 from src.connectors.alert_embeds import incident_embed, incident_message, status_nonce
+from src.connectors.alert_fix_controls import FixControls
+from src.connectors.alert_setup_reactions import SetupReactions
 from src.core.alert_channels import AlertError, AlertStore, ensure_operation
 from src.core.alert_credentials import CredentialEntry
 from src.core.alert_diagnosis import AlertWorker, public_prose, public_text
 from src.core.alert_errors import failure_reason, log_failure
+from src.core.alert_fix_worker import AlertFixWorker
 from src.core.alert_lifecycle import AlertLifecycle
 from src.core.alert_operator import OperatorRehearsal
 from src.core.alert_repositories import resolve_repository
@@ -439,7 +442,7 @@ class DiscordAlertTransport:
                 or current["state"] not in {"active", "provisional"}
             ):
                 raise AlertError("Registration changed before posting")
-            if row and (row["state"] == "complete" or (step != "result" and row["state"] == "ready")):
+            if step != "fix" and row and (row["state"] == "complete" or (step != "result" and row["state"] == "ready")):
                 return None
             if step == "queued" and row and row["state"] != "pending":
                 return None
@@ -470,7 +473,10 @@ class DiscordAlertTransport:
                 ):
                     raise AlertError("Registration changed before posting")
                 message = await channel.send(
-                    **incident_message(embed, channel), nonce=nonce, allowed_mentions=discord.AllowedMentions.none()
+                    **incident_message(embed, channel),
+                    nonce=nonce,
+                    view=self.fix_controls.view(source, receipt),
+                    allowed_mentions=discord.AllowedMentions.none(),
                 )
                 return {"id": str(message.id)}
 
@@ -481,16 +487,25 @@ class DiscordAlertTransport:
             ).fetchone()
             if step == "result" and legacy and legacy["state"] == "complete":
                 return json.loads(legacy["result"])
-            result = await ensure_operation(self.store, source, "status:" + receipt["id"], find, create)
+            if step == "fix":
+                if not row or row["state"] != "complete" or not receipt.get("result_message"):
+                    raise AlertError("Fix card requires a committed diagnosis message")
+                result = {"id": receipt["result_message"]}
+            else:
+                result = await ensure_operation(self.store, source, "status:" + receipt["id"], find, create)
             message = await channel.fetch_message(int(result["id"]))
             if message.author.id != bot_id or message.webhook_id or str(message.id) != result["id"]:
                 raise AlertError("Diagnosis status message changed; refusing to edit it")
             # Repeat edits are safe after a lost edit response. Repeat sends are not.
             formatted = incident_message(embed, channel)
+            formatted["view"] = self.fix_controls.view(source, receipt)
             expected_embeds = [formatted["embed"].to_dict()] if formatted["embed"] else []
-            if (message.content or "") != formatted["content"] or [
-                e.to_dict() for e in message.embeds
-            ] != expected_embeds:
+            if (
+                (message.content or "") != formatted["content"]
+                or [e.to_dict() for e in message.embeds] != expected_embeds
+                or [c.to_dict() for c in getattr(message, "components", [])]
+                != (formatted["view"].to_components() if formatted["view"] else [])
+            ):
                 current = self.store.get(source["id"])
                 if (
                     not current
@@ -526,6 +541,29 @@ class DiscordAlertTransport:
     async def report(self, source, receipt):
         return await self._notice(source, receipt, "result", incident_embed(source, receipt, "result"))
 
+    async def fix_status(self, source, receipt, job):
+        embed = incident_embed(source, receipt, "result")
+        result = job["result"]
+        if pr := result.get("pr"):
+            state = "merged" if pr["merged"] else "draft" if pr["draft"] else pr["state"]
+            if not result.get("existing") and state == "open":
+                state = "ready"
+            label = ("Existing " if result.get("existing") else "") + f"PR #{pr['number']} {state}"
+            value = f"[{label}]({pr['url']})"
+        elif job["state"] == "waiting":
+            value = "Use Fix it to request a tested PR."
+        elif job["state"] in {"pending", "running"}:
+            value = "Writing fix…" if job["state"] == "running" else "Queued for a fix."
+        else:
+            value = "No PR: " + public_prose(result.get("reason", "fix unavailable"), 250)
+            if result.get("pr_intent"):
+                value = "PR not confirmed: " + public_prose(result.get("reason", "publication uncertain"), 220)
+        if job["state"] == "skipped":
+            embed.set_footer(text=embed.footer.text + " · " + value)
+        else:
+            embed.add_field(name="Fix PR", value=value, inline=False)
+        return await self._notice(source, receipt, "fix", embed)
+
 
 class DiscordAlerts:
     def __init__(self, connector, config, directory):
@@ -545,6 +583,14 @@ class DiscordAlerts:
             self.store, self.adapters, self.transport, self.worker, self.locks, connector.vault
         )
         self.worker.accounts = set()
+        self.fixer = AlertFixWorker(
+            self.store, connector._agent_manager, self.transport, directory, config.get("fix_runs_per_day", 3)
+        )
+        self.worker.fixer = self.fixer
+        self.fix_controls = FixControls(self)
+        self.setup_reactions = SetupReactions(self)
+        self.transport.fix_controls = self.fix_controls
+        self.fix_task = None
         self.lifecycle_task = None
         self.operator = OperatorRehearsal(self, directory)
         self.lifecycle.expire_rehearsals = self.operator.expire
@@ -559,6 +605,8 @@ class DiscordAlerts:
             await self.lifecycle.reconcile(account)
             self.lifecycle.accounts.add(account)
             self.worker.accounts.add(account)
+            self.fixer.accounts.add(account)
+            self.fix_controls.restore(account)
             if self.task is None:
                 await self.credentials.start()
                 if self.config.get("operator_rehearsal") is True:
@@ -569,10 +617,11 @@ class DiscordAlerts:
                         log_failure(error, "operator rehearsal startup")
                 self.task = asyncio.create_task(self.worker.run(), name="alert-worker")
                 self.lifecycle_task = asyncio.create_task(self.lifecycle.run(), name="alert-lifecycle")
+                self.fix_task = asyncio.create_task(self.fixer.run(), name="alert-fixes")
 
     async def stop(self):
         self.worker.stopped = True
-        for task in (self.task, self.lifecycle_task):
+        for task in (self.task, self.lifecycle_task, self.fix_task):
             if task:
                 task.cancel()
                 try:
@@ -610,6 +659,10 @@ class DiscordAlerts:
         async def rotate(interaction: discord.Interaction, source_id: str = ""):
             await self.command(bot, interaction, "rotate", source_id)
 
+        @group.command(name="settings", description="Choose automatic PRs or the Fix it button")
+        async def settings(interaction: discord.Interaction, auto_fix_pr: bool, source_id: str = ""):
+            await self.fix_controls.setting(bot, interaction, auto_fix_pr, source_id)
+
         bot.tree.add_command(group)
         alias = app_commands.Group(name="alert", description="Application alert setup")
 
@@ -642,9 +695,26 @@ class DiscordAlerts:
             return
         if not source["config"]:
             source = self.store.update(source["id"], config={"service": service, "message_format": 2})
-        await interaction.response.send_message(
-            self.question(source, bot), allowed_mentions=discord.AllowedMentions.none()
-        )
+        async with self.locks.setdefault(source["id"], asyncio.Lock()):
+            current = self.store.get(source["id"])
+            if not current or current["state"] != "draft" or not current["waiting"]:
+                await interaction.response.send_message("Setup changed. Use /alerts status to see its current state.")
+                return
+            text = self.question(current, bot)
+            source = self.store.get(source["id"])
+            await interaction.response.send_message(
+                self.setup_reactions.prompt(source, text), allowed_mentions=discord.AllowedMentions.none()
+            )
+            if self.setup_reactions.phase(source):
+                try:
+                    message = await interaction.original_response()
+                except Exception as error:
+                    log_failure(error, "setup reaction response lookup")
+                    await interaction.followup.send(
+                        "Reaction controls are unavailable. " + text, allowed_mentions=discord.AllowedMentions.none()
+                    )
+                else:
+                    await self.setup_reactions.seed(bot, message, source, text)
 
     def credential_names(self, service):
         listing = getattr(self.connector.vault, "list_keys", None)
@@ -712,6 +782,8 @@ class DiscordAlerts:
                 "Alert on all issue events: created, reopened and spiking? Reply yes or all (the default), "
                 "or choose a comma-separated subset."
             )
+        elif type(config.get("auto_fix_pr")) is not bool:
+            prompt = "Open a fix PR automatically for real errors? (yes/no)"
         else:
             guild = (
                 next((g.name for g in bot.client.guilds if str(g.id) == source["guild_id"]), source["guild_id"])
@@ -723,6 +795,7 @@ class DiscordAlerts:
                 f"for {config['service']} project {config['project']}? "
                 f"Repository: `{self.repository_label(config['repo'])}`. "
                 f"Events: {', '.join(config['triggers'])}. "
+                f"Automatic fix PRs: {'yes' if config['auto_fix_pr'] else 'no, use Fix it'}. "
                 f"Project: {config['host']}/project/{config['project']}. Key: {config['api_key']}. "
                 "This creates a private channel, webhook and service destination, then sends a diagnostic test. "
                 "Reply CREATE to proceed or CANCEL to stop."
@@ -782,6 +855,10 @@ class DiscordAlerts:
             if not kinds or set(kinds) - set(self.adapters[config["service"]].triggers):
                 raise AlertError("Choose created, reopened, spiking, or all")
             config["triggers"] = kinds
+        elif type(config.get("auto_fix_pr")) is not bool:
+            if text.casefold() not in {"yes", "no"}:
+                raise AlertError("Reply yes or no: open a fix PR automatically for real errors?")
+            config["auto_fix_pr"] = text.casefold() == "yes"
         elif text.upper() == "CREATE":
             for row in self.store.db.execute(
                 "SELECT id FROM sources WHERE guild_id=? AND id!=? AND state!='disabled'",
@@ -793,6 +870,13 @@ class DiscordAlerts:
                         continue
                     raise AlertError("This app already has an alert registration. Use /alerts status or /alerts rotate")
             await self.adapters[config["service"]].check_credentials(config)
+            current = self.store.get(source["id"])
+            if (
+                not current
+                or current["state"] != "draft"
+                or self.setup_reactions.binding(current) != self.setup_reactions.binding(source)
+            ):
+                raise AlertError("Setup was revoked or changed; confirm its current summary before creating resources")
             self.operator.check_creation(source)
             source = self.store.update(source["id"], state="provisioning")
             return await self.provision(source)
@@ -948,21 +1032,30 @@ class DiscordAlerts:
             current = self.store.get(source["id"])
             if not current or current["state"] != "draft" or not current["waiting"]:
                 return False
-            self.store.update(source["id"], waiting=0)
-            try:
-                response = await self.answer(self.store.get(source["id"]), bot, message.content)
-            except Exception as error:
-                log_failure(error, "setup")
-                response = public_text(failure_reason(error))
-                current = self.store.get(source["id"])
-                if current and current["state"] in {"provisioning", "provisional"}:
-                    self.store.notify_setup(current, "Alert setup is held: " + response, "provision-held")
-                    self.lifecycle.wake.set()
-                    response = None
-            finally:
-                current = self.store.get(source["id"])
-                if current and current["state"] == "draft":
-                    self.store.update(source["id"], waiting=1)
-        if response is not None:
-            await message.channel.send(response, allowed_mentions=discord.AllowedMentions.none())
+            response = await self.setup_answer(current, bot, message.content)
+            if response is not None:
+                await self.setup_reactions.send(bot, message.channel, self.store.get(source["id"]), response)
         return True
+
+    async def setup_answer(self, source, bot, text):
+        """Typed and reaction answers share the source lock and durable transition."""
+        with self.store.transaction():
+            self.setup_reactions.invalidate(source)
+            self.store.update(source["id"], waiting=0)
+        try:
+            response = await self.answer(self.store.get(source["id"]), bot, text)
+        except Exception as error:
+            log_failure(error, "setup")
+            response = public_text(failure_reason(error))
+            current = self.store.get(source["id"])
+            if current and current["state"] == "draft":
+                response += "\n\n" + self.question(current, bot)
+            if current and current["state"] in {"provisioning", "provisional"}:
+                self.store.notify_setup(current, "Alert setup is held: " + response, "provision-held")
+                self.lifecycle.wake.set()
+                response = None
+        finally:
+            current = self.store.get(source["id"])
+            if current and current["state"] == "draft":
+                self.store.update(source["id"], waiting=1)
+        return response
