@@ -82,7 +82,7 @@ async def test_resolved_clone_is_announced_and_in_create_confirmation(ux, monkey
     reply = await ux.alerts.answer(ux.current(), ux.bot, f"The repository is here: {REMOTE}" if as_url else str(clone))
     assert reply.startswith("Found the clone at `~/dev/actual-clone-name`.\n\n")
     assert "What is the PostHog project URL?" in reply
-    for answer in ("https://eu.posthog.com/project/123/home", "1", "all"):
+    for answer in ("https://eu.posthog.com/project/123/home", "1", "all", "no"):
         reply = await ux.alerts.answer(ux.current(), ux.bot, answer)
     assert "Repository: `~/dev/actual-clone-name`." in reply and "Reply CREATE" in reply
     assert ux.current()["config"]["repo"] == str(clone)

@@ -4,7 +4,6 @@ import asyncio
 import contextlib
 import json
 import re
-import subprocess
 import tempfile
 import time
 import unicodedata
@@ -13,6 +12,7 @@ from pathlib import Path, PurePosixPath
 
 from src.core.alert_channels import AlertError
 from src.core.alert_errors import failure_reason, log_failure
+from src.core.alert_git import AlertRepository, git
 from src.core.base import Message, MessageRole
 
 SOURCE_EXTENSIONS = {".py", ".ts", ".tsx", ".js", ".jsx", ".vue", ".rs", ".go", ".java", ".rb"}
@@ -93,23 +93,22 @@ def frame_selections(issue, names):
     return matches[:4], unresolved[:24]
 
 
-def source_evidence(repo, issue):
+def source_evidence(repo, issue, revision="HEAD"):
     """Tracked source only, no config/credential files, no symlinks or hooks."""
     root = Path(repo).resolve(strict=True)
     if not root.is_dir():
         raise AlertError("Registered repository is unavailable")
-    try:
-        result = subprocess.run(["git", "-C", str(root), "ls-files", "-z"], capture_output=True, check=True, timeout=10)
-        revision = (
-            subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"], capture_output=True, check=True, timeout=10)
-            .stdout.decode()
-            .strip()
-        )
-    except (subprocess.SubprocessError, OSError):
-        raise AlertError("Registered repository cannot be inspected") from None
-    if len(result.stdout) > 2_000_000:
-        raise AlertError("Repository inventory exceeds the diagnostic bound")
-    names = result.stdout.decode(errors="replace").split("\0")
+    revision = git(root, "rev-parse", "--verify", revision + "^{commit}").decode().strip()
+    inventory = git(root, "ls-tree", "-rz", "--full-tree", revision)
+    entries = {}
+    for entry in inventory.split(b"\0"):
+        if not entry:
+            continue
+        meta, name = entry.split(b"\t", 1)
+        mode, kind, oid = meta.decode().split()
+        if mode in {"100644", "100755"} and kind == "blob":
+            entries[name.decode(errors="replace")] = oid
+    names = list(entries)
     eligible = []
     for name in names:
         path = Path(name)
@@ -130,15 +129,10 @@ def source_evidence(repo, issue):
     no_frame_match = has_frames and not selected
     snippets = []
     for name in selected if selected else [] if no_frame_match else eligible[:300]:
-        path = root / name
-        if (
-            path.is_symlink()
-            or not path.resolve().is_relative_to(root)
-            or not path.is_file()
-            or path.stat().st_size > 60_000
-        ):
+        oid = entries[name]
+        if int(git(root, "cat-file", "-s", oid)) > 60_000:
             continue
-        text = path.read_text(errors="replace")
+        text = git(root, "cat-file", "blob", oid).decode(errors="replace")
         if selected or Path(name).name in json.dumps(issue) or any(word in text for word in needles):
             snippets.append({"path": name, "source": public_text(text, 5000)})
         if len(snippets) >= 4:
@@ -262,8 +256,11 @@ class AlertWorker:
         self.stopped = False
         self.accounts = None  # Connector enables each account after startup reconciliation.
         self.running = {}
+        self.repositories = AlertRepository(directory)
 
     def cancel_source(self, source_id):
+        if getattr(self, "fixer", None):
+            self.fixer.cancel_source(source_id)
         task = self.running.get(source_id)
         if task:
             task.cancel()
@@ -383,6 +380,7 @@ class AlertWorker:
 
         progress = asyncio.create_task(updates())
         try:
+            self.store.save_fix_context(receipt, {"attempted": True})
             issue = await self._evidence(source, receipt)
             if issue is None:
                 return True
@@ -402,7 +400,9 @@ class AlertWorker:
                 sample_drill_status=sample_status,
             )
             await self.transport.progress(source, receipt)
-            evidence = await asyncio.to_thread(source_evidence, source["config"]["repo"], issue)
+            tree = await asyncio.to_thread(self.repositories.evidence_tree, source, issue)
+            evidence = await asyncio.to_thread(source_evidence, tree["repo"], issue, tree["revision"])
+            evidence["revision_selection"] = tree["selection"]
             paths = [m["path"] for m in evidence.get("frame_matches", [])]
             has_frames = any(e.get("frames") for e in sample.get("exceptions", []))
             self.store.annotate(
@@ -414,6 +414,15 @@ class AlertWorker:
                     if has_frames
                     else "Source: no in-app source frame was available."
                 ),
+                source_stale=tree.get("stale") is True,
+            )
+            self.store.save_fix_context(
+                receipt,
+                {
+                    "tree": tree,
+                    "evidence": evidence,
+                    "trigger_unmarked": sample_status == "unmarked" and sample.get("matches_trigger") is True,
+                },
             )
             result = await diagnose(self.manager, source, issue, self.directory, evidence=evidence)
             if setup_test:

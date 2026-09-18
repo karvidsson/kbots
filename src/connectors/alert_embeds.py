@@ -96,7 +96,10 @@ def incident_embed(source, receipt, step, status=""):
     service = "PostHog" if config.get("service") == "posthog" else public_text(config.get("service", "Alerts"), 30)
     kind = receipt.get("kind", "issue").removeprefix("$error_tracking_issue_")
     kind = kind if kind in {"created", "reopened", "spiking"} else "issue"
-    embed.set_footer(text=f"{service} · {kind} · issue {receipt['issue_id'][:8]}")
+    footer = f"{service} · {kind} · issue {receipt['issue_id'][:8]}"
+    if receipt.get("source_stale"):
+        footer += " · Local source snapshot; may be stale"
+    embed.set_footer(text=footer)
     return embed
 
 

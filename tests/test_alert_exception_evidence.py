@@ -453,6 +453,15 @@ async def test_worker_preserves_sample_scope_through_model_and_restart(
             active_turns=0,
         )
         monkeypatch.setattr(alert_diagnosis, "source_evidence", lambda *args: {"snippets": []})
+        monkeypatch.setattr(
+            alert_diagnosis.AlertRepository,
+            "fetch",
+            lambda self, source, issue=None: {
+                "repo": source["config"]["repo"],
+                "revision": "HEAD",
+                "selection": "offline fixture",
+            },
+        )
         adapter = SimpleNamespace(
             issue=AsyncMock(return_value={"name": "Error", "sample": {"drill_status": sample_status}})
         )
@@ -466,6 +475,10 @@ async def test_worker_preserves_sample_scope_through_model_and_restart(
         h.store.close()
         h.store = AlertStore(tmp_path)
         h.alerts.transport.store = h.store
+        from src.core.alert_fix_store import FixJobs
+
+        h.alerts.fix_controls.store = h.store
+        h.alerts.fix_controls.jobs = FixJobs(h.store)
         receipt = h.store.ready()[0]
         assert receipt["sample_drill_status"] == sample_status
         assert receipt["result"].startswith(prefix)

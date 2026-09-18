@@ -85,6 +85,12 @@ class AlertStore:
             self.db.execute("ALTER TABLE receipts ADD COLUMN evidence TEXT NOT NULL DEFAULT '{}'")
         if "evidence_retry" not in receipt_columns:
             self.db.execute("ALTER TABLE receipts ADD COLUMN evidence_retry INTEGER NOT NULL DEFAULT 0")
+        if "fix_context" not in receipt_columns:
+            self.db.execute("ALTER TABLE receipts ADD COLUMN fix_context TEXT NOT NULL DEFAULT '{}'")
+        self.db.execute(
+            "UPDATE sources SET config=json_set(config,'$.auto_fix_pr',json('false')) "
+            "WHERE state!='draft' AND json_type(config,'$.auto_fix_pr') IS NULL"
+        )
         # A restart during local lookup must not strand an unfinished draft.
         self.db.execute("UPDATE sources SET waiting=1 WHERE state='draft' AND waiting=0")
         # Existing cleaned rows only establish a disable, never a removal.
@@ -434,7 +440,12 @@ class AlertStore:
 
     @staticmethod
     def _receipt(row):
-        return {**dict(row), **json.loads(row["presentation"]), "evidence": json.loads(row["evidence"])}
+        return {
+            **dict(row),
+            **json.loads(row["presentation"]),
+            "evidence": json.loads(row["evidence"]),
+            "fix_context": json.loads(row["fix_context"]),
+        }
 
     def checkpoint_evidence(self, receipt, evidence):
         changed = self.db.execute(
@@ -480,7 +491,15 @@ class AlertStore:
         return 15 if row[0] is None else max(0.1, min(15, row[0] - time.time()))
 
     def annotate(self, receipt, **values):
-        allowed = {"issue_name", "issue_title", "setup_test", "drill", "sample_drill_status", "source_summary"}
+        allowed = {
+            "issue_name",
+            "issue_title",
+            "setup_test",
+            "drill",
+            "sample_drill_status",
+            "source_summary",
+            "source_stale",
+        }
         if set(values) - allowed:
             raise AlertError("Invalid incident presentation")
         row = self.db.execute(
@@ -495,6 +514,13 @@ class AlertStore:
             (json.dumps(presentation), receipt["id"], receipt["lease"]),
         )
         receipt.update(presentation)
+
+    def save_fix_context(self, receipt, context):
+        self.db.execute(
+            "UPDATE receipts SET fix_context=? WHERE id=? AND lease=? AND state='running'",
+            (json.dumps(context), receipt["id"], receipt["lease"]),
+        )
+        receipt["fix_context"] = context
 
     def save_result(self, receipt, result, success=True):
         return (
