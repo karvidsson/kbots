@@ -117,9 +117,12 @@ async def test_duplicate_clicks_disable_one_run_and_no_pr_restores_retry(setup):
             "merged": False,
         },
     )
-    i = interaction(o)
-    await button(controls, o, r).callback(i)
-    assert "/pull/7" in i.followup.send.call_args.args[0]
+    # A finished repair replaces the control with a link to its PR, so the card
+    # cannot be clicked into a second run and shows the outcome at a glance.
+    await o.h.alerts.fixer.notices()
+    link = button(controls, o, r)
+    assert link.label == "PR #7" and link.url == "https://github.com/example/sample/pull/7"
+    assert link.custom_id is None and link.style is discord.ButtonStyle.link
     assert jobs.claim() is None and len(o.room.messages) == 1
 
 
@@ -295,3 +298,19 @@ async def test_legacy_setup_event_without_presentation_flag_never_gets_button_or
     assert o.h.alerts.fixer.jobs.claim() is None
     o.source = o.h.store.update(o.source["id"], config={**o.source["config"], "auto_fix_pr": False})
     assert o.h.alerts.fix_controls.view(o.source, r) is None
+
+
+async def test_button_label_shows_whether_a_repair_ran(setup):
+    o = setup
+    controls = manual(o)
+    r = await delivered(o)
+    assert button(controls, o, r).label == "Fix it"
+    await button(controls, o, r).callback(interaction(o))
+    await o.h.alerts.fixer.notices()
+    queued = button(controls, o, r)
+    assert queued.label == "Writing fix…" and queued.disabled
+    job = controls.jobs.claim()
+    controls.jobs.save(job, state="failed", reason="repository gate failed")
+    await o.h.alerts.fixer.notices()
+    retry = button(controls, o, r)
+    assert retry.label == "Fix it again" and not retry.disabled

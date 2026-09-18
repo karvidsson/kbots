@@ -27,11 +27,19 @@ class FixControls:
         current = self.receipt(receipt["id"]) or receipt
         job = self.jobs.for_receipt(current)
         view = discord.ui.View(timeout=None)
+        # The control itself carries the state, so a used button never reads as
+        # untouched: a link to the PR once one exists, otherwise a label saying
+        # whether a repair is running or has already been attempted.
+        if job and (pr := job["result"].get("pr")):
+            view.add_item(discord.ui.Button(label=f"PR #{pr['number']}", url=pr["url"], style=discord.ButtonStyle.link))
+            return view
+        running = bool(job and job["state"] in {"pending", "running"})
+        attempted = bool(job and job["state"] in {"complete", "failed"} and job["attempts"])
         button = discord.ui.Button(
-            label="Fix it",
-            style=discord.ButtonStyle.primary,
+            label="Writing fix…" if running else "Fix it again" if attempted else "Fix it",
+            style=discord.ButtonStyle.secondary if running else discord.ButtonStyle.primary,
             custom_id="alert-fix:" + source["id"] + ":" + receipt["issue_id"],
-            disabled=current["state"] != "complete" or bool(job and job["state"] in {"pending", "running"}),
+            disabled=current["state"] != "complete" or running,
         )
 
         async def clicked(interaction):
