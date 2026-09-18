@@ -22,6 +22,10 @@ setup = setup_fixture
 
 @pytest.fixture
 def workspace(tmp_path):
+    # FixWorkspace builds a real FixSandbox, which exists only on macOS. Linux
+    # CI skips these cases instead of erroring at fixture setup.
+    if platform.system() != "Darwin":
+        pytest.skip("macOS OS-sandbox acceptance")
     registered = tmp_path / "registered"
     registered.mkdir()
     run(registered, "init", "-q", "-b", "main")
