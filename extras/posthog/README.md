@@ -5,7 +5,7 @@ private API host `eu.posthog.com` or `us.posthog.com`, not the ingestion host.
 One vault reference supplies the API key for provisioning and diagnosis.
 An existing token can be used directly, including an all-access key, without
 rewriting it. Its name is not evidence of scope. The runtime adapter permits
-fixed issue GETs and two fixed read-only issue-sample POST shapes; the diagnostic
+fixed issue GETs and fixed read-only issue-sample POST shapes; the diagnostic
 model receives neither the key nor an HTTP tool. Provisioning needs Hog function
 read/write access for reconciliation,
 creation, test invocation, disabling and soft-deleting the owned destination.
@@ -99,23 +99,32 @@ deployed revision; offline transport doubles are not evidence of vendor delivery
 ## Exception evidence
 
 In addition to the summary GET, incident processing may POST only to
-`error_tracking/query/issue_events/` with either of these two body shapes. Both
-requests share one absolute seven-day UTC window ending when the sample fetch
-starts:
+`error_tracking/query/issue_events/` with the fixed body below and only the
+optional exact UUID and `test=true` clauses described here. All reads share one
+absolute seven-day UTC window ending when the sample fetch starts:
 
 ```json
 {"issueId":"<canonical issue UUID>","limit":1,"onlyAppFrames":true,"filterTestAccounts":false,"include":["exception","stacktrace","release"],"dateRange":{"date_from":"<UTC start>","date_to":"<UTC end>"}}
 ```
 
 The pinned [query view](https://github.com/PostHog/posthog/blob/e4aa96a7ea4679a5004a0ad1c2630c7992f5af80/products/error_tracking/backend/presentation/views/query.py)
-marks this as `error_tracking:read`. It samples the most recent event in the explicit
-seven-day window. The filtered request adds only
-`"filterGroup":[{"key":"test","value":["true"],"operator":"exact","type":"event"}]`.
+marks this as `error_tracking:read` and forwards `filterGroup` to event properties.
+When a bound triggering event UUID is available, the first request adds
+`"filterGroup":[{"key":"uuid","value":["<canonical event UUID>"],"operator":"exact","type":"event_metadata"}]`.
+The [property parser](https://github.com/PostHog/posthog/blob/e4aa96a7ea4679a5004a0ad1c2630c7992f5af80/posthog/hogql/property.py)
+resolves this to the event's `uuid` column, not `properties.uuid`.
+The classification probe adds exactly one `test=true` clause after the UUID:
+`{"key":"test","value":["true"],"operator":"exact","type":"event"}`.
+If the exact read fails, is empty or returns a different UUID, a query without
+the UUID filter retrieves the latest sample in the same window. Its probe uses
+the selected sample UUID when valid. Legacy callers without a trigger ID keep
+the latest-sample query and optional test-only filter.
 The runtime accepts only canonical UTC second-resolution endpoints exactly seven
 days apart, ending within five minutes of request time (one minute of future
 clock tolerance). Caller-selected wider, relative or historical windows are refused.
-This is not necessarily the exception that triggered the
-lifecycle notification. Missing samples are stated explicitly.
+Fallback samples are not necessarily the triggering event. Their identity is
+not confirmed unless the returned UUID matches the trigger; missing samples are
+stated explicitly.
 
 The runtime rejects any extra field, larger limit, different include group,
 false application-frame filter or alternate endpoint on this path. It never
@@ -127,7 +136,7 @@ mandatory. Only up to three exception type/value pairs and 24 application frames
 sessions and arbitrary release metadata are not forwarded. Up to three release
 versions and validated Git commit hashes are retained for revision comparison. Frame URL query strings and
 credentials are discarded. Existing response-size, credential-host, redirect and
-request-budget limits apply to both reads.
+request-budget limits apply to every read, including fallback.
 
 Classification is `drill` only when the filtered result has the same exception
 UUID as the unfiltered sample. The UUID is compared internally and discarded,
@@ -144,7 +153,8 @@ sample and exposes only `matches_trigger` (true, false or unknown), not either
 raw ID. Exact equality lets the diagnosis state the triggering event's declared
 drill status without a sample-identity caveat. Missing or different IDs retain the
 caveat. The existing response projection already returns `uuid` independently of
-`include`; neither request body nor read scope is widened. Diagnosis runs for
+`include`; the new exact UUID filter does not add include groups or widen the
+window, limit, returned projection or read endpoint. Diagnosis runs for
 drills too, explaining the reporting path rather than proposing removal of the
 intentional debug route.
 

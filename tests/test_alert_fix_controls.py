@@ -271,7 +271,7 @@ async def test_switching_off_stops_unstarted_auto_job_and_preserves_manual_inten
     assert job and job["payload"]["manual"]
 
 
-async def test_unknown_trigger_cannot_be_promoted_by_button(setup):
+async def test_owner_can_request_unconfirmed_trigger_with_durable_warning(setup):
     import json
 
     o = setup
@@ -280,9 +280,12 @@ async def test_unknown_trigger_cannot_be_promoted_by_button(setup):
     r["fix_context"]["trigger_unmarked"] = False
     o.h.store.db.execute("UPDATE receipts SET fix_context=? WHERE id=?", (json.dumps(r["fix_context"]), r["id"]))
     await button(controls, o, r).callback(interaction(o))
-    assert controls.jobs.claim() is None
-    assert not button(controls, o, r).disabled
-    assert "classification" in controls.jobs.for_receipt(r)["result"]["reason"]
+    job = controls.jobs.claim()
+    assert job and job["payload"]["manual"] and job["payload"]["drill_status_unconfirmed"]
+    assert button(controls, o, r).disabled
+    from tests.test_alert_setup_ux import visible_text
+
+    assert "drill status unconfirmed" in visible_text(o.room.messages[0])
 
 
 async def test_legacy_setup_event_without_presentation_flag_never_gets_button_or_auto_fix(setup):

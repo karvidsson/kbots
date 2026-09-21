@@ -82,6 +82,8 @@ class FixPublisher:
             "and passed with this fix.\n\n"
             f"Repository gates:\n{summary}\n\nOpened automatically from alert {issue}\n"
         )
+        if report.get("drill_status_unconfirmed") is True:
+            body += "\nRequested explicitly with Fix it; drill status unconfirmed.\n"
         result = github(
             f"repos/{tree['identity']}/pulls",
             {

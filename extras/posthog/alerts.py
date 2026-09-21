@@ -276,7 +276,7 @@ class PostHogAdapter:
             return False
 
     @staticmethod
-    def sample_request(issue_id, *, date_range=None, drill=False):
+    def sample_request(issue_id, *, date_range=None, drill=False, event_id=None):
         if date_range is None:
             end = datetime.fromtimestamp(time.time(), UTC).replace(microsecond=0)
             date_range = {
@@ -291,8 +291,17 @@ class PostHogAdapter:
             "include": ["exception", "stacktrace", "release"],
             "dateRange": dict(date_range),
         }
+        filters = []
+        if event_id is not None:
+            # UUID is an event column, not an event property. The issue_events
+            # serializer forwards these flat AND filters to EventsQuery.
+            filters.append(
+                {"key": "uuid", "value": [str(uuid.UUID(event_id))], "operator": "exact", "type": "event_metadata"}
+            )
         if drill:
-            body["filterGroup"] = [{"key": "test", "value": ["true"], "operator": "exact", "type": "event"}]
+            filters.append({"key": "test", "value": ["true"], "operator": "exact", "type": "event"})
+        if filters:
+            body["filterGroup"] = filters
         return body
 
     @classmethod
@@ -311,13 +320,20 @@ class PostHogAdapter:
                 dates.append(datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC))
             if dates[1] - dates[0] != timedelta(days=7) or not -60 <= time.time() - dates[1].timestamp() <= 300:
                 return False
+            filters = payload.get("filterGroup", [])
+            if not isinstance(filters, list) or len(filters) > 2:
+                return False
+            event_id = None
+            if filters and filters[0].get("key") == "uuid":
+                event_id = filters[0]["value"][0]
+            drill = bool(filters and filters[-1].get("key") == "test")
             return (
-                payload == cls.sample_request(payload["issueId"], date_range=window, drill="filterGroup" in payload)
+                payload == cls.sample_request(payload["issueId"], date_range=window, drill=drill, event_id=event_id)
                 and type(payload["limit"]) is int
                 and payload["onlyAppFrames"] is True
                 and payload["filterTestAccounts"] is False
             )
-        except (ValueError, TypeError, AttributeError, KeyError):
+        except (ValueError, TypeError, AttributeError, KeyError, IndexError):
             return False
 
     async def _request(self, config, method, resource, *, provisioning=False, payload=None):
@@ -627,19 +643,40 @@ class PostHogAdapter:
             "volume",
         )
         issue = {key: clean_text(data[key]) for key in fields if isinstance(data.get(key), (str, int, float))}
-        query = self.sample_request(issue_id)
-        sample = await self._request(source["config"], "POST", "error_tracking/query/issue_events/", payload=query)
+        try:
+            trigger_id = str(uuid.UUID(event_id)) if event_id is not None else None
+        except (ValueError, TypeError, AttributeError):
+            trigger_id = None
+        query = self.sample_request(issue_id, event_id=trigger_id)
+        try:
+            sample = await self._request(source["config"], "POST", "error_tracking/query/issue_events/", payload=query)
+        except AlertError:
+            if trigger_id is None:
+                raise
+            sample = {"results": []}
+        if trigger_id is not None and sampled_event_matches_trigger(sample, trigger_id) is not True:
+            # A missing, lagging or mismatched exact-event response cannot prove
+            # trigger identity. Retain today's latest-event diagnosis fallback.
+            query = self.sample_request(issue_id, date_range=query["dateRange"])
+            sample = await self._request(source["config"], "POST", "error_tracking/query/issue_events/", payload=query)
         issue["sample"] = sampled_exception(sample)
         if issue["sample"]["availability"] == "empty":
             issue["sample"]["drill_status"] = "unknown"
             return issue
-        # Both reads share an absolute window; a later ingestion can still change
-        # membership, so matching the sampled event identity remains necessary.
+        # Pin the test=true probe to the selected event too. Otherwise a newer
+        # drill can displace it between reads. Legacy callers without a trigger
+        # keep their existing latest-sample query and identity checks.
+        probe_id = None
+        if trigger_id is not None:
+            try:
+                probe_id = str(uuid.UUID(sample["results"][0]["uuid"]))
+            except (ValueError, TypeError, AttributeError, KeyError):
+                pass
         filtered = await self._request(
             source["config"],
             "POST",
             "error_tracking/query/issue_events/",
-            payload=self.sample_request(issue_id, date_range=query["dateRange"], drill=True),
+            payload=self.sample_request(issue_id, date_range=query["dateRange"], drill=True, event_id=probe_id),
         )
         issue["sample"]["drill_status"] = sample_drill_status(sample, filtered)
         matches_trigger = sampled_event_matches_trigger(sample, event_id)
