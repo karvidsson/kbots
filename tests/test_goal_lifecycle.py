@@ -54,11 +54,15 @@ def world(monkeypatch):
         archived.append(goal["id"])
         return "channel archived read-only"
 
+    async def _unarchive(ctx, goal):
+        return ""
+
     monkeypatch.setattr(tools, "_post_to_channel", _post)
     monkeypatch.setattr(tools, "_add_reactions", _react)
     monkeypatch.setattr(tools, "_create_goal_channel", _chan)
     monkeypatch.setattr(tools, "_update_card", _card)
     monkeypatch.setattr(tools, "_archive_channel", _archive)
+    monkeypatch.setattr(tools, "_unarchive_channel", _unarchive)
     monkeypatch.setattr(tools, "_agent_tier",
                         lambda a: "privileged" if a == "atlas" else "assistant")
     monkeypatch.setattr(tools, "_known_agents", lambda: {"atlas", "beacon", "quill"})
@@ -149,10 +153,11 @@ async def test_full_lifecycle(world):
     assert store.get_goal(goal["id"])["status"] == "executing"
     assert store.get_goal(goal["id"])["blocked_brief"] == ""
 
-    # 7. Retire. The room closes, routing ends, the ledger stops.
+    # 7. Retire. The summary asks for a verdict, the room stays open for it,
+    # routing ends, the ledger stops.
     out = await t.goal_set(_ctx(), goal["id"], "status", "done")
-    assert out.startswith("✅") and "archived read-only" in out
-    assert world.archived == [goal["id"]]
+    assert out.startswith("✅") and "awaiting ✅/❌" in out
+    assert world.archived == []
     assert store.get_goal(goal["id"])["status"] == "done"
     assert store.routed_participants_for_channel("chan-1") == []
     # #90 replaced is_retired_goal_channel with is_goal_channel: the room stays
@@ -167,7 +172,10 @@ async def test_full_lifecycle(world):
     ctx = store.build_goal_context("beacon", "chan-1")
     assert 'status="done"' in ctx and "CLOSED" in ctx and "do not reopen" in ctx
     assert store.goal_audience_for_channel("chan-1")["owner"] == "atlas"
-    assert "illegal transition" in await t.goal_set(_ctx(), goal["id"], "status", "executing")
+    # 8. The only way out of done is back to executing (the ❌ path).
+    assert "illegal transition" in await t.goal_set(_ctx(), goal["id"], "status", "brainstorm")
+    assert "reopened" in await t.goal_set(_ctx(), goal["id"], "status", "executing")
+    assert store.active_goal_for_channel("chan-1")["id"] == goal["id"]
 
 
 @pytest.mark.asyncio
@@ -342,40 +350,181 @@ async def _run_to_executing(world, title="Closing"):
 
 
 @pytest.mark.asyncio
-async def test_done_posts_a_closing_notice_before_archiving(world):
+async def test_done_posts_the_summary_and_asks_for_a_verdict(world):
     """The transcript used to end on 'approved' with the outcome only in an
-    edited card at the top. The last message must now say what happened."""
+    edited card at the top. The last message is now the owner's summary,
+    with ✅/❌ seeded on it, and the room stays writable so the user can
+    answer. The same text is stored: a ✅ deletes the room it sits in."""
     t = world.tools
     goal = await _run_to_executing(world)
     await t.goal_set(_ctx(), goal["id"], "strategy", "Defer submission: 28-48h exceeds the ceiling.")
     await t.goal_task(_ctx(), goal["id"], "add", title="audit")
     await t.goal_task(_ctx(), goal["id"], "done", task_id=1)
+    await t.goal_task(_ctx(), goal["id"], "add", title="nice to have")
+    await t.goal_task(_ctx(), goal["id"], "drop", task_id=2, detail="out of scope")
     n_before = len(world.posts)
 
     out = await t.goal_set(_ctx(), goal["id"], "status", "done")
 
-    assert "closing notice posted" in out and "archived read-only" in out
+    assert "closing summary posted, awaiting ✅/❌" in out
+    assert "archived" not in out
     chan, text = world.posts[-1]
     assert chan == "chan-1"
-    assert text.startswith("✅ **COMPLETED: Closing**")
-    assert "Defer submission" in text
-    assert "1 task(s) done" in text
-    assert "Nothing is waiting on you" in text
+    assert text.startswith("🏁 **DONE: Closing**")
+    assert "How it was reached:** Defer submission" in text
+    assert "**Delivered:**\n• #1 audit" in text
+    assert "**Dropped:**\n• #2 nice to have: out of scope" in text
+    assert t.VERDICT_ASK in text and "atlas** asks what is missing" in text
     assert len(world.posts) == n_before + 1
-    assert store.get_goal(goal["id"])["closing_message_id"] == f"msg-{len(world.posts)}"
-    # posted before the room closed
-    assert world.archived == [goal["id"]]
+    mid = f"msg-{len(world.posts)}"
+    g = store.get_goal(goal["id"])
+    assert g["closing_message_id"] == mid
+    assert g["summary"] == text
+    assert g["verdict"] == ""
+    assert world.reactions[-1] == (mid, ("✅", "❌"))
+    assert world.archived == []
+    assert store.goal_by_closing_message(mid)["id"] == goal["id"]
 
 
 @pytest.mark.asyncio
-async def test_closing_notice_names_open_tasks(world):
+async def test_closing_summary_lists_open_tasks_without_dropping_them(world):
+    """Open tasks are dropped on ✅, not at retirement: a ❌ reopens the goal
+    and nothing should have to be un-dropped."""
     t = world.tools
     goal = await _run_to_executing(world)
     await t.goal_task(_ctx(), goal["id"], "add", title="never started")
     await t.goal_set(_ctx(), goal["id"], "status", "done")
     text = world.posts[-1][1]
-    assert "1 left open: #1 never started" in text
-    assert "Left open, see above" in text
+    assert "**Still open (1), dropped on ✅ unless carried:**\n• #1 never started" in text
+    assert store.list_tasks(goal["id"])[0]["status"] == "open"
+
+
+@pytest.mark.asyncio
+async def test_a_verdict_of_not_reached_reopens_and_the_second_summary_posts(world):
+    """The ❌ round trip. Reopening must undo the close, not just the status:
+    _close_goal skips the notice on a stored closing_message_id, so without
+    the reset the second retirement would post nothing."""
+    t = world.tools
+    goal = await _run_to_executing(world)
+    await t.goal_set(_ctx(), goal["id"], "status", "done")
+    first = store.get_goal(goal["id"])["closing_message_id"]
+    assert store.record_verdict(goal["id"], False, "user1")["verdict"] == "not_reached"
+    assert store.record_verdict(goal["id"], True, "user2") is None    # decided once
+    assert store.get_goal(goal["id"])["verdict_by"] == "user1"
+
+    out = await t.goal_set(_ctx(), goal["id"], "status", "executing")
+    assert out.startswith("✅") and "reopened" in out
+    g = store.get_goal(goal["id"])
+    assert g["status"] == "executing"
+    assert g["closing_message_id"] == "" and g["verdict"] == "" and g["verdict_by"] == ""
+    assert store.goal_by_closing_message(first) is None
+    assert store.record_verdict(goal["id"], True, "user1") is None    # not done
+
+    n = len(world.posts)
+    out = await t.goal_set(_ctx(), goal["id"], "status", "done")
+    assert "closing summary posted" in out and len(world.posts) == n + 1
+    second = store.get_goal(goal["id"])["closing_message_id"]
+    assert second and second != first
+    assert store.record_verdict(goal["id"], True, "user1")["verdict"] == "reached"
+
+
+@pytest.mark.asyncio
+async def test_reopening_makes_an_archived_room_writable_again(monkeypatch):
+    """Defensive: done no longer archives, but a room archived before that
+    change (or an abandoned one, should a path ever reopen it) must take
+    posts again when its goal leaves the retired status."""
+    from src.tools import goals as tools
+    patched: list[tuple[str, dict]] = []
+
+    async def _get(vault, endpoint, bot=""):
+        return {"guild_id": "g1", "topic": "[done] Goal workstream: X",
+                "permission_overwrites": [
+                    {"id": "g1", "type": 0, "allow": "0", "deny": str(tools._ARCHIVE_DENY)},
+                    {"id": "bot-owner", "type": 1, "allow": str(tools._SEND_MESSAGES), "deny": "0"},
+                    {"id": "bot-1", "type": 1, "allow": "2048", "deny": "0"}]}
+
+    async def _patch(vault, endpoint, payload, bot=""):
+        patched.append((endpoint, payload))
+        return {"id": "chan-1"}
+
+    async def _owner(ctx, goal):
+        return "bot-owner"
+
+    monkeypatch.setattr("src.tools.discord_tools._discord_get", _get)
+    monkeypatch.setattr("src.tools.discord_tools._discord_patch", _patch)
+    monkeypatch.setattr(tools, "_owner_bot_user_id", _owner)
+    goal = store.create_goal("X", "", "atlas", "chan-1", "u")
+    for s in ("brainstorm", "strategy", "executing"):
+        goal = store.update_goal(goal["id"], "atlas", status=s)
+    assert await tools._unarchive_channel(_ctx(), goal) == "channel writable again"
+    endpoint, payload = patched[0]
+    assert endpoint == "/channels/chan-1"
+    by_id = {o["id"]: o for o in payload["permission_overwrites"]}
+    assert "g1" not in by_id and "bot-owner" not in by_id          # the archive pair is gone
+    assert by_id["bot-1"]["allow"] == "2048"                        # untouched
+    assert payload["topic"] == "Goal workstream: X"
+    # a room that was never archived is left alone
+    patched.clear()
+
+    async def _get_clean(vault, endpoint, bot=""):
+        return {"guild_id": "g1", "topic": "Goal workstream: X", "permission_overwrites": []}
+
+    monkeypatch.setattr("src.tools.discord_tools._discord_get", _get_clean)
+    assert await tools._unarchive_channel(_ctx(), goal) == ""
+    assert patched == []
+
+
+@pytest.mark.asyncio
+async def test_open_tasks_are_dropped_on_the_reached_verdict(world):
+    """What the ✅ handler calls: drop the leftovers with one reason."""
+    t = world.tools
+    goal = await _run_to_executing(world)
+    await t.goal_task(_ctx(), goal["id"], "add", title="a")
+    await t.goal_task(_ctx(), goal["id"], "add", title="b")
+    await t.goal_task(_ctx(), goal["id"], "doing", task_id=2)
+    await t.goal_task(_ctx(), goal["id"], "add", title="c")
+    await t.goal_task(_ctx(), goal["id"], "done", task_id=3)
+    await t.goal_set(_ctx(), goal["id"], "status", "done")
+    dropped = store.drop_open_tasks(goal["id"], "user1", "goal closed")
+    assert [d["id"] for d in dropped] == [1, 2]
+    assert all(d["status"] == "dropped" and d["drop_reason"] == "goal closed" for d in dropped)
+    assert store.list_tasks(goal["id"]) == []
+    assert store.list_tasks(goal["id"], statuses=("done",))[0]["id"] == 3
+
+
+@pytest.mark.asyncio
+async def test_carry_hands_a_task_to_a_successor_goal(world):
+    t = world.tools
+    old = await _run_to_executing(world, title="Old")
+    new = await _run_to_executing(world, title="New")
+    await t.goal_task(_ctx(), old["id"], "add", title="finish docs", detail="the README",
+                      assignee="beacon")
+    await t.goal_task(_ctx(), old["id"], "add", title="already done")
+    await t.goal_task(_ctx(), old["id"], "done", task_id=2)
+
+    assert "needs target" in await t.goal_task(_ctx(), old["id"], "carry", task_id=1)
+    assert "is not on" in await t.goal_task(_ctx(), new["id"], "carry", task_id=1, target=old["id"])
+    assert "only open or doing" in await t.goal_task(_ctx(), old["id"], "carry", task_id=2,
+                                                     target=new["id"])
+    assert "already on" in await t.goal_task(_ctx(), old["id"], "carry", task_id=1, target=old["id"])
+    assert "unknown goal" in await t.goal_task(_ctx(), old["id"], "carry", task_id=1, target="g-nope")
+
+    out = await t.goal_task(_ctx(), old["id"], "carry", task_id=1, target=new["id"])
+    assert out == f"✅ Task #1 carried to `{new['id']}` as #3: finish docs"
+    src = store.get_task(1)
+    assert src["status"] == "dropped" and src["drop_reason"] == f"carried to {new['id']} #3"
+    moved = store.get_task(3)
+    assert moved["goal_id"] == new["id"] and moved["status"] == "open"
+    assert moved["assignee"] == "beacon"
+    assert moved["detail"] == f"the README\n(carried from {old['id']} #1)"
+    # a retired target refuses
+    await t.goal_set(_ctx(), new["id"], "status", "done")
+    await t.goal_task(_ctx(), old["id"], "add", title="late")
+    assert "carry to a live goal" in await t.goal_task(_ctx(), old["id"], "carry", task_id=4,
+                                                       target=new["id"])
+    # the source summary shows where the task went
+    await t.goal_set(_ctx(), old["id"], "status", "done")
+    assert f"• #1 finish docs: carried to {new['id']} #3" in world.posts[-1][1]
 
 
 @pytest.mark.asyncio
@@ -424,9 +573,9 @@ async def test_closing_notice_failure_is_visible_and_retryable(world, monkeypatc
     assert store.get_goal(goal["id"])["closing_message_id"] == ""
 
     out = await t.goal_set(_ctx(), goal["id"], "status", "done")   # the retry
-    assert "closing notice posted" in out
+    assert "closing summary posted" in out
     assert store.get_goal(goal["id"])["closing_message_id"] == "msg-retry"
-    assert world.posts[-1][1].startswith("✅ **COMPLETED")
+    assert world.posts[-1][1].startswith("🏁 **DONE")
 
 
 def test_closing_notice_is_a_system_notice():

@@ -129,3 +129,86 @@ async def test_expiry_wins_over_a_late_reminder():
     out = await _janitor(conn).tick(now=T0 + 100 * H)
     assert out == {"expired": [goal["id"]], "reminded": []}
     assert len(conn.sent) == 1 and "expired" in conn.sent[0][1]
+
+
+# --- with the vault: the same close path as any other retirement ------------
+
+def _vault_janitor(conn, alert="", **cfg):
+    base = {"proposal_timeout_hours": 72, "escalation_user": ""}
+    base.update(cfg)
+    return GoalJanitor(base, {"discord": conn}, mention=lambda: "<@owner>",
+                       vault=object(), alert_channel=lambda: alert)
+
+
+@pytest.mark.asyncio
+async def test_an_anchored_expiry_goes_through_the_close_path(monkeypatch):
+    """A borrowed home channel gets the closing notice and is never deleted."""
+    closed: list[tuple[str, str]] = []
+
+    async def _close(ctx, goal, reason=""):
+        closed.append((goal["id"], reason))
+        assert ctx.agent_id == "system" and ctx.vault is not None
+        return goal, "closing notice posted"
+
+    deleted: list[str] = []
+
+    async def _delete(vault, endpoint, bot=""):
+        deleted.append(endpoint)
+        return {"success": True}
+
+    monkeypatch.setattr("src.tools.goals._close_goal", _close)
+    monkeypatch.setattr("src.tools.discord_tools._discord_delete", _delete)
+    conn = _Connector()
+    goal = store.create_goal("Anchored", "d", "maya", "home-1", "u", anchored=True)
+    store._get_db().execute("UPDATE goals SET created_at=? WHERE id=?", (T0, goal["id"]))
+    store._get_db().commit()
+
+    out = await _vault_janitor(conn).tick(now=T0 + 100 * H)
+    assert out["expired"] == [goal["id"]]
+    assert store.get_goal(goal["id"])["status"] == "abandoned"
+    assert closed == [(goal["id"], "expired after 100h with no decision")]
+    assert deleted == [] and conn.sent == []
+
+
+@pytest.mark.asyncio
+async def test_an_expired_proposal_with_its_own_room_loses_the_room(monkeypatch):
+    """Nothing in that room but cards nobody reacted to: delete it and say so
+    in the alert channel, so the expiry is still visible somewhere."""
+    deleted: list[str] = []
+
+    async def _delete(vault, endpoint, bot=""):
+        deleted.append(endpoint)
+        return {"success": True}
+
+    async def _close(ctx, goal, reason=""):
+        raise AssertionError("own room: not the archive path")
+
+    monkeypatch.setattr("src.tools.discord_tools._discord_delete", _delete)
+    monkeypatch.setattr("src.tools.goals._close_goal", _close)
+    conn = _Connector()
+    goal = _proposal(channel="room-9")
+
+    out = await _vault_janitor(conn, alert="alerts").tick(now=T0 + 100 * H)
+    assert out["expired"] == [goal["id"]]
+    assert deleted == ["/channels/room-9"]
+    assert conn.sent == [("alerts", conn.sent[0][1])]
+    assert "expired after 100h" in conn.sent[0][1] and "room was removed" in conn.sent[0][1]
+    kinds = [r[0] for r in store._get_db().execute(
+        "SELECT kind FROM goal_events WHERE goal_id=? AND kind='channel_deleted'", (goal["id"],))]
+    assert kinds == ["channel_deleted"]
+    # the record keeps its channel id for history
+    assert store.get_goal(goal["id"])["channel_id"] == "room-9"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_room_delete_falls_back_to_the_line_in_the_room(monkeypatch):
+    async def _delete(vault, endpoint, bot=""):
+        return {"error": True, "status": 403, "detail": "Missing Access"}
+
+    monkeypatch.setattr("src.tools.discord_tools._discord_delete", _delete)
+    conn = _Connector()
+    goal = _proposal(channel="room-9")
+    out = await _vault_janitor(conn, alert="alerts").tick(now=T0 + 100 * H)
+    assert out["expired"] == [goal["id"]]
+    assert store.get_goal(goal["id"])["status"] == "abandoned"
+    assert conn.sent == [("room-9", conn.sent[0][1])] and "expired" in conn.sent[0][1]

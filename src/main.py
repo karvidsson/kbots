@@ -704,7 +704,9 @@ async def main() -> None:
     from src.tools.goals import _escalation_mention
     goal_janitor = GoalJanitor(
         config.get("goals", {}), active_connectors,
-        mention=lambda: _escalation_mention(_goal_tool_cfg()))
+        mention=lambda: _escalation_mention(_goal_tool_cfg()),
+        vault=vault,
+        alert_channel=lambda: _goal_tool_cfg().get("_alert_channel", ""))
     if goal_janitor.enabled:
         asyncio.create_task(goal_janitor.run(), name="goal-janitor")
     else:

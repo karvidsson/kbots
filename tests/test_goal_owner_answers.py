@@ -309,8 +309,12 @@ async def test_archive_still_closes_the_room_when_the_owner_bot_is_unknown(monke
     assert [o["id"] for o in patched[0]["permission_overwrites"]] == ["g1"]
 
 
-def test_closing_notice_invites_questions_and_names_the_owner():
+def test_closing_notice_names_the_owner():
+    """Done asks the user for a verdict and says who follows up on ❌;
+    abandoned invites questions and says who answers them."""
     from src.tools import goals as tools
     text = tools._closing_text(_goal("done"))
+    assert tools.VERDICT_ASK in text and "**maya** asks what is missing" in text
+    text = tools._closing_text(_goal("abandoned"))
     assert "questions are welcome" in text and "**maya**" in text
     assert "no mention needed" in text

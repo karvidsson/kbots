@@ -308,7 +308,8 @@ async def _archive_channel(ctx: ToolContext, goal: dict) -> str:
     return "channel archived read-only" + who
 
 
-RETIRED = ("done", "abandoned")
+RETIRED = store.RETIRED_STATUSES
+VERDICT_ASK = "React ✅ if the goal is reached, ❌ if it is not."
 
 
 def _closing_text(goal: dict, reason: str = "") -> str:
@@ -316,9 +317,13 @@ def _closing_text(goal: dict, reason: str = "") -> str:
 
     Editing the kickoff card to "done" left the transcript ending on
     "approved": the card sits at the top, and nobody scrolls up to check a
-    status word. So retirement posts one closing message at the bottom with
-    the outcome, what was delivered or why it stopped, and what if anything
-    is still waiting on the reader.
+    status word. So retirement posts one closing message at the bottom.
+
+    For 'done' that message is the owner's full summary: what the goal was,
+    what was delivered per task, what was dropped and why, what is still
+    open, and the ask for a verdict. The user's ✅ removes the room, so the
+    same text is stored on the goal (see _close_goal). For 'abandoned' it is
+    the reason it stopped; no verdict is asked.
     """
     done = store.list_tasks(goal["id"], statuses=("done",))
     dropped = store.list_tasks(goal["id"], statuses=("dropped",))
@@ -327,25 +332,53 @@ def _closing_text(goal: dict, reason: str = "") -> str:
         head = f"🪦 **ABANDONED: {goal['title']}** (`{goal['id']}`)"
         why = reason or goal.get("pause_reason") or ""
         body = f"**Stopped because:** {why[:400]}" if why else "**Stopped.**"
-    else:
-        head = f"✅ **COMPLETED: {goal['title']}** (`{goal['id']}`)"
-        body = (f"**Outcome:** {goal['strategy'][:600]}" if goal["strategy"]
-                else "**Outcome:** done, no strategy was recorded.")
-    tally = f"{len(done)} task(s) done"
+        tally = f"{len(done)} task(s) done"
+        if dropped:
+            tally += f", {len(dropped)} dropped"
+        if open_:
+            tally += f", {len(open_)} left open: " + ", ".join(
+                f"#{t['id']} {t['title'][:40]}" for t in open_[:5])
+        tail = ("**Nothing is waiting on you.**" if not open_
+                else "**Left open, see above.**")
+        tail += (f" The room is closed to new work; questions are welcome here and "
+                 f"**{goal['owner_agent']}** answers them, no mention needed.")
+        return "\n".join([head, body, f"**Tasks:** {tally}", tail])
+
+    head = f"🏁 **DONE: {goal['title']}** (`{goal['id']}`)"
+    lines = [head]
+    if goal.get("description"):
+        lines.append(f"**Goal:** {goal['description'][:300]}")
+    lines.append(f"**How it was reached:** {goal['strategy'][:500]}" if goal["strategy"]
+                 else "**How it was reached:** no strategy was recorded.")
+    if done:
+        lines.append("**Delivered:**")
+        lines += [f"• #{t['id']} {t['title'][:60]}" for t in done[:12]]
+        if len(done) > 12:
+            lines.append(f"• and {len(done) - 12} more")
     if dropped:
-        tally += f", {len(dropped)} dropped"
+        lines.append("**Dropped:**")
+        lines += [f"• #{t['id']} {t['title'][:50]}"
+                  + (f": {t['drop_reason'][:60]}" if t.get("drop_reason") else "")
+                  for t in dropped[:8]]
+        if len(dropped) > 8:
+            lines.append(f"• and {len(dropped) - 8} more")
     if open_:
-        tally += f", {len(open_)} left open: " + ", ".join(
-            f"#{t['id']} {t['title'][:40]}" for t in open_[:5])
-    tail = ("**Nothing is waiting on you.**" if not open_
-            else "**Left open, see above.**")
-    tail += (f" The room is closed to new work; questions are welcome here and "
-             f"**{goal['owner_agent']}** answers them, no mention needed.")
-    return "\n".join([head, body, f"**Tasks:** {tally}", tail])
+        lines.append(f"**Still open ({len(open_)}), dropped on ✅ unless carried:**")
+        lines += [f"• #{t['id']} {t['title'][:50]}" for t in open_[:8]]
+        if len(open_) > 8:
+            lines.append(f"• and {len(open_) - 8} more")
+    lines.append(f"{VERDICT_ASK} On ✅ this room is removed and the record stays in "
+                 f"goal_status; on ❌ **{goal['owner_agent']}** asks what is missing "
+                 f"and the goal continues.")
+    return "\n".join(lines)
 
 
 async def _close_goal(ctx: ToolContext, goal: dict, reason: str = "") -> tuple[dict, str]:
     """Post the closing notice, then close the room. Returns (goal, note).
+
+    'done' posts the summary, stores it, seeds ✅/❌ on it and leaves the room
+    writable: the user has to be able to answer, and a ❌ continues the
+    goal there. 'abandoned' posts the notice and makes the room read-only.
 
     Idempotent: a stored closing_message_id means it was already posted and
     is not posted again. Best effort on Discord, loud on failure: the note
@@ -354,21 +387,77 @@ async def _close_goal(ctx: ToolContext, goal: dict, reason: str = "") -> tuple[d
     exists to remove.
     """
     notes = []
+    asks_verdict = goal["status"] == "done"
     if goal.get("closing_message_id"):
         notes.append("closing notice already posted")
     else:
-        mid = await _post_to_channel(ctx, goal["channel_id"], _closing_text(goal, reason))
+        text = _closing_text(goal, reason)
+        mid = await _post_to_channel(ctx, goal["channel_id"], text)
         if mid:
-            goal = store.update_goal(goal["id"], ctx.agent_id, closing_message_id=mid)
+            fields = {"closing_message_id": mid}
+            if asks_verdict:
+                fields["summary"] = text
+            goal = store.update_goal(goal["id"], ctx.agent_id, **fields)
             store.log_event(goal["id"], ctx.agent_id, "closed", f"notice {mid}")
-            notes.append("closing notice posted")
+            notes.append("closing summary posted, awaiting ✅/❌" if asks_verdict
+                         else "closing notice posted")
+            if asks_verdict:
+                await _add_reactions(ctx, goal["channel_id"], mid, (APPROVE, DECLINE))
         else:
             logger.warning(f"goal {goal['id']}: closing notice NOT posted to "
                            f"{goal['channel_id']}")
             notes.append(f"closing notice NOT posted to <#{goal['channel_id']}> — "
                          f"retry with goal_set status={goal['status']}")
-    notes.append(await _archive_channel(ctx, goal))
+    if not asks_verdict:
+        notes.append(await _archive_channel(ctx, goal))
     return goal, "; ".join(n for n in notes if n)
+
+
+async def _unarchive_channel(ctx: ToolContext, goal: dict) -> str:
+    """Undo _archive_channel on a goal that leaves a retired status. Best
+    effort; returns a note ('' when there was nothing to undo).
+
+    'done' no longer archives, so on the ❌ path this normally finds nothing.
+    It exists for rooms archived before that change and for any future path
+    that reopens an abandoned goal: a reopened goal whose room is still
+    read-only is a goal nobody can work on.
+    """
+    if goal.get("anchored") or not ctx.vault or not goal.get("channel_id"):
+        return ""
+    from src.tools.discord_tools import _discord_get, _discord_patch
+    chan = await _discord_get(ctx.vault, f"/channels/{goal['channel_id']}")
+    if not chan or not isinstance(chan, dict) or chan.get("error") or not chan.get("guild_id"):
+        return ""
+    guild_id = str(chan["guild_id"])
+    overwrites = chan.get("permission_overwrites") or []
+    denied = [o for o in overwrites
+              if str(o.get("id")) == guild_id and int(o.get("deny") or 0) & _SEND_MESSAGES]
+    topic = chan.get("topic") or ""
+    tagged = topic.startswith("[")
+    if not denied and not tagged:
+        return ""
+    owner_bot = await _owner_bot_user_id(ctx, goal)
+    kept = []
+    for o in overwrites:
+        oid = str(o.get("id"))
+        if oid == guild_id:
+            deny = int(o.get("deny") or 0) & ~_ARCHIVE_DENY
+            if deny or int(o.get("allow") or 0):
+                kept.append({**o, "deny": str(deny)})
+            continue
+        if owner_bot and oid == owner_bot and int(o.get("allow") or 0) == _SEND_MESSAGES \
+                and not int(o.get("deny") or 0):
+            continue
+        kept.append(o)
+    if tagged:
+        topic = topic.split("]", 1)[1].strip()
+    result = await _discord_patch(
+        ctx.vault, f"/channels/{goal['channel_id']}",
+        {"permission_overwrites": kept, "topic": topic[:1000]})
+    if not result or result.get("error"):
+        return f"channel still read-only: {(result or {}).get('detail', 'edit failed')}"
+    store.log_event(goal["id"], ctx.agent_id, "unarchived", "channel writable again")
+    return "channel writable again"
 
 
 def _card_text(goal: dict) -> str:
@@ -671,6 +760,8 @@ async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> st
 
     leaving_proposed = (field == "status" and goal["status"] == "proposed"
                         and value != "proposed")
+    leaving_retired = (field == "status" and goal["status"] in RETIRED
+                       and value not in RETIRED)
     # Same terminal status again is the retry for a closing notice that did
     # not post; nothing else about the goal changes.
     if field == "status" and value == goal["status"] and value in RETIRED:
@@ -691,10 +782,15 @@ async def goal_set(ctx: ToolContext, goal_id: str, field: str, value: str) -> st
     chan_note = ""
     if leaving_proposed and goal.get("anchored"):
         goal, chan_note = await _acquire_channel(ctx, goal, cfg)
-    # Retiring tells the room, then closes it: nothing routes there any
-    # more, so nothing should be able to post there either.
+    # Retiring tells the room, then (abandoned) closes it, or (done) asks the
+    # user for a verdict on the summary.
     if field == "status" and goal["status"] in RETIRED:
         goal, chan_note = await _close_goal(ctx, goal)
+    # Reopening after ❌: the store already cleared the closing notice and
+    # the verdict; the room, if it was ever archived, must take posts again.
+    if leaving_retired:
+        chan_note = await _unarchive_channel(ctx, goal)
+        chan_note = ("reopened; " + chan_note) if chan_note else "reopened"
 
     await _update_card(ctx, goal)
     return (f"✅ `{goal['id']}` {field} → {kwargs[field]}. Status: "
@@ -780,12 +876,15 @@ async def goal_add_member(ctx: ToolContext, goal_id: str, reason: str,
     description=(
         "Manage a goal's tasks. action: add (title, detail, optional assignee) "
         "| assign (task_id, assignee) | doing (task_id) | done (task_id) | "
-        "drop (task_id) | list."
+        "drop (task_id, optional detail=reason) | carry (task_id, target=goal "
+        "id: hands an open task to a successor goal, dropping it here with a "
+        "pointer) | list."
     ),
     category="goals",
 )
 async def goal_task(ctx: ToolContext, goal_id: str, action: str, task_id: int = 0,
-                    title: str = "", detail: str = "", assignee: str = "") -> str:
+                    title: str = "", detail: str = "", assignee: str = "",
+                    target: str = "") -> str:
     goal = store.get_goal(goal_id.strip())
     if not goal:
         return f"ERROR: unknown goal '{goal_id}'."
@@ -811,11 +910,22 @@ async def goal_task(ctx: ToolContext, goal_id: str, action: str, task_id: int = 
             t = store.update_task(task_id, ctx.agent_id, status=action)
             return f"✅ Task #{t['id']} is {t['status']}: {t['title']}"
         if action == "drop":
-            t = store.update_task(task_id, ctx.agent_id, status="dropped")
-            return f"✅ Task #{t['id']} dropped."
+            t = store.update_task(task_id, ctx.agent_id, status="dropped",
+                                  drop_reason=detail)
+            return f"✅ Task #{t['id']} dropped." + (
+                f" Reason: {t['drop_reason']}" if t.get("drop_reason") else "")
+        if action == "carry":
+            if not target.strip():
+                return "ERROR: carry needs target=<goal id> to hand the task to."
+            src = store.get_task(task_id)
+            if not src or src["goal_id"] != goal["id"]:
+                return f"ERROR: task #{task_id} is not on '{goal['id']}'."
+            src, new = store.carry_task(task_id, ctx.agent_id, target.strip())
+            return (f"✅ Task #{src['id']} carried to `{new['goal_id']}` as #{new['id']}: "
+                    f"{new['title']}")
     except ValueError as e:
         return f"ERROR: {e}"
-    return "ERROR: action must be add/assign/doing/done/drop/list."
+    return "ERROR: action must be add/assign/doing/done/drop/carry/list."
 
 
 @tool(

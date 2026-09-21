@@ -71,7 +71,14 @@ _TRANSITIONS: dict[str, set[str]] = {
     "executing":       {"paused", "blocked_on_user", "done", "abandoned"},
     "paused":          {"brainstorm", "strategy", "executing", "blocked_on_user", "abandoned"},
     "blocked_on_user": {"brainstorm", "strategy", "executing", "paused", "abandoned"},
+    # 'done' is the owner's claim, not the verdict. The user answers the
+    # closing summary with ✅ (reached: the room is removed) or ❌ (not yet:
+    # the goal goes back to executing and the owner asks what is missing).
+    "done":            {"executing"},
 }
+# Statuses with a closing notice. 'done' asks for a verdict; 'abandoned' does not.
+RETIRED_STATUSES = ("done", "abandoned")
+VERDICTS = ("reached", "not_reached")
 
 DECISION_KINDS = ("pause", "abandon", "strategy_change")
 TASK_STATUSES = ("open", "doing", "done", "dropped")
@@ -224,6 +231,21 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
     # it twice, and so "was the user ever told" is a column, not a guess.
     if "closing_message_id" not in cols:
         db.execute("ALTER TABLE goals ADD COLUMN closing_message_id TEXT NOT NULL DEFAULT ''")
+    # The closing summary and the user's verdict on it. The summary is stored
+    # because a ✅ deletes the room it was posted in; the verdict is stored
+    # because "did the user ever agree this was reached" must be a column,
+    # not a reaction on a message that may no longer exist.
+    if "summary" not in cols:
+        db.execute("ALTER TABLE goals ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+    if "verdict" not in cols:
+        db.execute("ALTER TABLE goals ADD COLUMN verdict TEXT NOT NULL DEFAULT ''")
+        db.execute("ALTER TABLE goals ADD COLUMN verdict_by TEXT NOT NULL DEFAULT ''")
+        db.execute("ALTER TABLE goals ADD COLUMN verdict_at REAL NOT NULL DEFAULT 0")
+    # Why a task was dropped ("goal closed", "carried to g-x #7"). Without it
+    # a dropped task and a declined one look the same in the summary.
+    tcols = {r[1] for r in db.execute("PRAGMA table_info(goal_tasks)")}
+    if "drop_reason" not in tcols:
+        db.execute("ALTER TABLE goal_tasks ADD COLUMN drop_reason TEXT NOT NULL DEFAULT ''")
     db.commit()
 
 
@@ -367,7 +389,8 @@ def update_goal(goal_id: str, actor: str, **fields) -> dict:
     allowed = {"status", "strategy", "title", "description", "turn_budget",
                "owner_agent", "pause_reason", "wake_condition", "wake_ref",
                "blocked_brief", "card_message_id", "plan", "kickoff_message_id",
-               "closing_message_id"}
+               "closing_message_id", "summary", "verdict", "verdict_by",
+               "verdict_at"}
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"cannot set field(s): {', '.join(sorted(unknown))}")
@@ -377,6 +400,18 @@ def update_goal(goal_id: str, actor: str, **fields) -> dict:
             raise ValueError(
                 f"illegal transition {goal['status']} → {new_status} "
                 f"(allowed: {', '.join(sorted(_TRANSITIONS.get(goal['status'], set()))) or 'none'})")
+        # Leaving a retired status undoes the close, not just the status word.
+        # _close_goal skips the notice whenever closing_message_id is set, so
+        # a goal reopened after ❌ and then finished again would retire in
+        # silence, and a stale verdict would make the second summary look
+        # already answered.
+        if goal["status"] in RETIRED_STATUSES and new_status not in RETIRED_STATUSES:
+            fields.setdefault("closing_message_id", "")
+            fields.setdefault("verdict", "")
+            fields.setdefault("verdict_by", "")
+            fields.setdefault("verdict_at", 0)
+    if "verdict" in fields and fields["verdict"] not in ("", *VERDICTS):
+        raise ValueError(f"verdict must be one of: {', '.join(VERDICTS)}")
     now = time.time()
     sets = ", ".join(f"{k}=?" for k in fields)
     db = _get_db()
@@ -490,6 +525,32 @@ def goal_by_kickoff_message(message_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def goal_by_closing_message(message_id: str) -> dict | None:
+    """The goal whose closing summary a reaction landed on, whatever its
+    status. Unlike the kickoff lookup this must not filter on status: a
+    closing notice is by definition on a retired goal, and the caller decides
+    whether a verdict is still wanted (status 'done', no verdict yet)."""
+    if not message_id:
+        return None
+    row = _get_db().execute(
+        "SELECT * FROM goals WHERE closing_message_id=?", (message_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def record_verdict(goal_id: str, reached: bool, decided_by: str) -> dict | None:
+    """Store the user's answer to the closing summary. Returns the goal, or
+    None when the goal is not 'done' or already has a verdict: a second
+    reaction changes nothing, like a second reaction on a nomination."""
+    goal = get_goal(goal_id)
+    if not goal or goal["status"] != "done" or goal.get("verdict"):
+        return None
+    verdict = "reached" if reached else "not_reached"
+    goal = update_goal(goal_id, decided_by, verdict=verdict, verdict_by=decided_by,
+                       verdict_at=time.time())
+    log_event(goal_id, decided_by, "verdict", verdict)
+    return goal
+
+
 # --- proposal expiry ---
 #
 # A HITL request reminds once and times out. A proposal had neither: a kickoff
@@ -583,8 +644,13 @@ def add_task(goal_id: str, title: str, detail: str, assignee: str,
     return {"id": cur.lastrowid, "title": title.strip()}
 
 
+def get_task(task_id: int) -> dict | None:
+    row = _get_db().execute("SELECT * FROM goal_tasks WHERE id=?", (task_id,)).fetchone()
+    return dict(row) if row else None
+
+
 def update_task(task_id: int, actor: str, *, status: str = "",
-                assignee: str | None = None) -> dict:
+                assignee: str | None = None, drop_reason: str = "") -> dict:
     db = _get_db()
     row = db.execute("SELECT * FROM goal_tasks WHERE id=?", (task_id,)).fetchone()
     if not row:
@@ -596,6 +662,8 @@ def update_task(task_id: int, actor: str, *, status: str = "",
         fields["status"] = status
     if assignee is not None:
         fields["assignee"] = assignee
+    if status == "dropped":
+        fields["drop_reason"] = drop_reason.strip()
     if not fields:
         return dict(row)
     sets = ", ".join(f"{k}=?" for k in fields)
@@ -605,8 +673,47 @@ def update_task(task_id: int, actor: str, *, status: str = "",
     _invalidate_cache()
     log_event(row["goal_id"], actor, "task",
               f"#{task_id} {status or 'assigned'}"
-              + (f" → {assignee}" if assignee is not None else ""))
+              + (f" → {assignee}" if assignee is not None else "")
+              + (f": {drop_reason.strip()}" if status == "dropped" and drop_reason.strip() else ""))
     return dict(db.execute("SELECT * FROM goal_tasks WHERE id=?", (task_id,)).fetchone())
+
+
+def drop_open_tasks(goal_id: str, actor: str, reason: str) -> list[dict]:
+    """Drop every open or doing task on a goal with one reason. Called when
+    the user confirms a goal is reached (✅ on the summary), not at
+    retirement: a ❌ reopens the goal, and nothing should have to un-drop."""
+    dropped = []
+    for t in list_tasks(goal_id):
+        dropped.append(update_task(t["id"], actor, status="dropped", drop_reason=reason))
+    return dropped
+
+
+def carry_task(task_id: int, actor: str, target_goal_id: str) -> tuple[dict, dict]:
+    """Hand a task to a successor goal. The source task is dropped with the
+    destination in its reason and a fresh open task is created on the target,
+    so both records stay honest: the old goal shows what it did not finish
+    and where it went, the new goal shows what it inherited. Returns
+    (source_task, new_task). Raises ValueError on unknown ids, a retired
+    target, a task that is not open or doing, or the same goal."""
+    src = get_task(task_id)
+    if not src:
+        raise ValueError(f"unknown task #{task_id}")
+    if src["status"] not in ("open", "doing"):
+        raise ValueError(f"task #{task_id} is {src['status']}; only open or doing tasks carry")
+    target = get_goal(target_goal_id)
+    if not target:
+        raise ValueError(f"unknown goal '{target_goal_id}'")
+    if target["id"] == src["goal_id"]:
+        raise ValueError(f"task #{task_id} is already on '{target['id']}'")
+    if target["status"] in RETIRED_STATUSES:
+        raise ValueError(f"goal '{target['id']}' is {target['status']}; carry to a live goal")
+    detail = src["detail"]
+    tag = f"(carried from {src['goal_id']} #{task_id})"
+    detail = f"{detail}\n{tag}".strip() if detail else tag
+    new = get_task(add_task(target["id"], src["title"], detail, src["assignee"], actor)["id"])
+    src = update_task(task_id, actor, status="dropped",
+                      drop_reason=f"carried to {target['id']} #{new['id']}")
+    return src, new  # type: ignore[return-value]
 
 
 def list_tasks(goal_id: str, statuses: tuple = ("open", "doing")) -> list[dict]:
@@ -813,11 +920,12 @@ _PHASE_PROTOCOL = {
         "unless directly addressed. If the user has not replied, reply exactly "
         "NO_REPLY."),
     "done": (
-        "CLOSED (done). This room is the record of a finished goal. Answer a "
-        "human's questions about it from the record (goal_status, the tasks "
-        "and events above, the channel history); do not reopen it, start "
-        "work, or add tasks. A question does not reopen a goal — if new work "
-        "is wanted, say so and propose a new goal."),
+        "CLOSED (done), awaiting the user's verdict on the closing summary: "
+        "✅ means reached and the room is removed, ❌ reopens the goal and the "
+        "owner asks what is missing. Answer a human's questions about it "
+        "from the record (goal_status, the tasks and events above, the "
+        "channel history); do not reopen it by hand, start work, or add "
+        "tasks. A question does not reopen a goal — only a ❌ does."),
     "abandoned": (
         "CLOSED (abandoned). This room is the record of a goal that was "
         "stopped. Answer a human's questions about why from the record; do "
