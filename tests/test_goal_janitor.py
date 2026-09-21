@@ -129,3 +129,148 @@ async def test_expiry_wins_over_a_late_reminder():
     out = await _janitor(conn).tick(now=T0 + 100 * H)
     assert out == {"expired": [goal["id"]], "reminded": []}
     assert len(conn.sent) == 1 and "expired" in conn.sent[0][1]
+
+
+# --- with the vault: the same close path as any other retirement ------------
+
+def _vault_janitor(conn, alert="", **cfg):
+    base = {"proposal_timeout_hours": 72, "escalation_user": ""}
+    base.update(cfg)
+    return GoalJanitor(base, {"discord": conn}, mention=lambda: "<@owner>",
+                       vault=object(), alert_channel=lambda: alert)
+
+
+@pytest.mark.asyncio
+async def test_an_anchored_expiry_goes_through_the_close_path(monkeypatch):
+    """A borrowed home channel gets the closing notice and is never deleted."""
+    closed: list[tuple[str, str]] = []
+
+    async def _close(ctx, goal, reason=""):
+        closed.append((goal["id"], reason))
+        assert ctx.agent_id == "system" and ctx.vault is not None
+        return goal, "closing notice posted"
+
+    deleted: list[str] = []
+
+    async def _delete(vault, endpoint, bot=""):
+        deleted.append(endpoint)
+        return {"success": True}
+
+    monkeypatch.setattr("src.tools.goals._close_goal", _close)
+    monkeypatch.setattr("src.tools.discord_tools._discord_delete", _delete)
+    conn = _Connector()
+    goal = store.create_goal("Anchored", "d", "maya", "home-1", "u", anchored=True)
+    store._get_db().execute("UPDATE goals SET created_at=? WHERE id=?", (T0, goal["id"]))
+    store._get_db().commit()
+
+    out = await _vault_janitor(conn).tick(now=T0 + 100 * H)
+    assert out["expired"] == [goal["id"]]
+    assert store.get_goal(goal["id"])["status"] == "abandoned"
+    assert closed == [(goal["id"], "expired after 100h with no decision")]
+    assert deleted == [] and conn.sent == []
+
+
+def _bot_msg(mid, content="card"):
+    return {"id": mid, "content": content, "author": {"id": "bot-1", "bot": True}}
+
+
+def _human_msg(mid, content="what would this cost?"):
+    return {"id": mid, "content": content, "author": {"id": "user-1"}}
+
+
+def _own_room(monkeypatch, messages, delete_result=None):
+    """Stub the room fetch, the delete and the close path; return the logs."""
+    log = {"deleted": [], "closed": []}
+
+    async def _get(vault, endpoint, bot="", **kw):
+        assert endpoint == "/channels/room-9/messages?limit=100"
+        return messages
+
+    async def _delete(vault, endpoint, bot=""):
+        log["deleted"].append(endpoint)
+        return delete_result or {"success": True}
+
+    async def _close(ctx, goal, reason=""):
+        log["closed"].append((goal["id"], reason))
+        return goal, "closing notice posted; channel archived read-only"
+
+    monkeypatch.setattr("src.tools.discord_tools._discord_get", _get)
+    monkeypatch.setattr("src.tools.discord_tools._discord_delete", _delete)
+    monkeypatch.setattr("src.tools.goals._close_goal", _close)
+    return log
+
+
+@pytest.mark.asyncio
+async def test_an_expired_proposal_with_its_own_room_loses_the_room(monkeypatch):
+    """Nothing in that room but the goal's own posts: delete it and say so
+    in the alert channel, so the expiry is still visible somewhere."""
+    log = _own_room(monkeypatch, [_bot_msg("1"), _bot_msg("2"), _bot_msg("3", "⏳ reminder")])
+    conn = _Connector()
+    goal = _proposal(channel="room-9")
+
+    out = await _vault_janitor(conn, alert="alerts").tick(now=T0 + 100 * H)
+    assert out["expired"] == [goal["id"]]
+    assert log["deleted"] == ["/channels/room-9"] and log["closed"] == []
+    assert conn.sent == [("alerts", conn.sent[0][1])]
+    assert "expired after 100h" in conn.sent[0][1] and "room was removed" in conn.sent[0][1]
+    kinds = [r[0] for r in store._get_db().execute(
+        "SELECT kind FROM goal_events WHERE goal_id=? AND kind='channel_deleted'", (goal["id"],))]
+    assert kinds == ["channel_deleted"]
+    # the record keeps its channel id for history
+    assert store.get_goal(goal["id"])["channel_id"] == "room-9"
+
+
+@pytest.mark.asyncio
+async def test_a_room_with_a_human_message_is_archived_not_deleted(monkeypatch):
+    """A proposal room is routed: the owner answers questions in it. One
+    human line in there and an unattended tick must not destroy it."""
+    log = _own_room(monkeypatch, [_bot_msg("1"), _human_msg("2"), _bot_msg("3", "answer")])
+    conn = _Connector()
+    goal = _proposal(channel="room-9")
+    out = await _vault_janitor(conn, alert="alerts").tick(now=T0 + 100 * H)
+    assert out["expired"] == [goal["id"]]
+    assert log["deleted"] == []
+    assert log["closed"] == [(goal["id"], "expired after 100h with no decision")]
+    assert conn.sent == []
+
+
+@pytest.mark.asyncio
+async def test_no_alert_channel_means_no_delete(monkeypatch):
+    """Without somewhere to report it, deleting the room would make the
+    expiry invisible. Keep the room and post the notice in it instead."""
+    log = _own_room(monkeypatch, [_bot_msg("1")])
+    conn = _Connector()
+    goal = _proposal(channel="room-9")
+    out = await _vault_janitor(conn, alert="").tick(now=T0 + 100 * H)
+    assert out["expired"] == [goal["id"]]
+    assert log["deleted"] == [] and len(log["closed"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_or_long_history_is_kept(monkeypatch):
+    """Cannot prove the room is empty of human posts: keep it."""
+    conn = _Connector()
+    log = _own_room(monkeypatch, {"error": True, "status": 403, "detail": "Missing Access"})
+    goal = _proposal(channel="room-9")
+    await _vault_janitor(conn, alert="alerts").tick(now=T0 + 100 * H)
+    assert log["deleted"] == [] and len(log["closed"]) == 1
+    assert store.get_goal(goal["id"])["status"] == "abandoned"
+
+    log = _own_room(monkeypatch, [_bot_msg(str(i)) for i in range(100)])
+    goal = _proposal(title="Busy", channel="room-9")
+    await _vault_janitor(conn, alert="alerts").tick(now=T0 + 100 * H)
+    assert log["deleted"] == [] and len(log["closed"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_room_delete_falls_back_to_the_close_path(monkeypatch):
+    log = _own_room(monkeypatch, [_bot_msg("1")],
+                    delete_result={"error": True, "status": 403, "detail": "Missing Access"})
+    conn = _Connector()
+    goal = _proposal(channel="room-9")
+    out = await _vault_janitor(conn, alert="alerts").tick(now=T0 + 100 * H)
+    assert out["expired"] == [goal["id"]]
+    assert store.get_goal(goal["id"])["status"] == "abandoned"
+    assert log["deleted"] == ["/channels/room-9"]
+    assert log["closed"] == [(goal["id"], "expired after 100h with no decision")]
+    assert conn.sent == []
