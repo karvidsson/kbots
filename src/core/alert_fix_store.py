@@ -13,6 +13,7 @@ def declared_drill(source, receipt):
         receipt.get("drill")
         or receipt.get("setup_test")
         or receipt.get("sample_drill_status") == "drill"
+        or receipt.get("evidence", {}).get("issue", {}).get("sample", {}).get("drill_status") == "drill"
         or receipt.get("event_id") == str(uuid.uuid5(uuid.UUID(source["id"]), source["nonce"]))
     )
 
@@ -82,7 +83,7 @@ class FixJobs:
             reason = "only created and reopened incidents start fixes"
         elif not config.get("repo"):
             reason = "no registered repository"
-        elif not context.get("trigger_unmarked"):
+        elif not manual and context.get("trigger_unmarked") is not True:
             reason = "trigger drill classification could not be confirmed"
         elif not manual and (
             not context.get("evidence", {}).get("frame_matches") or not context.get("evidence", {}).get("snippets")
@@ -93,7 +94,13 @@ class FixJobs:
         if drill:
             key = hashlib.sha256((key + receipt["id"]).encode()).hexdigest()
         now = time.time()
-        payload = {"context": context, "diagnosis": receipt["result"], "receipt_id": receipt["id"], "manual": manual}
+        payload = {
+            "context": context,
+            "diagnosis": receipt["result"],
+            "receipt_id": receipt["id"],
+            "manual": manual,
+            "drill_status_unconfirmed": manual and context.get("trigger_unmarked") is not True,
+        }
         self.db.execute(
             "INSERT OR IGNORE INTO alert_fixes(id,source_id,revision,issue_id,state,payload,result,created,updated) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
@@ -120,6 +127,8 @@ class FixJobs:
         if manual and not drill and job["state"] in {"waiting", "failed", "skipped"} and not job["result"].get("pr"):
             # An uncertain publication is only reconciled; never discard its intent.
             uncertain = job["result"].get("push_intent") or job["result"].get("pr_intent")
+            if uncertain and job["payload"].get("drill_status_unconfirmed") is True:
+                payload["drill_status_unconfirmed"] = True
             result = job["result"] if uncertain else ({"reason": reason} if reason else {})
             self.db.execute(
                 "UPDATE alert_fix_runs SET result=? WHERE job_id=? AND cycle=?",

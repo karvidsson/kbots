@@ -488,9 +488,14 @@ The deterministic delivery test is labelled as a setup test. New PostHog
 created/reopened notifications carry an explicit drill bit derived only from
 `event.properties.test == true`; names containing "test" are not evidence.
 Spiking and manual transitions can lack trigger-specific exception properties.
-A second fixed `test=true` filtered query can classify the recent sample, including
-for legacy destinations, only when its exception UUID matches the unfiltered
-sample. The event IDs are compared internally and excluded from model input.
+The first sample query selects the bound triggering event with an exact UUID
+metadata filter. The `test=true` probe uses that same UUID and absolute window.
+If the exact read fails, is empty or returns a different event, diagnosis falls
+back to the latest event in the same issue/window. Its drill probe is pinned to
+that selected sample's UUID when available. This fallback retains the sample-only
+"not confirmed" caveat unless the returned UUID itself matches the trigger.
+Legacy callers without an event ID keep the existing latest-sample queries.
+A filtered query can classify a sample only when its exception UUID matches. The event IDs are compared internally and excluded from model input.
 A sample with no filtered match is unmarked, not proven to be a production fault.
 Empty windows or mismatched identities remain unknown. Both requests use the
 same explicit seven-day UTC window. The sampled event UUID is also compared to
@@ -572,8 +577,12 @@ registrations migrate to `false`, and setup requires an explicit yes/no choice. 
 sample is positively identified, has no declared-drill match, and resolved a
 tracked source file. Setup checks, drills, unknown trigger classification,
 missing source and held diagnoses get a short `No PR` explanation on the same
-card. An explicit Fix it click permits source searching when no tracked frame
-resolved; the other eligibility and publication gates still apply. Unmarked means no declared marker was found; it cannot prove intent.
+card. An explicit owner Fix it click may proceed with unconfirmed classification
+when no evidence declares a drill, and may search source when no tracked frame
+resolved. Its card and PR body say "drill status unconfirmed" throughout the run
+and after restart. Automatic runs keep the strict trigger gate. Declared drills
+and setup checks cannot use either path; all other eligibility and publication
+gates still apply. Unmarked means no declared marker was found; it cannot prove intent.
 
 The owning agent uses its configured model in a fresh session without native
 provider tools. Its structured JSON actions can read source, write source and a

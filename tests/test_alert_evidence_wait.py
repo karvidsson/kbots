@@ -103,6 +103,9 @@ def delayed(tmp_path, monkeypatch):
             return {"id": issue_id, "name": "Error", "first_seen": "2026-09-16T19:47:53Z"}
         assert resource == "error_tracking/query/issue_events/"
         assert h.adapter._sample_request_allowed(resource, kwargs["payload"])
+        requested = next((f["value"][0] for f in kwargs["payload"].get("filterGroup", []) if f["key"] == "uuid"), None)
+        if requested and requested != raw["results"][0].get("uuid"):
+            return {"results": []}
         return copy.deepcopy(raw) if clock.now >= result.visible_at else {"results": []}
 
     h.adapter._request = request
@@ -173,7 +176,7 @@ async def test_late_stack_waits_across_restart_and_selects_real_handler(delayed)
     assert receipt["sample_drill_status"] == "drill" and receipt["attempts"] == 1
     assert receipt["evidence"]["status"] == "available"
     assert diagnosis_uses(d) == 1
-    assert len(d.reads) == 9  # Three empty GET+POSTs, then GET+POST+fixed filtered POST.
+    assert len(d.reads) == 13  # Three GET+exact+latest empty polls, then GET+exact+latest+probe.
     assert (
         d.h.store.db.execute(
             "SELECT used FROM budgets WHERE scope=? AND bucket=?",
@@ -200,7 +203,7 @@ async def test_deadline_fallback_is_durable_and_does_not_claim_no_events(delayed
     d.clock.now = 1090
     assert await d.worker.once()
     d.provider.complete.assert_awaited_once()
-    assert len(d.reads) == 12 and diagnosis_uses(d) == 1
+    assert len(d.reads) == 18 and diagnosis_uses(d) == 1
     payload = json.loads(d.provider.complete.call_args.args[0][1].content)
     assert "indexing delay and no matching events cannot be distinguished" in payload["issue"]["sample"]["status"]
     receipt = d.h.store.ready()[0]
@@ -261,7 +264,7 @@ async def test_revocation_cancels_waiting_receipt(delayed, action):
     d.clock.now = 1030
     assert not await d.worker.once()
     d.provider.complete.assert_not_awaited()
-    assert len(d.reads) == 2
+    assert len(d.reads) == 3
 
 
 async def test_issue_not_found_is_held_without_evidence_retries(delayed):
@@ -319,12 +322,12 @@ async def test_model_retry_uses_checkpointed_stack_without_new_vendor_read(delay
     d.provider.complete.side_effect = asyncio.CancelledError
     await d.worker.once()  # Per-source cancellation leaves the durable lease recoverable.
     assert d.h.store.counts(d.source["id"]) == {"running": 1}
-    assert len(d.reads) == 3
+    assert len(d.reads) == 4
     restart(d)
     d.provider.complete.side_effect = None
     d.clock.now = 1361  # Existing interrupted-running lease recovery, not a new wait window.
     await d.worker.once()
-    assert len(d.reads) == 3
+    assert len(d.reads) == 4
     assert d.h.store.ready()[0]["attempts"] == 2
     assert diagnosis_uses(d) == 2
 

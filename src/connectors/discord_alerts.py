@@ -561,6 +561,8 @@ class DiscordAlertTransport:
         if job["state"] == "skipped":
             embed.set_footer(text=embed.footer.text + " · " + value)
         else:
+            if job["payload"].get("drill_status_unconfirmed") is True:
+                value += "\nRequested with Fix it; drill status unconfirmed."
             embed.add_field(name="Fix PR", value=value, inline=False)
         return await self._notice(source, receipt, "fix", embed)
 

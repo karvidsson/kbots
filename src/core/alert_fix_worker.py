@@ -86,6 +86,8 @@ class AlertFixWorker:
                     "evidence": job["payload"]["context"]["evidence"],
                     "fix_base_revision": tree["default_revision"],
                 }
+                if job["payload"].get("drill_status_unconfirmed") is True:
+                    context["drill_status"] = "unconfirmed; the owner explicitly requested Fix it"
                 with tempfile.TemporaryDirectory(prefix="model-", dir=self.directory) as scratch:
                     report = await repair(
                         self.manager, source, workspace, context, lambda: self.jobs.guard(job), Path(scratch)
@@ -133,7 +135,10 @@ class AlertFixWorker:
                 result["branch"],
                 job["issue_id"],
                 issue_url,
-                result["report"],
+                {
+                    **result["report"],
+                    "drill_status_unconfirmed": job["payload"].get("drill_status_unconfirmed") is True,
+                },
                 result["proof"],
             )
             if pr["head"] != result["commit"] or pr["branch"] != result["branch"]:

@@ -190,7 +190,14 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         if path == "error_tracking/query/issue_events/":
             from tests.test_alert_exception_evidence import response
 
-            return response()
+            sample = response()
+            query = kwargs["payload"]
+            assert alerts.adapters["posthog"]._sample_request_allowed(path, query)
+            selected = next((f["value"][0] for f in query.get("filterGroup", []) if f["key"] == "uuid"), None)
+            # The synthetic setup event has no sampled exception of its own.
+            if selected and selected != sample["results"][0]["uuid"]:
+                return {"results": []}
+            return sample
         if path == f"error_tracking/issues/{issue_id}/":
             return {"id": issue_id, "name": "TypeError in handler"}
         raise AssertionError((method, path))
@@ -216,7 +223,7 @@ async def test_complete_setup_flow_requires_human_create_and_verified_test(tmp_p
         assert alerts.store.get(source["id"])["state"] == "active"
         assert alerts.store.counts(source["id"]) == {"complete": 1}
         assert len([call for call in calls if call[0] == "POST" and call[1].startswith("hog_functions/")]) == 2
-        assert calls.count(("POST", "error_tracking/query/issue_events/")) == 2
+        assert calls.count(("POST", "error_tracking/query/issue_events/")) == 3
         assert provider.complete.await_count == 1
         public = json.dumps([m.content for m in history]) + "\n".join(alerts.store.db.iterdump())
         assert "synthetic-token" not in public and "synthetic-key" not in public

@@ -68,7 +68,7 @@ async def test_uuid_relation_is_private_and_only_exact_match_confirms_trigger(de
     else:
         assert "not necessarily" in sample["status"] and ready["drill"] is False
     posts = [entry[3]["payload"] for entry in d.reads if entry[1] == "POST"]
-    assert len(posts) == 2
+    assert len(posts) == (2 if match else 3)
     assert all(p["include"] == ["exception", "stacktrace", "release"] for p in posts)
 
 

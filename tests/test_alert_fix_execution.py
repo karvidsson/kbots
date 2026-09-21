@@ -184,7 +184,8 @@ async def test_owning_provider_has_no_native_tools_and_only_mediated_actions(tmp
         assert call.kwargs["agent_id"] == "owner" and call.kwargs["session_id"] is None
 
 
-def test_publisher_uses_exact_ready_pr_payload_and_never_merge(monkeypatch):
+@pytest.mark.parametrize("unconfirmed", [False, True])
+def test_publisher_uses_exact_ready_pr_payload_and_never_merge(monkeypatch, unconfirmed):
     from src.core import alert_fix_publish
 
     calls = []
@@ -209,13 +210,14 @@ def test_publisher_uses_exact_ready_pr_payload_and_never_merge(monkeypatch):
         "alert-fix/aa-bb",
         issue,
         url,
-        {"cause": "missing guard", "fix": "check input"},
+        {"cause": "missing guard", "fix": "check input", "drill_status_unconfirmed": unconfirmed},
         {"regression": "test/new.test.ts", "checks": [{"command": ["pnpm", "run", "typecheck"]}]},
     )
     assert result["number"] == 7 and calls[0][0] == "repos/example/sample/pulls"
     body = calls[0][1]
     assert body["draft"] is False and body["base"] == "main"
     assert url in body["body"] and "Opened automatically from alert " + issue in body["body"]
+    assert ("drill status unconfirmed" in body["body"]) is unconfirmed
     assert "merge" not in body and "auto_merge" not in body
 
 
@@ -237,7 +239,18 @@ def test_pr_dedup_uses_paginated_list_not_search_index(monkeypatch):
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="macOS OS-sandbox acceptance")
-@pytest.mark.parametrize("failure", ["none", "lost_ack", "restart_push", "restart_post", "manual_no_frame"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "none",
+        "lost_ack",
+        "restart_push",
+        "restart_post",
+        "manual_no_frame",
+        "manual_unconfirmed",
+        "restart_unconfirmed",
+    ],
+)
 async def test_actual_fix_pipeline_tests_commits_and_edits_one_card(setup, workspace, monkeypatch, failure):
     from src.core.alert_fix_worker import AlertFixWorker
 
@@ -286,12 +299,13 @@ async def test_actual_fix_pipeline_tests_commits_and_edits_one_card(setup, works
         assert git(folder, "show", sha + ":handler.mjs").decode().startswith("export const label")
         remote.update(head=sha, branch=branch)
         calls.append("push")
-        if failure == "restart_push" and calls.count("push") == 1:
+        if failure in {"restart_push", "restart_unconfirmed"} and calls.count("push") == 1:
             loop.call_soon_threadsafe(run_task.cancel)
             raise asyncio.CancelledError()
 
     def create(snapshot, branch, issue, url, report, proof):
         assert proof["before"]["exit_code"] != 0 and all(c["exit_code"] == 0 for c in proof["checks"])
+        assert report["drill_status_unconfirmed"] is ("unconfirmed" in failure)
         calls.append("create")
         remote["pr"] = {
             "number": 31,
@@ -311,12 +325,15 @@ async def test_actual_fix_pipeline_tests_commits_and_edits_one_card(setup, works
 
     worker.publisher.find = lambda *args: remote.get("pr")
     worker.publisher.push, worker.publisher.create = push, create
-    if failure == "manual_no_frame":
+    if failure in {"manual_no_frame", "manual_unconfirmed", "restart_unconfirmed"}:
         from src.connectors.alert_fix_controls import FixControls
         from tests.test_alert_fix_controls import interaction
 
         o.source = o.h.store.update(o.source["id"], config={**o.source["config"], "auto_fix_pr": False})
-        receipt["fix_context"]["evidence"] = {}
+        if failure == "manual_no_frame":
+            receipt["fix_context"]["evidence"] = {}
+        else:
+            receipt["fix_context"]["trigger_unmarked"] = False
         o.h.store.db.execute(
             "UPDATE receipts SET fix_context=? WHERE id=?", (json.dumps(receipt["fix_context"]), receipt["id"])
         )
@@ -340,14 +357,26 @@ async def test_actual_fix_pipeline_tests_commits_and_edits_one_card(setup, works
         worker.publisher.find = lambda *args: remote.get("pr")
         worker.publisher.push, worker.publisher.create = push, create
         worker.repositories.fetch = lambda *args: pytest.fail("Persisted tree must survive restart")
+        if failure == "restart_unconfirmed":
+            o.h.alerts.store = o.h.store
+            o.h.alerts.fixer = worker
+            o.h.alerts.fix_controls = FixControls(o.h.alerts)
+            o.h.alerts.transport.fix_controls = o.h.alerts.fix_controls
+            restored = []
+            o.h.bot.client.add_view = lambda view, **kwargs: restored.append((view, kwargs))
+            o.h.alerts.fix_controls.restore(o.source["account"])
+            assert restored and restored[0][1]["message_id"] == o.room.messages[0].id
     assert await worker.once()
-    assert calls.count("create") == 1 and calls.count("push") == (2 if failure == "restart_push" else 1)
+    assert calls.count("create") == 1 and calls.count("push") == (
+        2 if failure in {"restart_push", "restart_unconfirmed"} else 1
+    )
     assert provider.complete.call_count == len(actions)
     assert not await worker.once()
     assert manager.active_turns == 0 and len(o.room.messages) == 1
     from tests.test_alert_setup_ux import visible_text
 
     assert "PR #31 ready" in visible_text(o.room.messages[0])
+    assert ("drill status unconfirmed" in visible_text(o.room.messages[0])) is ("unconfirmed" in failure)
     row = o.h.store.db.execute("SELECT * FROM alert_fixes").fetchone()
     assert row["state"] == "complete"
 
