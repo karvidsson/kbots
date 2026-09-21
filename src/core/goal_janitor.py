@@ -117,22 +117,46 @@ class GoalJanitor:
                 f"off. It expires in {left:.0f}h. {self._mention()}"))
         return out
 
+    async def _room_holds_only_bot_posts(self, goal: dict) -> bool:
+        """Whether the proposal's room can be deleted without losing anything a
+        human wrote. A proposal room is routed (the owner answers questions
+        in it), so "nothing but cards" is a claim to check, not a premise:
+        one human message, a fetch that fails, or more than one page of
+        history, and the answer is no."""
+        from src.tools.discord_tools import _discord_get
+        msgs = await _discord_get(self.vault,
+                                  f"/channels/{goal['channel_id']}/messages?limit=100")
+        if not isinstance(msgs, list) or len(msgs) >= 100:
+            return False
+        return all((m.get("author") or {}).get("bot") for m in msgs if isinstance(m, dict))
+
     async def _close_expired(self, goal: dict, line: str, hours: float) -> None:
         """Retire an expired proposal through the ordinary close path.
 
         Anchored: the closing notice lands in the borrowed home channel, and
-        _close_goal never archives a borrowed channel. Own room: delete it,
-        it holds nothing but cards, and say so in the alert channel so the
-        expiry is still visible somewhere.
+        _close_goal never archives a borrowed channel. Own room: deleted only
+        when it provably holds nothing but bot posts AND there is an alert
+        channel to report the expiry in; otherwise it gets the closing notice
+        and goes read-only like any other retired room. Unattended and
+        irreversible is the combination this guards against: nothing a human
+        did authorised the deletion, so the room must have nothing of theirs.
         """
         from src.core.base import ToolContext
         from src.tools.goals import _close_goal
         ctx = ToolContext(agent_id="system", channel_id=goal["channel_id"],
                           user_id="", vault=self.vault)
+        reason = f"expired after {hours:.0f}h with no decision"
+        alert = self._alert_channel()
+        keep = ""
         if goal.get("anchored"):
-            _, note = await _close_goal(
-                ctx, goal, reason=f"expired after {hours:.0f}h with no decision")
-            logger.info(f"Goal janitor: {goal['id']} expired, {note}")
+            keep = "borrowed channel"
+        elif not alert:
+            keep = "no alert channel to report the expiry in"
+        elif not await self._room_holds_only_bot_posts(goal):
+            keep = "the room holds more than the goal's own posts"
+        if keep:
+            _, note = await _close_goal(ctx, goal, reason=reason)
+            logger.info(f"Goal janitor: {goal['id']} expired, room kept ({keep}); {note}")
             return
         from src.tools.discord_tools import _discord_delete
         result = await _discord_delete(self.vault, f"/channels/{goal['channel_id']}")
@@ -140,13 +164,12 @@ class GoalJanitor:
             detail = (result or {}).get("detail", "no Discord token")
             logger.warning(f"Goal janitor: room {goal['channel_id']} of {goal['id']} "
                            f"not deleted: {detail}")
-            await self._post(goal, line)
+            _, note = await _close_goal(ctx, goal, reason=reason)
+            logger.info(f"Goal janitor: {goal['id']} expired, room kept; {note}")
             return
         store.log_event(goal["id"], "system", "channel_deleted",
                         f"{goal['channel_id']} (expired proposal)")
-        alert = self._alert_channel()
-        if alert:
-            await self._post({**goal, "channel_id": alert}, line + " Its room was removed.")
+        await self._post({**goal, "channel_id": alert}, line + " Its room was removed.")
 
     async def _post(self, goal: dict, text: str) -> None:
         connector = self.connectors.get(goal.get("connector") or "discord")

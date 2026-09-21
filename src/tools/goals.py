@@ -344,8 +344,15 @@ def _closing_text(goal: dict, reason: str = "") -> str:
                  f"**{goal['owner_agent']}** answers them, no mention needed.")
         return "\n".join([head, body, f"**Tasks:** {tally}", tail])
 
+    # The ask goes directly under the header, not at the end: _post_to_channel
+    # truncates at 1900 characters and the lists below are what grow. A
+    # reaction that deletes a room must never be reachable without the
+    # sentence that says so, whatever got cut off after it.
     head = f"🏁 **DONE: {goal['title']}** (`{goal['id']}`)"
-    lines = [head]
+    lines = [head,
+             f"{VERDICT_ASK} On ✅ this room is removed and the record stays in "
+             f"goal_status; on ❌ **{goal['owner_agent']}** asks what is missing "
+             f"and the goal continues."]
     if goal.get("description"):
         lines.append(f"**Goal:** {goal['description'][:300]}")
     lines.append(f"**How it was reached:** {goal['strategy'][:500]}" if goal["strategy"]
@@ -367,9 +374,6 @@ def _closing_text(goal: dict, reason: str = "") -> str:
         lines += [f"• #{t['id']} {t['title'][:50]}" for t in open_[:8]]
         if len(open_) > 8:
             lines.append(f"• and {len(open_) - 8} more")
-    lines.append(f"{VERDICT_ASK} On ✅ this room is removed and the record stays in "
-                 f"goal_status; on ❌ **{goal['owner_agent']}** asks what is missing "
-                 f"and the goal continues.")
     return "\n".join(lines)
 
 

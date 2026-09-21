@@ -710,10 +710,30 @@ def carry_task(task_id: int, actor: str, target_goal_id: str) -> tuple[dict, dic
     detail = src["detail"]
     tag = f"(carried from {src['goal_id']} #{task_id})"
     detail = f"{detail}\n{tag}".strip() if detail else tag
-    new = get_task(add_task(target["id"], src["title"], detail, src["assignee"], actor)["id"])
-    src = update_task(task_id, actor, status="dropped",
-                      drop_reason=f"carried to {target['id']} #{new['id']}")
-    return src, new  # type: ignore[return-value]
+    # One transaction: the drop needs the new id, so the insert goes first,
+    # and a failure between the two must not leave the task live on both
+    # goals. add_task/update_task each commit, hence the direct statements.
+    db = _get_db()
+    now = time.time()
+    try:
+        cur = db.execute(
+            "INSERT INTO goal_tasks (goal_id, title, detail, assignee, created_by, "
+            "created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (target["id"], src["title"], detail, src["assignee"], actor, now, now))
+        new_id = cur.lastrowid
+        db.execute(
+            "UPDATE goal_tasks SET status='dropped', drop_reason=?, updated_at=? WHERE id=?",
+            (f"carried to {target['id']} #{new_id}", now, task_id))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    _invalidate_cache()
+    log_event(target["id"], actor, "task",
+              f"#{new_id} added: {src['title']} (carried from {src['goal_id']} #{task_id})")
+    log_event(src["goal_id"], actor, "task",
+              f"#{task_id} dropped: carried to {target['id']} #{new_id}")
+    return get_task(task_id), get_task(new_id)  # type: ignore[return-value]
 
 
 def list_tasks(goal_id: str, statuses: tuple = ("open", "doing")) -> list[dict]:

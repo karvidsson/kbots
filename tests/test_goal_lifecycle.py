@@ -375,6 +375,8 @@ async def test_done_posts_the_summary_and_asks_for_a_verdict(world):
     assert "**Delivered:**\n• #1 audit" in text
     assert "**Dropped:**\n• #2 nice to have: out of scope" in text
     assert t.VERDICT_ASK in text and "atlas** asks what is missing" in text
+    # the ask sits under the header, ahead of everything that can grow
+    assert text.index(t.VERDICT_ASK) < text.index("**How it was reached")
     assert len(world.posts) == n_before + 1
     mid = f"msg-{len(world.posts)}"
     g = store.get_goal(goal["id"])
@@ -384,6 +386,27 @@ async def test_done_posts_the_summary_and_asks_for_a_verdict(world):
     assert world.reactions[-1] == (mid, ("✅", "❌"))
     assert world.archived == []
     assert store.goal_by_closing_message(mid)["id"] == goal["id"]
+
+
+@pytest.mark.asyncio
+async def test_the_verdict_ask_survives_a_summary_that_gets_truncated(world):
+    """_post_to_channel cuts at 1900 characters. A reaction that deletes a
+    room must never be seeded on a message whose explanation was cut off."""
+    t = world.tools
+    goal = await _run_to_executing(world)
+    await t.goal_set(_ctx(), goal["id"], "strategy", "s" * 500)
+    for i in range(30):
+        await t.goal_task(_ctx(), goal["id"], "add", title=f"task {i} " + "x" * 60)
+    for i in range(1, 14):
+        await t.goal_task(_ctx(), goal["id"], "done", task_id=i)
+    for i in range(14, 24):
+        await t.goal_task(_ctx(), goal["id"], "drop", task_id=i, detail="r" * 60)
+    await t.goal_set(_ctx(), goal["id"], "status", "done")
+    text = world.posts[-1][1]
+    assert len(text) > 1900
+    posted = text[:1900]
+    assert t.VERDICT_ASK in posted and "On ✅ this room is removed" in posted
+    assert store.get_goal(goal["id"])["summary"] == text      # stored in full
 
 
 @pytest.mark.asyncio
