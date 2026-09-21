@@ -1693,7 +1693,8 @@ class DiscordBot:
 
     async def _handle_goal_reaction(self, payload: discord.RawReactionActionEvent,
                                     emoji: str) -> bool:
-        """✅/❌ on a goal nomination or kickoff card. True if it was ours.
+        """✅/❌ on a goal nomination, kickoff card or closing summary. True if
+        it was ours.
 
         Returns True only when the message really is a goal card, so an
         unrelated ✅ falls through to HITL exactly as before.
@@ -1704,22 +1705,32 @@ class DiscordBot:
             message_id = str(payload.message_id)
             nom = store.nomination_by_message(message_id)
             goal = None if nom else store.goal_by_kickoff_message(message_id)
-            if not nom and not goal:
+            # The closing summary asks the user whether the goal was reached.
+            # Looked up without a status filter, unlike the kickoff card: a
+            # closing message is by definition on a retired goal.
+            closing = None if (nom or goal) else store.goal_by_closing_message(message_id)
+            if not nom and not goal and not closing:
                 return False
             # Same bar as HITL and schedule cancel: staffing a goal spends other
-            # agents' turns, so it is an admin's call, not any reader's.
+            # agents' turns, so it is an admin's call, not any reader's. The
+            # verdict deletes a channel, so it is not any reader's call either.
             if not self._is_admin(payload.user_id):
                 return True
             # Every gateway client sees this reaction. Exactly one must act, or
             # the confirmation goes out under whichever bot won the race to
             # decide_nomination, which is how a nomination for one agent came
             # back announced by an unrelated one.
-            owner = (goal or store.get_goal(nom["goal_id"]) or {}).get("owner_agent", "")
+            owner = (goal or closing
+                     or store.get_goal(nom["goal_id"]) or {}).get("owner_agent", "")
             if not self._owns_goal_reaction(payload, owner):
                 return True  # a goal card, handled by another client
             channel = (self.client.get_channel(payload.channel_id)
                        or await self.client.fetch_channel(payload.channel_id))
             user = f"<@{payload.user_id}>"
+
+            if closing:
+                return await self._handle_goal_verdict(payload, emoji, closing,
+                                                       channel, user)
 
             if nom:
                 approved = emoji == "✅"
@@ -1758,6 +1769,127 @@ class DiscordBot:
         except Exception as e:
             logger.error(f"goal reaction handling failed: {e}", exc_info=True)
             return False
+
+    def _goal_summary_channel(self) -> str:
+        """Where a goal's summary goes when its own room is about to be deleted.
+
+        The alert channel, resolved the way AlertSender resolves it (runtime
+        flag first, so a server provisioned live needs no config edit). Agents
+        on this fleet route with an empty `channels` list, so there is no
+        per-agent home channel to fall back on; the goal record keeps the
+        summary either way, this is the copy a human can scroll to.
+        """
+        from src.core import runtime_state
+        flag = runtime_state.get_flag("alert_channel", None)
+        if flag:
+            return str(flag)
+        full = getattr(self.connector, "_full_config", {}) or {}
+        return str((full.get("security") or {}).get("alert_channel", "") or "")
+
+    async def _send_to_channel_id(self, channel_id: str, text: str) -> bool:
+        """Best-effort send by raw id, for a channel this bot has not cached."""
+        if not channel_id:
+            return False
+        try:
+            channel = (self.client.get_channel(int(channel_id))
+                       or await self.client.fetch_channel(int(channel_id)))
+            await channel.send(text)
+            return True
+        except Exception as e:
+            logger.warning(f"[{self.account_name}] could not post to {channel_id}: {e}")
+            return False
+
+    async def _handle_goal_verdict(self, payload: discord.RawReactionActionEvent,
+                                   emoji: str, goal: dict, channel, user: str) -> bool:
+        """✅/❌ on a goal's closing summary — the user's verdict on it.
+
+        ✅ means reached: the summary is placed somewhere that outlives the
+        room, the leftover tasks are dropped, and the room is deleted. ❌ means
+        not yet: the goal goes back to executing and its owner is handed a turn
+        to ask what is missing. Either way the verdict is a column on the goal
+        before anything irreversible happens, so a failed delete leaves a
+        record of what the user decided rather than a goal that looks unasked.
+        """
+        from src.core import goal_notice
+        from src.core import goals as store
+        reached = emoji == "✅"
+        decided = store.record_verdict(goal["id"], reached, str(payload.user_id))
+        if not decided:
+            # Not awaiting a verdict (already answered, or reopened since the
+            # summary posted). A second reaction changes nothing, as on a
+            # nomination card.
+            return True
+        goal = decided
+        mgr = getattr(self.connector, "_agent_manager", None)
+
+        if not reached:
+            store.update_goal(goal["id"], "system", status="executing")
+            await channel.send(goal_notice.mark(
+                f"❌ `{goal['id']}` **not reached**, per {user}. The goal is open "
+                f"again and **{goal['owner_agent']}** will ask what is missing."))
+            if mgr:
+                await mgr.deliver_inter_agent_message(
+                    goal["owner_agent"], "system",
+                    f"The user answered ❌ on the closing summary of `{goal['id']}` "
+                    f"({goal['title']}): not reached. It is back in 'executing'. Ask "
+                    f"in the goal channel what is missing for it to count as reached, "
+                    f"in one message and without restating the summary, then add the "
+                    f"tasks that answer come to with goal_task.", 1)
+            logger.info(f"Goal {goal['id']}: verdict not_reached by {payload.user_id}")
+            return True
+
+        # ✅ — everything below is the removal, so order it worst-loss-last:
+        # the summary is placed first, the tasks are closed second, and the
+        # room goes last. A failure at any step leaves the steps before it.
+        where = self._goal_summary_channel()
+        head = (f"✅ `{goal['id']}` **{goal['title']}** confirmed reached by {user}. "
+                f"Its room was removed; this is the summary it closed on.")
+        body = goal.get("summary") or "(no summary was stored)"
+        text = f"{head}\n\n{body}"
+        if len(text) > 1900:
+            text = text[:1860].rstrip() + f"\n… full text: goal_status('{goal['id']}')"
+        if not await self._send_to_channel_id(where, goal_notice.mark(text)):
+            logger.warning(f"Goal {goal['id']}: summary not re-posted (alert channel "
+                           f"'{where}' unavailable); it remains on the goal record")
+        dropped = store.drop_open_tasks(goal["id"], str(payload.user_id), "goal closed")
+        logger.info(f"Goal {goal['id']}: verdict reached by {payload.user_id}, "
+                    f"{len(dropped)} task(s) dropped")
+
+        if goal.get("anchored"):
+            # A borrowed home channel belongs to the proposer, not to the goal.
+            await channel.send(goal_notice.mark(
+                f"✅ `{goal['id']}` confirmed reached by {user}. This channel is "
+                f"borrowed, so it stays; the goal is closed and its record is in "
+                f"goal_status."))
+            return True
+        if not await self._delete_goal_room(goal):
+            await channel.send(goal_notice.mark(
+                f"✅ `{goal['id']}` confirmed reached by {user}, but this room could "
+                f"not be deleted — see the log. The verdict is recorded; delete the "
+                f"channel by hand or react again after fixing the bot's rights."))
+        return True
+
+    async def _delete_goal_room(self, goal: dict) -> bool:
+        """Delete a goal's own channel. True on success; logs and returns False
+        otherwise. The goal row keeps its channel_id: the record of where the
+        work happened outlives the room."""
+        from src.core import goals as store
+        from src.tools.discord_tools import _discord_delete
+        vault = getattr(self.connector, "vault", None)
+        channel_id = str(goal.get("channel_id") or "")
+        if not vault or not channel_id:
+            logger.warning(f"Goal {goal['id']}: no vault or channel id, room kept")
+            return False
+        result = await _discord_delete(vault, f"/channels/{channel_id}",
+                                       bot=self.account_name)
+        if not result or result.get("error"):
+            detail = (result or {}).get("detail", "delete failed")
+            logger.error(f"Goal {goal['id']}: room {channel_id} not deleted: {detail}")
+            return False
+        store.log_event(goal["id"], "system", "channel_deleted",
+                        f"{channel_id} (goal reached)")
+        logger.info(f"Goal {goal['id']}: room {channel_id} deleted after ✅")
+        return True
 
     async def _handle_schedule_cancel(self, payload: discord.RawReactionActionEvent) -> None:
         """❌ on a schedule card → cancel that schedule. Parses the `sN` id from
