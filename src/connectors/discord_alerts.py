@@ -6,6 +6,7 @@ import json
 import re
 import time
 import unicodedata
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import discord
@@ -105,6 +106,31 @@ class DiscordAlertTransport:
         if not bot or not bot.client.user:
             raise AlertError("Registered bot is unavailable")
         return bot
+
+    @asynccontextmanager
+    async def presence(self, source, label):
+        """Show the owning agent as busy on this incident while work runs.
+
+        A repair is not a chat turn, so without this the agent looks idle for
+        the whole run. Presence is decoration: a failure here never stops it.
+        """
+        bot = self.connector.bots.get(source["account"]) if source else None
+        if bot is None:
+            yield
+            return
+        try:
+            await bot.task_started(label)
+        except Exception as error:
+            log_failure(error, "fix presence")
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                await bot.task_finished()
+            except Exception as error:
+                log_failure(error, "fix presence")
 
     async def channel(self, source):
         channel = await self.bot(source).client.fetch_channel(int(source["channel_id"]))
