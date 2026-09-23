@@ -16,6 +16,7 @@ from src.core.alert_fix_sandbox import FixSandbox
 from src.core.alert_git import git
 from src.core.base import Message, MessageRole
 
+REPAIR_STEP_TIMEOUT = 300
 SOURCE = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".vue", ".py", ".json", ".md", ".css"}
 LOCKS = {"pnpm-lock.yaml", "package-lock.json", "yarn.lock"}
 
@@ -279,25 +280,36 @@ async def repair(manager, source, workspace, context, guard, directory):
         except AlertError:
             pass
     history = [{"input": context, "files": inventory[:2000], "gates": workspace.gates}]
+    slow = 0
     for _ in range(40):
         guard()
-        response = await asyncio.wait_for(
-            provider.complete(
-                [
-                    Message(role=MessageRole.SYSTEM, content=system),
-                    Message(role=MessageRole.USER, content=json.dumps(history)),
-                ],
-                tools=None,
-                tool_free=True,
-                project_dir=str(directory),
-                session_id=None,
-                agent_id=source["owner"],
-                model=model or None,
-                timeout=120,
-                effort=overrides.get("effort", config.get("effort")),
-            ),
-            timeout=140,
-        )
+        # A repair step reads real source and reasons about a stack trace, so it
+        # is slower than a chat turn. One slow step must not lose the run: retry
+        # the same step a few times, inside the job's own time budget.
+        try:
+            response = await asyncio.wait_for(
+                provider.complete(
+                    [
+                        Message(role=MessageRole.SYSTEM, content=system),
+                        Message(role=MessageRole.USER, content=json.dumps(history)),
+                    ],
+                    tools=None,
+                    tool_free=True,
+                    project_dir=str(directory),
+                    session_id=None,
+                    agent_id=source["owner"],
+                    model=model or None,
+                    timeout=REPAIR_STEP_TIMEOUT,
+                    effort=overrides.get("effort", config.get("effort")),
+                ),
+                timeout=REPAIR_STEP_TIMEOUT + 20,
+            )
+        except TimeoutError:
+            slow += 1
+            if slow > 3:
+                raise AlertError("The repair model did not answer in time") from None
+            history.append({"note": "The previous step timed out. Answer with one smaller action."})
+            continue
         if response.tool_calls or response.stop_reason == "error" or len(response.content) > 150_000:
             raise AlertError("Restricted repair returned an invalid action")
         action, kind = {}, ""
