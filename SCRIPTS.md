@@ -82,6 +82,20 @@ scripts/install-watchdog.sh            # install + start
 scripts/install-watchdog.sh uninstall  # remove
 ```
 
+### `scripts/backup.sh` — Encrypted Backup of the Irreplaceable State
+Writes one encrypted archive of the vault, the configuration and every database. Databases are copied with `sqlite3 .backup`, never `cp`, so a live WAL database cannot restore as a corrupt file. Media, logs, caches and checkouts are excluded on purpose, which keeps the archive in the tens of megabytes. The encryption key is generated on first run and is deliberately NOT the vault passphrase, so an archive on another disk still cannot open the vault. Full detail in [docs/BACKUP.md](docs/BACKUP.md).
+```bash
+scripts/backup.sh                                   # newest archive, prune old
+KBOTS_BACKUP_DIR=/Volumes/drive/kbots scripts/backup.sh
+```
+
+### `scripts/restore-drill.sh` — Prove the Backup Restores
+Decrypts an archive into a throwaway `0700` directory and checks the vault opens with the vault key file, every database passes SQLite's `integrity_check`, and the configuration parses. Never touches the live install, never prints a secret value, exits non-zero on any failure so a scheduled run can page you.
+```bash
+scripts/restore-drill.sh              # newest archive
+scripts/restore-drill.sh <archive>    # a specific one
+```
+
 ### `setup.sh` — Deprecated Stub
 Forwards to `setup.py` and prints a deprecation notice; retained for backwards compatibility.
 ```bash

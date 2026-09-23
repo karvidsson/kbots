@@ -754,6 +754,7 @@ No sandbox for in-process tool execution (validation is a filter, not a boundary
 | [docs/PERMISSIONS.md](docs/PERMISSIONS.md) | Permissions & rights — per-platform setup (Linux/macOS/WSL2), failure catalog, runtime permission watch |
 | [docs/DISCORD_SETUP.md](docs/DISCORD_SETUP.md) | Discord bot setup — creating applications, the minimal permission set, install links, the Administrator trap |
 | [SCRIPTS.md](SCRIPTS.md) | Every script and what it's for |
+| [docs/BACKUP.md](docs/BACKUP.md) | Encrypted backup of the vault, config and databases, and the drill that proves a restore works |
 | [docs/TRAINING.md](docs/TRAINING.md) | Collect agent turns and fine-tune a local model (nanoGPT / MLX-LM / hosted / DPO-KTO) |
 | [docs/LOCAL_MODELS.md](docs/LOCAL_MODELS.md) | Run agents on local models (Ollama / LM Studio) + the quality-first tier router |
 | [docs/CREATE_THEN_OPERATE.md](docs/CREATE_THEN_OPERATE.md) | The core concept: big models build tools once, small/no models run them forever |
