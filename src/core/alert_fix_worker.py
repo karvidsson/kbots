@@ -51,6 +51,21 @@ class AlertFixWorker:
             except Exception as error:
                 log_failure(error, "fix PR card update")
 
+    def repair_label(self, job):
+        """What the agent's status says while it repairs this incident."""
+        row = self.store.db.execute("SELECT * FROM receipts WHERE id=?", (job["payload"]["receipt_id"],)).fetchone()
+        receipt = self.store._receipt(row) if row else {}
+        return "Fixing " + public_text(receipt.get("issue_title") or "a reported error", 90)
+
+    async def announced(self, job):
+        """Run the repair with the owning agent shown as busy on that incident."""
+        presence = getattr(self.transport, "presence", None)
+        if presence is None:
+            await self.execute(job)
+            return
+        async with presence(self.store.get(job["source_id"]), self.repair_label(job)):
+            await self.execute(job)
+
     async def execute(self, job):
         source = self.jobs.guard(job)
         config = source["config"]
@@ -182,7 +197,7 @@ class AlertFixWorker:
         job = self.jobs.claim(self.accounts)
         if not job:
             return False
-        task = asyncio.create_task(asyncio.wait_for(self.execute(job), timeout=2100))
+        task = asyncio.create_task(asyncio.wait_for(self.announced(job), timeout=2100))
         self.running[job["source_id"]] = task
         self.manager.active_turns += 1
         try:

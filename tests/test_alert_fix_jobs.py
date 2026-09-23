@@ -211,3 +211,23 @@ async def test_existing_foreign_head_is_not_labeled_as_our_tested_ready_pr(setup
     await worker.notices()
     assert "Existing PR #5 open" in visible_text(o.room.messages[0])
     assert "ready" not in visible_text(o.room.messages[0])
+
+
+async def test_repair_shows_the_agent_as_busy_on_that_incident(setup):
+    o = setup
+    worker = o.h.alerts.fixer
+    worker.accounts.add("one")
+    r = await delivered(o, issue_title="Cannot read properties of undefined")
+    shown = []
+    bot = o.h.bot
+    bot.task_started = AsyncMock(side_effect=lambda label="": shown.append(label))
+    bot.task_finished = AsyncMock(side_effect=lambda: shown.append(None))
+
+    async def execute(job):
+        assert shown and shown[-1].startswith("Fixing Cannot read properties")
+        worker.jobs.save(job, state="failed", reason="probe")
+
+    worker.execute = execute
+    assert await worker.once()
+    assert shown[-1] is None and len(shown) == 2
+    assert worker.repair_label(worker.jobs.for_receipt(r)).startswith("Fixing ")
