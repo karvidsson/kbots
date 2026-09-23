@@ -413,3 +413,34 @@ console.log('denied',n);process.exit(n===3?0:1);
     result = FixSandbox(root).run(["node", "probe.cjs"])
     assert result["exit_code"] == 0 and "denied 3" in result["output"]
     assert (root / "code.js").read_text() == "original"
+
+
+@pytest.mark.parametrize("timeouts,fixed", [(2, True), (4, False)])
+async def test_a_slow_repair_step_is_retried_before_the_run_is_lost(tmp_path, timeouts, fixed):
+    workspace = SimpleNamespace(
+        inventory=["handler.ts"],
+        folder=tmp_path,
+        gates=["typecheck", "test:unit"],
+        verified={"regression": "test/new.test.ts"},
+        read=lambda name: "untrusted source text",
+        write=lambda *a: None,
+        check=lambda name: {"passed": True},
+    )
+    answers = [TimeoutError()] * timeouts + [
+        LLMResponse(content=json.dumps({"action": "finish", "cause": "missing guard", "fix": "check input"}))
+    ]
+    provider = SimpleNamespace(supports_tool_free=True, complete=AsyncMock(side_effect=answers))
+    manager = SimpleNamespace(
+        agent_configs={"owner": {"llm": {"model": "fixture"}}},
+        storage=None,
+        defaults={},
+        _get_agent_llm=lambda owner: provider,
+        _effective_model=lambda *a: "fixture",
+        _apply_provider_override=lambda *a: None,
+    )
+    run = repair(manager, {"owner": "owner"}, workspace, {"diagnosis": {}}, lambda: None, tmp_path)
+    if fixed:
+        assert (await run)["fix"] == "check input"
+    else:
+        with pytest.raises(AlertError, match="did not answer in time"):
+            await run
