@@ -1866,6 +1866,8 @@ class DiscordBot:
         alerts = getattr(self.connector, "_alerts", None)
         if alerts:
             alerts.register_commands(self)
+        from src.connectors.discord_spend import register_spend
+        register_spend(self)
         self._register_status_commands()
         self._register_admin_commands()
         self._register_skill_commands()

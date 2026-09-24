@@ -26,6 +26,7 @@ from src.core.base import (
     VaultBackend,
 )
 from src.core.skills import get_skill, render_skill_prompt
+from src.core.spend import TurnMeter
 from src.core.tools import get_tool, get_tools_for_agent
 from src.memory.recall import format_block, recall
 
@@ -1022,6 +1023,7 @@ class AgentManager:
                       if active_skill and active_skill.max_rounds
                       else self._max_tool_rounds)
         fell_back = False
+        meter = TurnMeter(self, session.id, agent_id, message.user_id)
         async with connector.typing(message.channel_id, bot_account=message.bot_account,
                                      task_detail=message.content):
             response = None
@@ -1029,7 +1031,7 @@ class AgentManager:
             while round_num < max_rounds:
                 round_num += 1
                 try:
-                    response = await llm.complete(
+                    response = await meter.complete(llm,
                         messages,
                         tools=tools if tools else None,
                         project_dir=project_dir,
@@ -1070,6 +1072,7 @@ class AgentManager:
                 finally:
                     self._running_procs.pop(agent_id, None)
 
+                provider_used = meter.provider
                 # Skill-pinned provider failed (e.g. local runtime down): retry
                 # once on the agent's default provider unless fallback: false.
                 # Quality-first — a pinned task never silently dies.
@@ -1201,8 +1204,10 @@ class AgentManager:
             if self.storage:
                 await self.storage.save_message(
                     session.id, "assistant", response.content,
-                    tokens_used=response.tokens_used,
+                    tokens_used=meter.tokens,
                     provider=provider_used, model=response.model or llm_model,
+                    usage_turn_id=meter.id, usage_call_count=meter.calls,
+                    usage_requester_id=meter.requester_id,
                 )
         elif response and response.content:
             # A failed turn's content is an error string — mark it visibly so
@@ -1242,8 +1247,10 @@ class AgentManager:
             if self.storage:
                 await self.storage.save_message(
                     session.id, "assistant", response.content,
-                    tokens_used=response.tokens_used,
+                    tokens_used=meter.tokens,
                     provider=provider_used, model=response.model or llm_model,
+                    usage_turn_id=meter.id, usage_call_count=meter.calls,
+                    usage_requester_id=meter.requester_id,
                 )
 
         # Turn over — remove the in-channel progress message (any outcome path)
@@ -1340,10 +1347,11 @@ class AgentManager:
             (n for n, p in self.llm_providers.items() if p is llm), "unknown")
         await self._drop_foreign_cli_session(session, provider_used)
 
+        meter = TurnMeter(self, session.id, agent_id, message.user_id)
         response = None
         for round_num in range(self._max_tool_rounds):
             try:
-                response = await llm.complete(
+                response = await meter.complete(llm,
                     messages,
                     tools=tools if tools else None,
                     project_dir=project_dir,
@@ -1393,8 +1401,10 @@ class AgentManager:
         if self.storage and response and response.content:
             await self.storage.save_message(
                 session.id, "assistant", response.content,
-                tokens_used=response.tokens_used,
-                model=getattr(response, "model", None))
+                tokens_used=meter.tokens, provider=meter.provider,
+                model=getattr(response, "model", None) or llm_model,
+                usage_turn_id=meter.id, usage_call_count=meter.calls,
+                usage_requester_id=meter.requester_id)
 
         return response.content if response else None
 
