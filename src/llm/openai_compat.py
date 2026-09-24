@@ -302,9 +302,13 @@ class OpenAICompatProvider(LLMProvider):
                     content=f"Local model request failed — {type(e).__name__}: {e}{hint}",
                     model=model, stop_reason="error")
 
+        from src.core.usage import count, ollama_usage
+
+        usage_detail = ollama_usage(data)
         msg = data.get("message") or {}
         if kwargs.get("tool_free") and msg.get("tool_calls"):
-            return LLMResponse(content="Tool-free response contained tool calls", model=model, stop_reason="error")
+            return LLMResponse(content="Tool-free response contained tool calls", model=model, stop_reason="error",
+                               usage=usage_detail)
         tool_calls = None
         if msg.get("tool_calls"):
             tool_calls = [{"id": f"call_{uuid.uuid4().hex[:8]}",
@@ -312,9 +316,11 @@ class OpenAICompatProvider(LLMProvider):
                            "arguments": tc.get("function", {}).get("arguments") or {}}
                           for tc in msg["tool_calls"]]
         content = _strip_think(msg.get("content") or "")
-        tokens = (data.get("prompt_eval_count") or 0) + (data.get("eval_count") or 0)
+        inp, out = count(data.get("prompt_eval_count")), count(data.get("eval_count"))
+        tokens = count(inp + out) if inp is not None and out is not None else None
         return LLMResponse(content=content, tool_calls=tool_calls,
-                           tokens_used=tokens or None, model=model, stop_reason="end")
+                           tokens_used=tokens, model=data.get("model") or model,
+                           stop_reason="end", usage=usage_detail)
 
     # --- Provider interface ---
 
@@ -371,6 +377,9 @@ class OpenAICompatProvider(LLMProvider):
         except (RuntimeError, json.JSONDecodeError) as e:
             return LLMResponse(content=str(e), model=model, stop_reason="error")
 
+        from src.core.usage import count, inclusive_usage, mapping
+
+        usage_detail = inclusive_usage(data.get("usage"))
         try:
             msg = data["choices"][0]["message"]
         except (KeyError, IndexError):
@@ -378,7 +387,8 @@ class OpenAICompatProvider(LLMProvider):
                                model=model, stop_reason="error")
 
         if kwargs.get("tool_free") and msg.get("tool_calls"):
-            return LLMResponse(content="Tool-free response contained tool calls", model=model, stop_reason="error")
+            return LLMResponse(content="Tool-free response contained tool calls", model=model, stop_reason="error",
+                               usage=usage_detail)
         tool_calls = None
         if msg.get("tool_calls"):
             tool_calls = []
@@ -392,11 +402,12 @@ class OpenAICompatProvider(LLMProvider):
 
         content = _strip_think(msg.get("content") or "")
 
-        usage = data.get("usage") or {}
+        usage = mapping(data.get("usage"))
         return LLMResponse(
             content=content,
             tool_calls=tool_calls,
-            tokens_used=usage.get("total_tokens"),
+            tokens_used=count(usage.get("total_tokens")),
+            usage=usage_detail,
             model=data.get("model", model),
             stop_reason="end",
         )

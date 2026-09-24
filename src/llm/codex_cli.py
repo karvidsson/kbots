@@ -573,6 +573,7 @@ class CodexCLIProvider(LLMProvider):
                     await run_task
 
         thread_id, content, tokens = self._parse_events(stdout, tag)
+        usage = self._parse_usage(stdout)
         model = str(args[args.index('-m') + 1]) if '-m' in args else "codex-default"
         if proc.returncode != 0 or content is None:
             err = (stderr or b"").decode(errors="replace").strip()
@@ -601,7 +602,7 @@ class CodexCLIProvider(LLMProvider):
                     content=content + (
                         f"\n\n(Blocked by codex automatic approval review: "
                         f"{refusal})" if refusal else ""),
-                    tokens_used=tokens,
+                    tokens_used=tokens, usage=usage,
                     model=model,
                     # Not "error": that clears the CLI session id, and the codex
                     # thread is intact and resumable. Not "stop" either, so the
@@ -618,7 +619,7 @@ class CodexCLIProvider(LLMProvider):
             return None
         return LLMResponse(
             content=content,
-            tokens_used=tokens,
+            tokens_used=tokens, usage=usage,
             model=model,
             stop_reason="stop",
             session_id=thread_id,
@@ -669,6 +670,20 @@ class CodexCLIProvider(LLMProvider):
                 waiter.cancel()
 
     @staticmethod
+    def _parse_usage(stdout: bytes) -> dict | None:
+        from src.core.usage import inclusive_usage
+
+        result = None
+        for line in (stdout or b"").decode(errors="replace").splitlines():
+            try:
+                event = json.loads(line)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(event, dict) and event.get("type") == "turn.completed":
+                result = inclusive_usage(event.get("usage"), codex=True)
+        return result
+
+    @staticmethod
     def _parse_events(stdout: bytes, tag: str) -> tuple[str | None, str | None, int | None]:
         """(thread_id, last agent message, total tokens) from JSONL events."""
         thread_id = content = None
@@ -689,9 +704,10 @@ class CodexCLIProvider(LLMProvider):
                 if item.get("type") == "agent_message" and item.get("text"):
                     content = item["text"]
             elif etype == "turn.completed":
-                usage = event.get("usage") or {}
-                tokens = (usage.get("input_tokens", 0) or 0) + \
-                         (usage.get("output_tokens", 0) or 0)
+                from src.core.usage import count, mapping
+                usage = mapping(event.get("usage"))
+                inp, out = count(usage.get("input_tokens")), count(usage.get("output_tokens"))
+                tokens = count(inp + out) if inp is not None and out is not None else None
             elif etype in ("turn.failed", "error"):
                 logger.warning(f"{tag}codex event {etype}: "
                                f"{json.dumps(event)[:300]}")

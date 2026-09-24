@@ -486,6 +486,10 @@ class ClaudeCodeProvider(LLMProvider):
                            detail="; ".join(denials[:3]))
                     denials.clear()
 
+                response = self._parse_response(stdout_text)
+                if response.usage is not None:
+                    response.usage["fresh_session"] = "--resume" not in args
+
                 if proc.returncode != 0:
                     # Try to extract error from JSON stdout (Claude Code sometimes returns errors there)
                     error_detail = ""
@@ -571,7 +575,9 @@ class ClaudeCodeProvider(LLMProvider):
                             ),
                             # Distinct from generic "error" so the manager can alert
                             # ops and point at the reauth flow.
-                            stop_reason="auth_error",
+                            stop_reason="auth_error", usage=response.usage,
+                            tokens_used=response.tokens_used, model=response.model,
+                            session_id=response.session_id,
                         )
 
                     # Usage limit — downgrade to a cheaper model to keep going,
@@ -597,7 +603,8 @@ class ClaudeCodeProvider(LLMProvider):
                                 "I've hit the usage limit for now, so I can't respond until "
                                 "it resets. An admin has been notified."
                             ),
-                            stop_reason="usage_limit",
+                            stop_reason="usage_limit", usage=response.usage,
+                            tokens_used=response.tokens_used, session_id=response.session_id,
                             model=model,
                             reset_hint=_extract_reset_hint(f"{stderr_text} {error_detail}"),
                         )
@@ -617,10 +624,10 @@ class ClaudeCodeProvider(LLMProvider):
                             "Sorry, something went wrong on my end. Try sending that "
                             "again — if it keeps failing, tell an admin."
                         ),
-                        stop_reason="error",
+                        stop_reason="error", usage=response.usage,
+                        tokens_used=response.tokens_used, model=response.model,
+                        session_id=response.session_id,
                     )
-
-                response = self._parse_response(stdout_text)
 
                 # If we downgraded to escape a usage cap, flag it so the manager
                 # can keep the session on the cheaper model and alert ops.
@@ -815,26 +822,19 @@ class ClaudeCodeProvider(LLMProvider):
             # Not JSON — treat as plain text (shouldn't happen with --output-format json)
             return LLMResponse(content=output, stop_reason="end_turn")
 
-        if data.get("is_error"):
-            return LLMResponse(
-                content=data.get("result", "Unknown error"),
-                stop_reason="error",
-            )
+        from src.core.usage import claude_usage, total
 
-        # Extract usage info
-        usage = data.get("usage", {})
-        total_tokens = (
-            usage.get("input_tokens", 0) +
-            usage.get("output_tokens", 0) +
-            usage.get("cache_read_input_tokens", 0)
-        )
-
+        if not isinstance(data, dict):
+            return LLMResponse(content=output, stop_reason="end_turn")
+        usage = claude_usage(data)
+        models = list(usage["model_usage"])
         return LLMResponse(
-            content=data.get("result", ""),
-            tokens_used=total_tokens,
-            model=data.get("model"),
-            stop_reason=data.get("stop_reason", "end_turn"),
+            content=data.get("result", "Unknown error" if data.get("is_error") else ""),
+            tokens_used=total(usage),
+            model=data.get("model") or (models[0] if len(models) == 1 else None),
+            stop_reason="error" if data.get("is_error") else data.get("stop_reason", "end_turn"),
             session_id=data.get("session_id"),
+            usage=usage,
         )
 
     # Env vars safe to pass to Claude Code subprocess.

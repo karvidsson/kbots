@@ -73,11 +73,11 @@ async def test_messages_record_provider_and_model(tmp_path):
             rows = await cur.fetchall()
     assert rows[0] == ("assistant", "local", "qwen3.5:9b")
     assert rows[1] == ("user", None, None)
-    await st._db.close()
+    await st.close()
     # migration is idempotent — re-init on an already-migrated DB is a no-op
     st2 = Storage(db_path=db)
     await st2.init()
-    await st2._db.close()
+    await st2.close()
 
 
 async def test_progress_message_lifecycle():

@@ -83,6 +83,8 @@ class Storage:
     def __init__(self, db_path: str | Path = "data/kbots.db"):
         self._db_path = Path(db_path)
         self._db: aiosqlite.Connection | None = None
+        self.spend = None
+        self._usage_column = False
 
     async def init(self) -> None:
         """Initialize the database and create tables."""
@@ -112,10 +114,28 @@ class Storage:
             await self._db.execute(
                 "ALTER TABLE sessions ADD COLUMN cli_session_provider TEXT")
         await self._db.commit()
+        # Optional, additive accounting. A failed migration must not prevent
+        # conversations or rewrite any historical assistant message.
+        try:
+            async with self._db.execute("PRAGMA table_info(messages)") as cur:
+                cols = {row[1] for row in await cur.fetchall()}
+            for col, kind in (("usage_turn_id", "TEXT"), ("usage_call_count", "INTEGER"),
+                              ("usage_requester_id", "TEXT")):
+                if col not in cols:
+                    await self._db.execute(f"ALTER TABLE messages ADD COLUMN {col} {kind}")
+            await self._db.commit()
+            self._usage_column = True
+            from src.core.spend import SpendLedger
+            self.spend = await SpendLedger.open(self._db_path)
+        except Exception as exc:
+            await self._db.rollback()
+            logger.warning("Spend ledger unavailable (%s)", type(exc).__name__)
         logger.info(f"Storage initialized: {self._db_path}")
 
     async def close(self) -> None:
         """Close the database connection."""
+        if self.spend:
+            await self.spend.close()
         if self._db:
             await self._db.close()
 
@@ -278,18 +298,23 @@ class Storage:
         tokens_used: int | None = None,
         provider: str | None = None,
         model: str | None = None,
+        usage_turn_id: str | None = None,
+        usage_call_count: int | None = None,
+        usage_requester_id: str | None = None,
     ) -> int:
         """Save a message to the database. Returns the message ID."""
+        usage_col = ", usage_turn_id, usage_call_count, usage_requester_id" if self._usage_column else ""
+        usage_param = ", ?, ?, ?" if self._usage_column else ""
         cursor = await self._db.execute(
             "INSERT INTO messages (session_id, role, content, name, tool_calls, "
-            "tool_results, tokens_used, provider, model) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            f"tool_results, tokens_used, provider, model{usage_col}) "
+            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?{usage_param})",
             (
                 session_id, role, content, name,
                 json.dumps(tool_calls) if tool_calls else None,
                 json.dumps(tool_results) if tool_results else None,
                 tokens_used, provider, model,
-            )
+            ) + ((usage_turn_id, usage_call_count, usage_requester_id) if self._usage_column else ())
         )
         await self._db.commit()
         return cursor.lastrowid

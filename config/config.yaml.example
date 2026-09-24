@@ -51,6 +51,10 @@ connectors:
     port: 8090
 
 defaults:
+  # USD per million tokens, by provider registry name and exact reported model.
+  # Empty intentionally: unpriced calls stay unknown. See docs/SPEND.md.
+  spend:
+    prices: {}
   llm:
     provider: claude_code
     model: sonnet

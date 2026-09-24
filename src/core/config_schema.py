@@ -41,6 +41,7 @@ _SCHEMA: dict[str, tuple] = {
     "defaults": (dict, False, None, {
         "llm": (dict, False, None, None),
         "session": (dict, False, None, None),
+        "spend": (dict, False, None, {"prices": (dict, False, None, None)}),
         "memory": (dict, False, None, {
             "backend": (str, False, ["sqlite"], None),
             "semantic_search": (bool, False, None, None),

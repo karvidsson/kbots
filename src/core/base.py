@@ -430,6 +430,7 @@ class LLMResponse:
     # keep the session going after hitting a per-model usage cap.
     usage_downgraded: bool = False
     reset_hint: str | None = None  # human text about when the limit resets, if known
+    usage: dict | None = None  # normalized token classes and reported cost, never credentials
 
 
 # === Tool types ===
