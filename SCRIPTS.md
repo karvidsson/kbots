@@ -71,8 +71,24 @@ cd "$KBOTS_HOME" && scripts/update.sh
 Like `update.sh` but with safety rails, for letting an agent (or you) ship changes to the live service. Pulls, syncs, then **gates on `ruff` + full `pytest`** before restarting; after restart it **health-checks the boot** and **auto-rolls-back to the previous commit** if tests fail or the service doesn't come up cleanly. Deterministic — the safety is in the script, not an agent's judgement. The box is never left on broken code.
 
 It refreshes the service unit too, after the gate and before the restart, so a pulled sandbox fix reaches the machine instead of only the history. A unit written but not made live rolls the deploy back, since that is the one state where the file on disk and the running process disagree.
+
+The offline harness scan also runs after pytest and before restart. Drift or a
+missing baseline blocks deployment; only an explicit human `--accept` approves
+changes. A rejected harness rolls the code back without restarting the service.
+See [Harness scan](docs/HARNESS_SCAN.md) for coverage and first acceptance.
 ```bash
 cd "$KBOTS_HOME" && scripts/self-deploy.sh
+```
+
+### `scripts/harness-scan.py`: Offline Harness Drift Gate
+
+Checks agent rights, MCP servers, hooks, prompt credential shapes, skills/tools,
+and secret-file modes and ownership. Uses a deployment-local hash baseline and
+never opens vault, key or backup contents. No network calls.
+
+```bash
+uv run --offline --no-sync python scripts/harness-scan.py
+uv run --offline --no-sync python scripts/harness-scan.py --accept  # human review only
 ```
 
 ### `scripts/install-watchdog.sh` — Automatic-Recovery Watchdog (lifeboat)

@@ -9,8 +9,9 @@
 #   1. pull latest from origin
 #   2. sync dependencies
 #   3. GATE: ruff + full pytest on the new code — abort+rollback if red
-#   4. restart the service
-#   5. HEALTH CHECK: wait for a clean boot — auto-rollback if it doesn't come up
+#   4. GATE: offline harness scan against the explicitly accepted baseline
+#   5. restart the service
+#   6. HEALTH CHECK: wait for a clean boot — auto-rollback if it doesn't come up
 #
 # A failure at any stage reverts the install to the exact commit it was on and
 # restarts, so the box is never left on broken code. Deterministic on purpose:
@@ -60,7 +61,10 @@ rollback() {
     log "ROLLING BACK to $(git rev-parse --short "$OLD")"
     git reset --hard "$OLD" >/dev/null 2>&1
     "$SCRIPT_DIR/sync.sh" >/dev/null 2>&1 || uv sync >/dev/null 2>&1
-    restart_service
+    # A rejected harness must not be activated by the rollback restart either.
+    if [ "${1:-}" != "no-restart" ]; then
+        restart_service
+    fi
 }
 
 # Wait for a clean boot after a restart. $1 = log line count before restart.
@@ -149,6 +153,13 @@ if ! UV_PROJECT_ENVIRONMENT="$GATE_ENV" uv run --extra dev ruff check .; then
 fi
 if ! UV_PROJECT_ENVIRONMENT="$GATE_ENV" uv run --extra dev pytest -q; then
     log "TESTS FAILED — not deploying"; rollback; exit 1
+fi
+
+log "GATE: offline harness scan"
+if ! UV_PROJECT_ENVIRONMENT="$GATE_ENV" uv run --offline --no-sync python "$SCRIPT_DIR/harness-scan.py" --overlay "$OVERLAY"; then
+    log "HARNESS SCAN FAILED: review the printed diff; only a human may run scripts/harness-scan.py --accept"
+    log "Not restarting with an unreviewed harness; reverting code and leaving the running service alone"
+    rollback no-restart; exit 1
 fi
 
 # Post-gate migration check (fresh pull that brought the rename lands here)
