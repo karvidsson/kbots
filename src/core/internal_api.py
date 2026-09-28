@@ -60,6 +60,7 @@ class InternalAPI:
         app = web.Application()
         app.router.add_post("/agent-message", self._handle_agent_message)
         app.router.add_post("/graph", self._handle_graph)
+        app.router.add_post("/owner-ask", self._handle_owner_ask)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
@@ -76,6 +77,40 @@ class InternalAPI:
     def _authed(self, request: web.Request) -> bool:
         auth = request.headers.get("Authorization", "")
         return auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], self.token)
+
+    async def _handle_owner_ask(self, request: web.Request) -> web.Response:
+        """Creation only. Human answers are accepted solely from Discord events."""
+        if not self._authed(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        service = getattr(self.mgr, "_owner_asks", None)
+        if not service:
+            return web.json_response({"error": "Waiting list unavailable"}, status=503)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or not body.keys() <= {
+                "agent_id",
+                "question",
+                "default",
+                "options",
+                "context",
+                "request_key",
+            }:
+                raise ValueError("Invalid ask fields")
+            result = await service.ask(**body)
+            return web.json_response(result)
+        except (TypeError, ValueError):
+            return web.json_response(
+                {
+                    "error": "Invalid ask, owner configuration or agent routing. "
+                    "Provide question, default and optional bounded options/context/request_key."
+                },
+                status=400,
+            )
+        except Exception as exc:
+            logger.warning("Owner ask request not confirmed (%s)", type(exc).__name__)
+            return web.json_response(
+                {"error": "Ask delivery unconfirmed; retry unchanged with the same request_key"}, status=503
+            )
 
     async def _handle_graph(self, request: web.Request) -> web.Response:
         """Execute a graph-memory call for a tool subprocess (GraphClient).

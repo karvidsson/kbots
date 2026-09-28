@@ -400,6 +400,14 @@ class IncomingMessage:
     source: str = "user"
 
 
+@dataclass(frozen=True)
+class MessageDelivery:
+    """Explicit manager receipt; a normal return alone does not confirm delivery."""
+    delivered: bool
+    reason: str = ""
+    retryable: bool = False
+
+
 class MessageRole(str, Enum):
     USER = "user"
     ASSISTANT = "assistant"

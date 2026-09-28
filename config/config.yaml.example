@@ -50,6 +50,15 @@ connectors:
     host: "127.0.0.1"        # localhost only by default; use "0.0.0.0" for LAN (secure it!)
     port: 8090
 
+# Durable decisions, separate from security.hitl tool approvals. See docs/WAITING_ON_YOU.md.
+waiting_on_you:
+  enabled: true
+  owner_id: ""                # defaults to the sole admin_users.discord entry
+  digest_hour: 8              # one nonempty morning DM per recipient/local date
+  timezone: UTC              # IANA timezone, e.g. Europe/Stockholm
+  remind_after: 14400         # seconds, one reminder attempt after 4 hours
+  stale_after: 604800         # seconds, 7 days; never auto-approve
+
 defaults:
   # USD per million tokens, by provider registry name and exact reported model.
   # Empty intentionally: unpriced calls stay unknown. See docs/SPEND.md.

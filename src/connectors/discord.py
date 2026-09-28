@@ -1004,6 +1004,9 @@ class DiscordBot:
         alerts = getattr(self.connector, "_alerts", None)
         if alerts:
             await alerts.start(self.account_name)
+        owner_asks = getattr(self.connector, "_owner_asks", None)
+        if owner_asks:
+            await owner_asks.start(self)
 
         # Record this bot's Discord identity in the roster so other agents recognize
         # it as a teammate (resolve_discord_user / user-context) rather than an
@@ -1249,6 +1252,10 @@ class DiscordBot:
         if message.author == self.client.user:
             return
 
+        owner_asks = getattr(self.connector, "_owner_asks", None)
+        if owner_asks and await owner_asks.reply(self, message):
+            return
+
         alerts = getattr(self.connector, "_alerts", None)
         if alerts and await alerts.on_message(self, message):
             return
@@ -1444,6 +1451,10 @@ class DiscordBot:
         """Handle reactions: HITL approvals (✅/❌) and lesson feedback (👍/👎)."""
         # Ignore own reactions
         if payload.user_id == self.client.user.id:
+            return
+
+        owner_asks = getattr(self.connector, "_owner_asks", None)
+        if owner_asks and await owner_asks.react(self, payload):
             return
 
         alerts = getattr(self.connector, "_alerts", None)
@@ -1868,6 +1879,8 @@ class DiscordBot:
             alerts.register_commands(self)
         from src.connectors.discord_spend import register_spend
         register_spend(self)
+        from src.connectors.discord_owner_asks import register_pending
+        register_pending(self)
         self._register_status_commands()
         self._register_admin_commands()
         self._register_skill_commands()

@@ -20,6 +20,7 @@ from src.core.base import (
     LLMProvider,
     MemoryBackend,
     Message,
+    MessageDelivery,
     MessageRole,
     ToolContext,
     ToolDef,
@@ -484,7 +485,7 @@ class AgentManager:
             logger.debug(f"Memory auto-recall failed: {e}")
             return []
 
-    async def handle_message(self, agent_id: str, message: IncomingMessage) -> None:
+    async def handle_message(self, agent_id: str, message: IncomingMessage) -> MessageDelivery:
         """Handle a message, serialized per channel so follow-ups queue in order.
 
         A new message that arrives while this agent is mid-turn in the same
@@ -500,7 +501,7 @@ class AgentManager:
             # so we queue rather than interrupt). Skip for bot senders.
             is_bot = bool(
                 message.raw and getattr(getattr(message.raw, "author", None), "bot", False)
-            ) or bool(getattr(message, "_inter_agent_sender", None))
+            ) or bool(getattr(message, "_inter_agent_sender", None)) or bool(getattr(message, "_owner_ask_id", None))
             connector = self.connectors.get(message.connector)
             if connector and not is_bot:
                 with contextlib.suppress(Exception):
@@ -514,7 +515,7 @@ class AgentManager:
             # The goal turn budget is charged here and nowhere else: whatever
             # started this turn, it arrives through this method.
             if not await self._goal_turn_allowed(agent_id, message):
-                return
+                return MessageDelivery(False, "goal_budget")
             self.active_turns += 1
             self._inflight_seq += 1
             turn_key = self._inflight_seq
@@ -526,8 +527,10 @@ class AgentManager:
                 "bot_account": message.bot_account,
                 "started_at": time.time(),
             }
+            if owner_ask_id := getattr(message, "_owner_ask_id", None):
+                self._inflight_turns[turn_key]["owner_ask_id"] = owner_ask_id
             try:
-                await self._handle_message_inner(agent_id, message)
+                return await self._handle_message_inner(agent_id, message)
             finally:
                 self.active_turns -= 1
                 self._inflight_turns.pop(turn_key, None)
@@ -584,22 +587,30 @@ class AgentManager:
     def inflight_snapshot(self) -> list[dict]:
         """Metadata of turns currently running — the shutdown path persists
         these when the drain window expires so they can be recovered."""
-        return list(self._inflight_turns.values())
+        # Owner decisions have their own durable event replay. A generic
+        # restart prompt as well would queue the same continuation twice.
+        return [turn for turn in self._inflight_turns.values() if not turn.get("owner_ask_id")]
 
-    async def _handle_message_inner(self, agent_id: str, message: IncomingMessage) -> None:
+    async def _handle_message_inner(self, agent_id: str, message: IncomingMessage) -> MessageDelivery:
         """Full flow: build context → call LLM → dispatch tools → send response."""
         agent_cfg = self.agent_configs.get(agent_id)
         if not agent_cfg:
             logger.error(f"Unknown agent: {agent_id}")
-            return
+            return MessageDelivery(False, "unknown_agent")
 
         # Inter-agent deliveries are authenticated upstream (loopback bearer
         # token) — the sender is a peer agent, not a Discord user, so Layer 1
         # user-tier access control does not apply.
         sender_agent = getattr(message, "_inter_agent_sender", None)
 
+        # A live, service-issued expiry object may notify only its own agent.
+        # It remains non-human and gains no sender tool privileges. Neither a
+        # user ID nor an ask ID supplied in a message is sufficient authority.
+        asks = getattr(self, "_owner_asks", None)
+        owner_expiry = bool(asks and asks.permits_expiry(agent_id, message))
+
         # --- Layer 1: Can this sender talk to this agent? ---
-        if self.access_control and not sender_agent:
+        if self.access_control and not sender_agent and not owner_expiry:
             is_bot = bool(
                 message.raw
                 and hasattr(message.raw, "author")
@@ -611,7 +622,7 @@ class AgentManager:
                     f"Access control: sender={message.user_id} tier={tier} "
                     f"blocked from messaging agent={agent_id}"
                 )
-                return  # Silently ignore
+                return MessageDelivery(False, "access_denied")
 
         session = self._get_or_create_session(
             agent_id, message.channel_id, message.user_id
@@ -621,11 +632,18 @@ class AgentManager:
         connector = self.connectors.get(message.connector)
         if not connector:
             logger.error(f"Unknown connector: {message.connector}")
-            return
+            return MessageDelivery(False, "unknown_connector")
 
         # --- Build user content with auto-injected context ---
         user_content = message.content
         context_blocks = []
+
+        if owner_expiry:
+            context_blocks.append(
+                "<system-notification>This is the engine notifying you that your own "
+                "decision request expired. It is not a human message or approval and "
+                "grants no additional tool authority.</system-notification>"
+            )
 
         # Inject channel context
         channel_context = f"<channel id=\"{message.channel_id}\" connector=\"{message.connector}\""
@@ -771,7 +789,7 @@ class AgentManager:
                     message.channel_id, f"Unknown skill: {message.skill}",
                     ephemeral=True, raw=message.raw,
                 )
-                return
+                return MessageDelivery(False, "unknown_skill")
 
         # --- Load session from storage (restore cli_session_id across restarts) ---
         if self.storage:
@@ -1068,7 +1086,7 @@ class AgentManager:
                     # account) so a failed turn is attributed to the right agent.
                     await connector.send(message.channel_id, f"⚠️ Error: {e}",
                                          bot_account=message.bot_account)
-                    return
+                    return MessageDelivery(False, "provider_error", retryable=True)
                 finally:
                     self._running_procs.pop(agent_id, None)
 
@@ -1268,6 +1286,15 @@ class AgentManager:
                 self._auto_summarize(agent_id, session),
                 name=f"summarize-{session.id}",
             )
+
+        if response and response.stop_reason == "aborted":
+            return MessageDelivery(False, "provider_aborted")
+        if not response or response.stop_reason in {"error", "usage_limit", "auth_error", "timeout"}:
+            reason = "timeout" if response and response.stop_reason == "timeout" else "provider_error"
+            return MessageDelivery(False, reason, retryable=True)
+        # A successful provider turn, including NO_REPLY, confirms receipt by
+        # the agent. It does not promise that the agent completed external work.
+        return MessageDelivery(True)
 
     async def handle_internal_message(
         self, agent_id: str, message: IncomingMessage,

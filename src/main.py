@@ -477,6 +477,21 @@ async def main() -> None:
             on_guild_intro=_on_guild_intro,
         )
 
+    # One durable waiting list; the existing HITL gates remain separate.
+    owner_asks = None
+    if "discord" in active_connectors:
+        from src.connectors.discord_owner_asks import DiscordOwnerAsks
+        from src.core.base import resolve_data_dir
+        try:
+            owner_asks = DiscordOwnerAsks(active_connectors["discord"], agent_manager, config,
+                                         resolve_data_dir(config) / "owner-asks.db")
+            active_connectors["discord"]._owner_asks = owner_asks
+            agent_manager._owner_asks = owner_asks
+        except ValueError as exc:
+            logger.error("Waiting list disabled: %s", exc)
+        except Exception as exc:
+            logger.error("Waiting list unavailable (%s)", type(exc).__name__)
+
     # --- Start connectors ---
     for conn_name, connector in active_connectors.items():
         try:
@@ -769,6 +784,8 @@ async def main() -> None:
             logger.info("All turns drained cleanly")
 
     logger.info("Shutting down...")
+    if owner_asks:
+        await owner_asks.stop()
     for conn_name, connector in active_connectors.items():
         try:
             await connector.stop()
