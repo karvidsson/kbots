@@ -198,6 +198,22 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
             PRIMARY KEY (goal_id, agent_id)
         );
         CREATE INDEX IF NOT EXISTS idx_nom_msg ON goal_nominations(message_id);
+
+        -- Keep the exact decided card even after the goal is reopened. A pending
+        -- follow-up is not proof of Discord delivery or channel removal.
+        CREATE TABLE IF NOT EXISTS goal_verdict_deliveries (
+            message_id TEXT PRIMARY KEY,
+            goal_id TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            binding TEXT NOT NULL,
+            verdict TEXT NOT NULL,
+            decided_by TEXT NOT NULL,
+            decided_at REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending',
+            note TEXT NOT NULL DEFAULT 'Verdict recorded; follow-up not confirmed. Check the room before any cleanup.',
+            receipt_channel_id TEXT NOT NULL DEFAULT '',
+            receipt_message_id TEXT NOT NULL DEFAULT ''
+        );
     """)
     # `anchored` = the goal is borrowing the proposer's home channel because
     # its proposer's tier could not create one. It is a fact about the channel,
@@ -241,6 +257,8 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
         db.execute("ALTER TABLE goals ADD COLUMN verdict TEXT NOT NULL DEFAULT ''")
         db.execute("ALTER TABLE goals ADD COLUMN verdict_by TEXT NOT NULL DEFAULT ''")
         db.execute("ALTER TABLE goals ADD COLUMN verdict_at REAL NOT NULL DEFAULT 0")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_goals_closing ON goals(closing_message_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_goal_closed_events ON goal_events(kind,payload)")
     # Why a task was dropped ("goal closed", "carried to g-x #7"). Without it
     # a dropped task and a declined one look the same in the summary.
     tcols = {r[1] for r in db.execute("PRAGMA table_info(goal_tasks)")}
@@ -537,18 +555,90 @@ def goal_by_closing_message(message_id: str) -> dict | None:
     return dict(row) if row else None
 
 
-def record_verdict(goal_id: str, reached: bool, decided_by: str) -> dict | None:
-    """Store the user's answer to the closing summary. Returns the goal, or
-    None when the goal is not 'done' or already has a verdict: a second
-    reaction changes nothing, like a second reaction on a nomination."""
-    goal = get_goal(goal_id)
-    if not goal or goal["status"] != "done" or goal.get("verdict"):
-        return None
+def is_closing_message(message_id: str) -> bool:
+    """Consume retired/superseded cards too, instead of waking an agent."""
+    if not message_id:
+        return False
+    db = _get_db()
+    return bool(db.execute(
+        "SELECT 1 FROM goals WHERE closing_message_id=? UNION ALL "
+        "SELECT 1 FROM goal_verdict_deliveries WHERE message_id=? UNION ALL "
+        "SELECT 1 FROM goal_events WHERE kind='closed' AND payload=? LIMIT 1",
+        (message_id, message_id, f"notice {message_id}")).fetchone())
+
+
+def record_verdict(goal_id: str, reached: bool, decided_by: str, *,
+                   expected: dict | None = None, binding: dict | None = None) -> dict | None:
+    """Claim a verdict once, including across engine/MCP processes.
+
+    The connector supplies the snapshot it authenticated. No await separates
+    this claim from the optional return to executing on a negative answer.
+    The legacy store-only call keeps its existing lifecycle contract.
+    """
+    db = _get_db()
+    now = time.time()
     verdict = "reached" if reached else "not_reached"
-    goal = update_goal(goal_id, decided_by, verdict=verdict, verdict_by=decided_by,
-                       verdict_at=time.time())
-    log_event(goal_id, decided_by, "verdict", verdict)
-    return goal
+    with db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM goals WHERE id=?", (goal_id,)).fetchone()
+        goal = dict(row) if row else None
+        if not goal or goal["status"] != "done" or goal.get("verdict"):
+            return None
+        if expected is not None and any(goal.get(k) != v for k, v in expected.items()):
+            return None
+        if binding is not None and db.execute(
+                "SELECT 1 FROM goal_verdict_deliveries WHERE message_id=?",
+                (goal["closing_message_id"],)).fetchone():
+            return None
+        db.execute(
+            "UPDATE goals SET verdict=?,verdict_by=?,verdict_at=?,updated_at=?,"
+            "last_activity_at=? WHERE id=?", (verdict, decided_by, now, now, now, goal_id))
+        db.execute(
+            "INSERT INTO goal_events (goal_id,ts,agent_id,kind,payload) VALUES (?,?,?,?,?)",
+            (goal_id, now, decided_by, "verdict", verdict))
+        if binding is not None:
+            db.execute(
+                "INSERT INTO goal_verdict_deliveries "
+                "(message_id,goal_id,summary,binding,verdict,decided_by,decided_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (goal["closing_message_id"], goal_id, goal["summary"],
+                 json.dumps(binding, sort_keys=True), verdict, decided_by, now))
+            if not reached:
+                db.execute(
+                    "UPDATE goals SET status='executing',closing_message_id='',"
+                    "turns_since_human=0 WHERE id=?", (goal_id,))
+                db.execute(
+                    "INSERT INTO goal_events (goal_id,ts,agent_id,kind,payload) VALUES (?,?,?,?,?)",
+                    (goal_id, now, decided_by, "status", "done → executing"))
+    _invalidate_cache()
+    return get_goal(goal_id)
+
+
+def verdict_delivery(message_id: str) -> dict | None:
+    row = _get_db().execute(
+        "SELECT * FROM goal_verdict_deliveries WHERE message_id=?", (message_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def verdict_deliveries(goal_id: str) -> list[dict]:
+    return [dict(r) for r in _get_db().execute(
+        "SELECT * FROM goal_verdict_deliveries WHERE goal_id=? ORDER BY decided_at",
+        (goal_id,))]
+
+
+def update_verdict_delivery(message_id: str, state: str, note: str, *,
+                            receipt_channel_id: str = "", receipt_message_id: str = "") -> None:
+    if state not in ("pending", "saved", "removing", "complete", "failed"):
+        raise ValueError("invalid verdict delivery state")
+    db = _get_db()
+    with db:
+        db.execute(
+            "UPDATE goal_verdict_deliveries SET state=?,note=?,"
+            "receipt_channel_id=CASE WHEN ?='' THEN receipt_channel_id ELSE ? END,"
+            "receipt_message_id=CASE WHEN ?='' THEN receipt_message_id ELSE ? END "
+            "WHERE message_id=?",
+            (state, note, receipt_channel_id, receipt_channel_id,
+             receipt_message_id, receipt_message_id, message_id))
 
 
 # --- proposal expiry ---

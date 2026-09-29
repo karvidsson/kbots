@@ -349,10 +349,12 @@ def _closing_text(goal: dict, reason: str = "") -> str:
     # reaction that deletes a room must never be reachable without the
     # sentence that says so, whatever got cut off after it.
     head = f"🏁 **DONE: {goal['title']}** (`{goal['id']}`)"
+    consequence = ("this shared room stays open" if goal.get("anchored")
+                   else "this room is removed after the full summary is saved in your DM")
     lines = [head,
-             f"{VERDICT_ASK} On ✅ this room is removed and the record stays in "
+             f"{VERDICT_ASK} On ✅ {consequence} and the record stays in "
              f"goal_status; on ❌ **{goal['owner_agent']}** asks what is missing "
-             f"and the goal continues."]
+             "and the goal continues. Without an answer the room stays open; no approval is assumed."]
     if goal.get("description"):
         lines.append(f"**Goal:** {goal['description'][:300]}")
     lines.append(f"**How it was reached:** {goal['strategy'][:500]}" if goal["strategy"]
@@ -400,7 +402,7 @@ async def _close_goal(ctx: ToolContext, goal: dict, reason: str = "") -> tuple[d
         if mid:
             fields = {"closing_message_id": mid}
             if asks_verdict:
-                fields["summary"] = text
+                fields.update(summary=text, verdict="", verdict_by="", verdict_at=0)
             goal = store.update_goal(goal["id"], ctx.agent_id, **fields)
             store.log_event(goal["id"], ctx.agent_id, "closed", f"notice {mid}")
             notes.append("closing summary posted, awaiting ✅/❌" if asks_verdict
@@ -679,6 +681,15 @@ async def goal_status(ctx: ToolContext, goal_id: str = "") -> str:
         if not goal:
             return f"ERROR: unknown goal '{goal_id}'."
         lines = [_card_text(goal)]
+        if goal.get("verdict"):
+            lines.append(f"**Verdict:** {goal['verdict']} (by {goal['verdict_by']})")
+        for delivery in store.verdict_deliveries(goal["id"]):
+            lines.append(f"**Verdict follow-up [{delivery['state']}]:** {delivery['note']}")
+            if delivery["receipt_message_id"]:
+                lines.append("**Saved summary:** https://discord.com/channels/@me/"
+                             f"{delivery['receipt_channel_id']}/{delivery['receipt_message_id']}")
+        if goal.get("summary"):
+            lines.append("**Stored closing summary:**\n" + goal["summary"])
         tasks = store.list_tasks(goal["id"])
         if tasks:
             lines.append("**Tasks:**")

@@ -1464,6 +1464,9 @@ class DiscordBot:
 
         if DiscordConnector._reserved_alert(self.connector, str(payload.channel_id)):
             return  # Phase 1 never escalates a reaction into a coding session.
+        from src.connectors.discord_goal_verdicts import handle_closing_reaction
+        if await handle_closing_reaction(self, payload):
+            return
         emoji = str(payload.emoji)
 
         # Expand a shortened reply. Checked first and cheap: it is a read of
