@@ -127,6 +127,34 @@ scanner file with `--engine` pointing at the installation to create its first
 baseline. Future candidate changes to skills/tools must be included in the
 reviewed baseline before that candidate can pass.
 
+### Releasing a candidate that adds a scanned file
+
+A new skill, tool or MCP server is drift by construction, so the first deploy of
+that release will be rejected. The rejection also rolls the code back, which
+removes the very file you were asked to review, so accepting it afterwards is
+not possible from the installation as it stands. Bring the candidate in first,
+accept it, then deploy:
+
+```sh
+cd "$KBOTS_HOME"
+git fetch <remote> && git merge --ff-only <remote>/main   # candidate now on disk
+git diff <previous>..HEAD -- <the flagged paths>          # review what you are accepting
+scripts/harness-scan.py --accept                          # real paths, see below
+git reset --hard <previous>                               # leave something to pull
+scripts/self-deploy.sh                                    # gates, scan passes, restart
+```
+
+The reset matters: `self-deploy.sh` exits early when there is nothing to pull,
+and an early exit never restarts the service, so a manually fast-forwarded
+installation would keep running the old code.
+
+**Accept from the installation, never from a review copy.** The baseline records
+the engine and overlay roots as an item, so `--accept` run with `--engine`
+pointing at a worktree writes a baseline describing that worktree. The next real
+scan then reports the roots as changed, and the accepted hashes cover the wrong
+tree. If this happens, re-run `--accept` from the installation itself; the
+baseline is repaired, not corrupted permanently.
+
 The existing no-new-commit early exit and other deployment entrypoints are
 unchanged. Run the scanner directly to review overlay changes without a new
 engine commit. This patch supplies no baseline and approves no live surface.
