@@ -64,10 +64,37 @@ No rows are dropped to fit. Terminal agent-notification failures appear in a
 separate section, with the same privacy filter and a jump link. These records
 are closed decisions, not open requests for another answer.
 
-One morning DM contains the same list, only when something is open. No empty
-DM is sent or reserved. If the engine starts after the configured hour, it sends
-that day's first nonempty list when a bot is available. It does not replay prior
-days. The configured timezone governs the day, including clock changes.
+## Morning owner digest
+
+The owner receives one proactive morning DM summarizing everything waiting on
+them. The digest combines:
+
+- **Open owner_asks**: decisions waiting for a human answer
+- **Pending HITL approvals**: tool calls blocked on human approval
+- **Active goals**: goal workstreams in progress, especially blocked ones
+
+The digest is sent once per day, at `digest_hour` in the configured `timezone`.
+No empty DM is sent — if nothing is pending, no message goes out. If the engine
+starts after the configured hour, it sends that day's digest when a bot is
+available. It does not replay prior days.
+
+If DMs fail (closed DMs, rate limits), the digest falls back to the
+`security.alert_channel` if configured, with the owner mentioned. If both fail,
+the failure is logged and retried the next day.
+
+The digest uses the same configuration as owner_asks:
+
+```yaml
+waiting_on_you:
+  enabled: true
+  owner_id: ""           # infer only when admin_users.discord contains one ID
+  digest_hour: 8         # 0..23, in the timezone below
+  timezone: UTC          # an IANA timezone (e.g. Europe/Stockholm)
+```
+
+Goals appear in the digest with their status and open task count. Goals in
+`blocked_on_user` status are highlighted as "waiting on you". HITL requests
+show the agent, tool name, and how long they've been waiting.
 
 An open ask gets one reminder after four hours by default. At seven days it
 becomes stale, the card is edited, and the agent receives an expiry event with

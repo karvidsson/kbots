@@ -51,11 +51,14 @@ connectors:
     port: 8090
 
 # Durable decisions, separate from security.hitl tool approvals. See docs/WAITING_ON_YOU.md.
+# The morning digest DM combines open owner_asks, pending HITL approvals, and
+# active goals into one proactive summary at digest_hour. Silent when nothing
+# is pending. Falls back to security.alert_channel if DMs fail.
 waiting_on_you:
   enabled: true
   owner_id: ""                # defaults to the sole admin_users.discord entry
   digest_hour: 8              # one nonempty morning DM per recipient/local date
-  timezone: UTC              # IANA timezone, e.g. Europe/Stockholm
+  timezone: UTC               # IANA timezone, e.g. Europe/Stockholm
   remind_after: 14400         # seconds, one reminder attempt after 4 hours
   stale_after: 604800         # seconds, 7 days; never auto-approve
 

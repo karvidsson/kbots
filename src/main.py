@@ -727,6 +727,14 @@ async def main() -> None:
     else:
         logger.info("Goal janitor: OFF (goals.proposal_timeout_hours is 0)")
 
+    # --- Owner digest: morning DM summarizing what's waiting on the owner ---
+    from src.core.owner_digest import create_owner_digest_task
+    owner_digest_task = create_owner_digest_task(
+        config, vault, storage._db,
+        owner_asks_store=owner_asks.store if owner_asks else None)
+    if owner_digest_task and owner_digest_task.enabled:
+        asyncio.create_task(owner_digest_task.run(), name="owner-digest")
+
     # --- Turn judge: auto-label collected turns for training export (default off) ---
     judge_cfg = tc_cfg.get("judge", {}) or {}
     if training_collector and judge_cfg.get("enabled"):
