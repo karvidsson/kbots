@@ -140,20 +140,30 @@ async def gmail_read(ctx: ToolContext, message_id: str) -> str:
 # JSON overhead and fail with a clear message instead of an HTTP 413.
 _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
+# Lazy-init email draft store (needs data dir from config)
+_draft_store = None
 
-@tool(name="send_email", category="google", hitl=True,
-      description="Send or reply to an email via Gmail, optionally with file attachments")
-async def send_email(ctx: ToolContext, to: str, subject: str, body: str,
-                     reply_to_id: str = "", attachments: str = "") -> str:
-    """Send an email, or reply to an existing thread.
 
-    Args:
-        to: Recipient address.
-        subject: Subject line.
-        body: Plain-text body.
-        reply_to_id: Gmail message ID to reply to (threads the reply).
-        attachments: Comma-separated local file paths to attach.
-    """
+def _get_draft_store():
+    """Get or create the email draft store."""
+    global _draft_store
+    if _draft_store is None:
+        import os
+        from src.core.email_drafts import EmailDraftStore
+        overlay = os.environ.get("KBOTS_OVERLAY", "")
+        if overlay:
+            path = Path(overlay) / "data" / "email_drafts.db"
+        else:
+            path = Path(__file__).parent.parent.parent / "data" / "email_drafts.db"
+        _draft_store = EmailDraftStore(path)
+    return _draft_store
+
+
+async def _execute_email_send(
+    ctx: ToolContext, to: str, subject: str, body: str,
+    reply_to_id: str = "", attachments: str = ""
+) -> str:
+    """Core email sending logic — validates and sends via Gmail API."""
     import base64
     import mimetypes
     from email.message import EmailMessage
@@ -209,6 +219,90 @@ async def send_email(ctx: ToolContext, to: str, subject: str, body: str,
     action = "Reply sent" if reply_to_id else "Email sent"
     att_note = f" ({len(paths)} attachment{'s' if len(paths) != 1 else ''})" if paths else ""
     return f"{action} to {to}: {subject}{att_note}"
+
+
+@tool(name="send_email", category="google", hitl=True,
+      description="Send or reply to an email via Gmail, with draft-before-send approval by default")
+async def send_email(ctx: ToolContext, to: str, subject: str, body: str,
+                     reply_to_id: str = "", attachments: str = "",
+                     draft: bool = True) -> str:
+    """Send an email, or reply to an existing thread.
+
+    By default, emails are parked as drafts awaiting owner approval before
+    sending. The owner sees the recipient, subject, and body preview and can
+    approve, request edits, or cancel. Set draft=False to send immediately
+    (still subject to HITL gated_tools if configured).
+
+    Args:
+        to: Recipient address.
+        subject: Subject line.
+        body: Plain-text body.
+        reply_to_id: Gmail message ID to reply to (threads the reply).
+        attachments: Comma-separated local file paths to attach.
+        draft: If True (default), park as draft for owner approval before sending.
+               If False, send immediately.
+    """
+    import os
+    from src.core.email_drafts import build_email_context
+
+    if not draft:
+        return await _execute_email_send(ctx, to, subject, body, reply_to_id, attachments)
+
+    paths = [Path(p.strip()).expanduser() for p in attachments.split(",") if p.strip()]
+    missing = [str(p) for p in paths if not p.is_file()]
+    if missing:
+        return f"Not sent — attachment file(s) not found: {', '.join(missing)}"
+    total = sum(p.stat().st_size for p in paths)
+    if total > _MAX_ATTACHMENT_BYTES:
+        return (f"Not sent — attachments total {total // (1024 * 1024)}MB, over the "
+                f"{_MAX_ATTACHMENT_BYTES // (1024 * 1024)}MB Gmail limit. Send fewer/"
+                "smaller files, or share a link instead (e.g. a Drive upload).")
+
+    store = _get_draft_store()
+    account = os.environ.get("KBOTS_GOOGLE_ACCOUNT", "")
+
+    draft_record = store.create(
+        agent_id=ctx.agent_id,
+        account=account,
+        recipient=to,
+        subject=subject,
+        body=body,
+        reply_to_id=reply_to_id,
+        attachments=attachments,
+    )
+
+    context = build_email_context(to, subject, body)
+    if attachments:
+        att_count = len([p for p in attachments.split(",") if p.strip()])
+        context += f"\nAttachments: {att_count} file{'s' if att_count != 1 else ''}"
+
+    service = getattr(ctx.agent_manager, "_owner_asks", None) if ctx.agent_manager else None
+    if not service:
+        store.resolve(draft_record["draft_id"], "error", "Owner asks service unavailable")
+        return await _execute_email_send(ctx, to, subject, body, reply_to_id, attachments)
+
+    try:
+        ask_result = await service.ask(
+            agent_id=ctx.agent_id,
+            question="Send this email?",
+            default="Do not send",
+            options=["Send", "Edit", "Cancel"],
+            context=context,
+            request_key=f"email-draft:{draft_record['draft_id']}",
+        )
+        store.link_ask(draft_record["draft_id"], ask_result["id"])
+        jump_url = ask_result.get("url", "(card delivery pending)")
+        return (
+            f"Email draft awaiting approval.\n"
+            f"To: {to}\n"
+            f"Subject: {subject}\n"
+            f"Card: {jump_url}\n\n"
+            "The owner will see options: Send, Edit, or Cancel. "
+            "The decision will return to this channel when answered."
+        )
+    except ValueError as exc:
+        store.resolve(draft_record["draft_id"], "error", str(exc))
+        return await _execute_email_send(ctx, to, subject, body, reply_to_id, attachments)
 
 
 # === Google Calendar ===

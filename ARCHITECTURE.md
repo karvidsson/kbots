@@ -464,6 +464,16 @@ Tool packs that ship with the engine:
 
 *Tools flagged for HITL in config pause until a human approves them with a Discord reaction.*
 
+### Draft-before-send (Email)
+
+`send_email` defaults to **draft mode**: instead of sending immediately, the email parks as a durable owner_ask card. The owner sees recipient, subject, and a body preview (~400 chars), with three buttons:
+
+- **Send** — executes the send automatically; the agent receives confirmation.
+- **Edit** — cancels the draft and wakes the agent to ask what changes are needed.
+- **Cancel** — cancels the draft; the agent is told "not sent".
+
+Set `draft=False` to bypass and send immediately (still subject to HITL `gated_tools` if configured). This is useful for scheduled or triggered sends where an ask would be awkward. Attachments are validated before the ask is created, so missing-file or oversize errors fail fast.
+
 ### Process Mapping
 
 Business processes and Wardley maps are captured as a **structured model first, diagram second**. The agent fills a JSON model (`kind: process` — actors, steps, decisions, handoffs, systems, metrics, exceptions; or `kind: wardley` — anchors, components with visibility/evolution and a stage rationale, links, inertia, movement) and the engine does the deterministic work:

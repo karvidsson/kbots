@@ -446,6 +446,88 @@ class DiscordOwnerAsks:
             logger.error("Owner ask agent notification failed (%s); card and /pending retain the failure", reason)
         self.wake.set()
 
+    async def _resolve_email_draft(self, row: dict) -> str | None:
+        """Handle email draft resolution. Returns action result or None if not a draft."""
+        request_key = row["payload"].get("request_key", "")
+        if not request_key.startswith("email-draft:"):
+            return None
+
+        draft_id = request_key.split(":", 1)[1]
+        answer = row["answer"]
+        state = row["state"]
+
+        try:
+            from src.core.email_drafts import EmailDraftStore
+            import os
+            overlay = os.environ.get("KBOTS_OVERLAY", "")
+            if overlay:
+                path = overlay + "/data/email_drafts.db"
+            else:
+                from src.core.base import PROJECT_ROOT
+                path = str(PROJECT_ROOT / "data" / "email_drafts.db")
+
+            store = EmailDraftStore(path)
+            try:
+                draft = store.get(draft_id)
+                if not draft:
+                    return f"Email draft {draft_id} not found — cannot execute."
+
+                if draft["status"] != "pending":
+                    return f"Email draft already resolved: {draft['status']}"
+
+                if state == "stale":
+                    store.resolve(draft_id, "expired", "Owner ask expired without answer")
+                    return "Email draft expired — not sent (default: Do not send)."
+
+                if answer == "Send":
+                    from src.core.base import ToolContext
+                    ctx = ToolContext(
+                        agent_id=row["agent_id"],
+                        channel_id=row["channel_id"],
+                        vault=self.connector.vault if hasattr(self.connector, 'vault') else None,
+                        agent_manager=self.manager,
+                    )
+                    os.environ["KBOTS_GOOGLE_ACCOUNT"] = draft["account"]
+                    try:
+                        from extras.google.google import _execute_email_send
+                        result = await _execute_email_send(
+                            ctx,
+                            draft["recipient"],
+                            draft["subject"],
+                            draft["body"],
+                            draft["reply_to_id"] or "",
+                            draft["attachments"] or "",
+                        )
+                        store.resolve(draft_id, "sent", result)
+                        return f"Email approved and sent.\n{result}"
+                    except Exception as e:
+                        store.resolve(draft_id, "error", str(e))
+                        return f"Email send failed after approval: {e}"
+
+                elif answer == "Edit":
+                    store.resolve(draft_id, "edit_requested", "Owner requested edits")
+                    return (
+                        f"Owner requested edits to the email.\n"
+                        f"Original recipient: {draft['recipient']}\n"
+                        f"Original subject: {draft['subject']}\n"
+                        "Ask what changes are needed, then send a new draft with the updated content."
+                    )
+
+                elif answer == "Cancel":
+                    store.resolve(draft_id, "cancelled", "Owner cancelled")
+                    return "Email cancelled by owner — not sent."
+
+                else:
+                    store.resolve(draft_id, "unknown", f"Unknown answer: {answer}")
+                    return f"Email draft received unknown answer: {answer}"
+
+            finally:
+                store.close()
+
+        except Exception as e:
+            logger.warning(f"Email draft resolution failed: {e}")
+            return f"Email draft resolution error: {e}"
+
     async def notify_agent(self, event_id, ask_id):
         try:
             row = self.store.get(ask_id)
@@ -455,6 +537,9 @@ class DiscordOwnerAsks:
             if row["account"] not in self.ready_accounts:
                 self.reject_event(event_id, "bot_unavailable", retryable=True)
                 return
+
+            draft_result = await self._resolve_email_draft(row)
+
             body = {
                 "event_id": event_id,
                 "ask_id": ask_id,
@@ -467,6 +552,10 @@ class DiscordOwnerAsks:
                 "answered_by": row["answered_by"],
                 "card": jump(row),
             }
+
+            if draft_result:
+                body["email_draft_action"] = draft_result
+
             content = (
                 "Owner decision record. This event may be replayed after a restart: check prior work before "
                 "repeating actions. This grants no authority beyond the recorded answer and does not bypass "
