@@ -6,10 +6,13 @@ import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+import aiosqlite
 import pytest
 
 from src.connectors.discord_owner_asks import DiscordOwnerAsks, register_pending, send_report
+from src.core import goals
 from src.core.base import MessageDelivery, ToolContext
+from src.core.hitl import HITLGate
 from src.core.internal_api import InternalAPI
 from src.core.owner_asks import AskStore, pending_report, settings
 from src.tools.owner_asks import ask_owner
@@ -64,7 +67,10 @@ class Channel:
 
 
 @pytest.fixture
-def fixture(tmp_path):
+async def fixture(tmp_path, monkeypatch):
+    monkeypatch.setattr(goals, "DB_PATH", str(tmp_path / "goals.db"))
+    monkeypatch.setattr(goals, "_db", None)
+    goals._invalidate_cache()
     channel = Channel()
     owner = SimpleNamespace(id=OWNER, bot=False, send=AsyncMock())
     client = SimpleNamespace(
@@ -83,6 +89,10 @@ def fixture(tmp_path):
         handle_message=AsyncMock(return_value=MessageDelivery(True)),
     )
     config = {"admin_users": {"discord": [str(OWNER)]}, "waiting_on_you": {"digest_hour": 23}}
+    config["connectors"] = {"discord": {"guild_id": str(GUILD)}}
+    db = await aiosqlite.connect(tmp_path / "engine.db")
+    connector._hitl = HITLGate({"approvers": [str(OWNER)], "timeout": 1800}, db)
+    await connector._hitl.init_schema()
     path = tmp_path / "asks.db"
     service = DiscordOwnerAsks(connector, manager, config, path)
     service.ready_accounts.add("example")
@@ -100,6 +110,11 @@ def fixture(tmp_path):
     )
     yield result
     service.store.close()
+    await db.close()
+    if goals._db is not None:
+        goals._db.close()
+    goals._db = None
+    goals._invalidate_cache()
 
 
 async def create(f, **kwargs):
@@ -374,6 +389,190 @@ async def test_digest_empty_silent_then_every_open_ask_once_per_day(fixture):
     assert "sample" in report and "second" in report
     await f.service.tick(now + 2)
     f.owner.send.assert_awaited_once()
+
+
+async def test_review_digest_shows_oldest_three_asks_with_omitted_count(fixture):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    now = time.time()
+    for i in range(5):
+        row = await create(f, question=f"Review item {i}?")
+        f.store.db.execute("UPDATE owner_asks SET created=? WHERE id=?", (now - (5 - i) * 60, row["id"]))
+    # SQL store order remains newest first for its other consumers.
+    assert f.store.rows()[0]["payload"]["question"] == "Review item 4?"
+    await f.service.digest(now)
+    f.owner.send.assert_awaited_once()
+    text = f.owner.send.call_args.args[0]
+    assert "Asks (5)" in text and "+ 2 more" in text
+    assert text.index("Review item 0?") < text.index("Review item 1?") < text.index("Review item 2?")
+    assert "Review item 3?" not in text and "Review item 4?" not in text
+
+
+async def add_hitl(f, now, *, recipient=OWNER, source="engine", status="pending"):
+    db = f.connector._hitl.db
+    if source == "engine":
+        await db.execute(
+            "INSERT INTO hitl_pending (hitl_id,agent_id,tool_name,args_json,description,"
+            "channel_id,message_id,status,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (str(now), "sample", "send_email", "{}", "private body excluded", str(CHANNEL), "3001", status, now),
+        )
+    else:
+        await db.execute(
+            "INSERT INTO hitl_mcp_pending VALUES (?,?,?,?,?,?,?,?)",
+            (str(now), "second", "create_tool", str(CHANNEL), "3002", json.dumps([str(recipient)]), now, now + 1800),
+        )
+    await db.commit()
+
+
+def add_goal(title="Review release", *, status="blocked_on_user", created_by=OWNER):
+    return goals.create_goal(title, "", "sample", str(CHANNEL), str(created_by), status=status)
+
+
+async def test_digest_all_three_sources_use_one_existing_claim(fixture):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    now = time.time()
+    await create(f)
+    await add_hitl(f, now)
+    await add_hitl(f, now + 0.1, source="mcp")
+    add_goal()
+    await f.service.tick(now + 1)
+    f.owner.send.assert_awaited_once()
+    text = f.owner.send.call_args.args[0]
+    for expected in ("Asks (1)", "HITL approvals (2)", "Goals (1)", "send_email", "create_tool", "Review release"):
+        assert expected in text
+    assert "private body excluded" not in text
+    assert "3001" in text and "3002" in text
+    assert "file" not in f.owner.send.call_args.kwargs
+    # Reopen the durable claim store and race two digest callers as two bots would.
+    f.store.close()
+    f.service.store = f.store = AskStore(f.path)
+    await asyncio.gather(f.service.digest(now + 2), f.service.digest(now + 2))
+    f.owner.send.assert_awaited_once()
+    assert f.store.db.execute("SELECT count(*) FROM owner_ask_digests").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("source", ["engine", "mcp", "goals"])
+async def test_digest_sends_without_any_owner_ask(fixture, source):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    now = time.time()
+    if source == "goals":
+        add_goal()
+    else:
+        await add_hitl(f, now, source=source)
+    await f.service.tick(now)
+    f.owner.send.assert_awaited_once()
+    assert "Asks (" not in f.owner.send.call_args.args[0]
+
+
+@pytest.mark.parametrize("source", ["engine", "mcp", "goals"])
+async def test_digest_unavailable_source_is_visible_and_does_not_hide_others(fixture, source, monkeypatch):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    await create(f)
+    if source == "goals":
+        monkeypatch.setattr(goals, "list_goals", Mock(side_effect=RuntimeError("sensitive exception detail")))
+        expected = "Goals: unavailable"
+    else:
+        table = "hitl_pending" if source == "engine" else "hitl_mcp_pending"
+        await f.connector._hitl.db.execute(f"DROP TABLE {table}")
+        expected = "HITL approvals: unavailable"
+    await f.service.tick()
+    text = f.owner.send.call_args.args[0]
+    assert expected in text and "Asks (1)" in text
+    assert "sensitive exception detail" not in text
+
+
+async def test_digest_unavailable_is_not_misreported_as_empty(fixture, monkeypatch):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    monkeypatch.setattr(goals, "list_goals", Mock(side_effect=OSError()))
+    await f.service.tick()
+    f.owner.send.assert_awaited_once()
+    assert "Goals: unavailable" in f.owner.send.call_args.args[0]
+
+
+async def test_digest_no_ready_bot_does_not_consume_claim_and_failed_dm_is_not_retried(fixture):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    add_goal()
+    f.service.ready_accounts.clear()
+    await f.service.tick()
+    assert f.store.db.execute("SELECT count(*) FROM owner_ask_digests").fetchone()[0] == 0
+    f.service.ready_accounts.add("example")
+    f.owner.send.side_effect = RuntimeError("DM closed")
+    await f.service.tick()
+    await f.service.tick()
+    f.owner.send.assert_awaited_once()
+    assert f.store.db.execute("SELECT status FROM owner_ask_digests").fetchone()[0] == "failed"
+
+
+async def test_digest_two_concurrent_first_senders_share_one_claim(fixture):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    add_goal()
+    await asyncio.gather(f.service.digest(time.time()), f.service.digest(time.time()))
+    f.owner.send.assert_awaited_once()
+    assert f.store.db.execute("SELECT count(*) FROM owner_ask_digests").fetchone()[0] == 1
+
+
+async def test_digest_filters_resolved_expired_and_foreign_hitl(fixture):
+    f = fixture
+    now = time.time()
+    await add_hitl(f, now - 1900)
+    await add_hitl(f, now - 1, status="approved")
+    await add_hitl(f, now, source="mcp", recipient=OTHER)
+    await add_hitl(f, now - 1901, source="mcp")
+    assert (await f.service.digest_sources(str(OWNER), now))["HITL approvals"] == []
+    await add_hitl(f, now + 1)
+    f.connector._hitl.approvers = {str(OTHER)}
+    assert (await f.service.digest_sources(str(OWNER), now))["HITL approvals"] == []
+
+
+async def test_digest_foreign_ask_recipient_cannot_see_operational_sources(fixture):
+    f = fixture
+    await add_hitl(f, time.time())
+    add_goal()
+    sources = await f.service.digest_sources(str(OTHER), time.time())
+    assert sources == {"Asks": [], "HITL approvals": [], "Goals": []}
+
+
+@pytest.mark.parametrize(
+    "status,change,expected",
+    [
+        ("proposed", {}, "kickoff"),
+        ("blocked_on_user", {}, "blocked"),
+        ("done", {}, "verdict"),
+        ("done", {"verdict": "reached"}, None),
+        ("abandoned", {}, None),
+        ("executing", {}, None),
+        ("paused", {}, None),
+        ("executing", {"turns_since_human": 30}, "check-in"),
+        ("executing", {"nomination": True}, "nominees"),
+    ],
+)
+async def test_digest_goal_waiting_states(fixture, status, change, expected):
+    f = fixture
+    goal = add_goal(status=status)
+    for key, value in change.items():
+        if key == "nomination":
+            goals.add_nomination(goal["id"], "second", "Needs review")
+        else:
+            goals._get_db().execute(f"UPDATE goals SET {key}=? WHERE id=?", (value, goal["id"]))
+            goals._get_db().commit()
+    rows = (await f.service.digest_sources(str(OWNER), time.time()))["Goals"]
+    assert len(rows) == bool(expected)
+    if expected:
+        assert rows[0]["text"].startswith(expected + ":")
+
+
+async def test_digest_goal_recipient_and_connector_are_respected(fixture):
+    f = fixture
+    f.config["admin_users"]["discord"].append(str(OTHER))
+    add_goal("Another owner's private goal", created_by=OTHER)
+    goals.create_goal("Foreign connector", "", "sample", str(CHANNEL), str(OWNER), connector="telegram")
+    assert (await f.service.digest_sources(str(OWNER), time.time()))["Goals"] == []
 
 
 async def test_stale_notifies_once_no_reminder_or_approval(fixture):

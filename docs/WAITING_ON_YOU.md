@@ -4,8 +4,9 @@ Use `ask_owner` when work needs the owner's judgement. It posts one card in the
 requesting agent's Discord home channel and records it in the deployment data
 directory's `owner-asks.db`. The call returns immediately. The owner can answer
 on the card, and the engine gives the agent a continuation in that same channel.
-Existing HITL tool approvals keep their existing behaviour and are not included
-in this waiting list. An answer here does not bypass a required tool approval.
+Existing HITL tool approvals keep their existing behaviour. `/pending` lists
+owner asks; the morning digest also includes HITL approvals and goals waiting
+on a human. An answer here does not bypass a required tool approval.
 
 ```python
 ask_owner(
@@ -64,10 +65,40 @@ No rows are dropped to fit. Terminal agent-notification failures appear in a
 separate section, with the same privacy filter and a jump link. These records
 are closed decisions, not open requests for another answer.
 
-One morning DM contains the same list, only when something is open. No empty
-DM is sent or reserved. If the engine starts after the configured hour, it sends
-that day's first nonempty list when a bot is available. It does not replay prior
-days. The configured timezone governs the day, including clock changes.
+One morning DM combines open asks, pending HITL approvals, and goals waiting
+on a human. It uses the existing timer, timezone, owner and daily claim. There
+is no second digest task. No empty DM is sent or reserved. If the engine starts
+after the configured hour, it sends that day's first nonempty list when a bot
+is available. It does not replay prior days. The configured timezone governs
+the day, including clock changes.
+
+The morning list shows at most three oldest entries per source, each on one
+short line, with an omitted count for the rest. It fits in one Discord message
+with numbered jump links below the fenced list. `/pending` still supplies the
+complete ask list; use the linked approval channel or goal room for those
+sources. Ages are since ask/card creation, or the goal's last update. A source
+that cannot be read gets one `unavailable` line in that same daily DM. This is
+not reported as an empty queue. An unavailable ask store also prevents the
+daily claim from being saved, so no DM can be attempted; maintenance logs the
+failure instead of sending an unclaimed duplicate.
+
+HITL entries include both engine requests and MCP requests visible to the
+current owner as an approver. They include agent and tool names, not email
+bodies or tool arguments. An additive `hitl_mcp_pending` table in the existing
+engine database records only request/card identity, approvers and deadline.
+It is visibility metadata, never an approval authority. MCP's existing Discord
+reaction poll still decides. Rows are cleared on completion, error, timeout or
+cancellation, and a row left by process death is hidden at its original
+deadline. Metadata failures are logged and do not approve or deny a tool.
+Requests from older MCP processes cannot be reconstructed retroactively.
+
+Goals include proposed kickoffs, `blocked_on_user`, closing verdicts still
+needed, pending nominees, and active goals at their human check-in turn limit.
+Ordinary paused goals with no pending human decision are excluded. Each goal
+appears once, only for its entitled recipient under the existing goal-recipient
+rules. A former owner's retained asks do not expose the current owner's HITL
+or goal list. Links use the configured Discord guild and stored card/channel
+identities; the digest does not fetch private channel histories.
 
 An open ask gets one reminder after four hours by default. At seven days it
 becomes stale, the card is edited, and the agent receives an expiry event with
@@ -157,3 +188,30 @@ favours avoiding duplicate reminders over blind resends after uncertainty.
 The database is mode `0600` and uses WAL. It belongs with the other deployment
 SQLite stores and their backup. This is a single-engine worker, like the rest of
 the platform. This change supplies no live configuration and sends no live ask.
+
+## Email approval preview
+
+Both engine and MCP `send_email` requests show the recipient, subject and body
+on the existing HITL approval card. The body preview is at most 12 lines and
+1000 UTF-16 units, with an ellipsis when shortened. Recipient and subject are
+bounded too, so the full card stays below Discord's message limit. Invisible
+and control characters are removed first, then the shared redactor's conservative
+preview mode runs before any line or length cut. This prevents an invisible
+character from hiding a credential until later display cleanup.
+
+The preview masks known key prefixes, secret assignments, credential-bearing
+URLs, Discord and Slack webhooks, SendGrid keys, 64-character hex recovery
+material, and private-key blocks, including unterminated blocks. Long opaque
+tokens near key/token/secret/password labels are masked too. This deliberately
+over-redacts some benign material; use the email client for the real body.
+It is a heuristic, not a guarantee that arbitrary sensitive prose is detected.
+This mode is specific to the preview; ordinary audit redaction retains its
+existing behaviour. Mentions and code fences are neutralised for display;
+the original email arguments are not changed.
+
+The card states whether attachments are present. It does not read attachment
+files, inline them, or expose their local paths. Approval sends the original
+email through the existing gate, including any content beyond the preview.
+There is no second approval or editing workflow. To change the email, deny it
+on that card and ask the agent for a revised email. Existing gate permissions,
+timeouts, individual HITL notifications and failure policy are unchanged.

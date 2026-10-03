@@ -101,6 +101,7 @@ async def send_report(target, report, *, ephemeral=False, nonce=None):
 class DiscordOwnerAsks:
     def __init__(self, connector, manager, config, path):
         self.connector, self.manager = connector, manager
+        self.config = config
         self.cfg = settings(config)
         self.store = AskStore(path)
         self.task = None
@@ -504,6 +505,115 @@ class DiscordOwnerAsks:
             self.expiry_messages.pop(ask_id, None)
             self.events.pop(event_id, None)
 
+    async def digest_sources(self, recipient, now):
+        from src.connectors.discord_goal_verdicts import recipient as goal_recipient
+        from src.core import goals
+        from src.core.hitl_display import pending_for
+        from src.core.morning_digest import jump as digest_jump
+
+        rows = self.store.rows(recipient=recipient)
+        sources = {
+            "Asks": [
+                {
+                    "text": r["agent_id"] + ": " + r["payload"]["question"],
+                    "created_at": r["created"],
+                    "url": digest_jump(r["guild_id"], r["channel_id"], r["message_id"]) if r["message_id"] else "",
+                }
+                for r in sorted(rows, key=lambda r: (r["created"], r["id"]))
+            ],
+            "HITL approvals": [],
+            "Goals": [],
+        }
+        # Old asks retain their recipient. The current owner's operational
+        # sources must not leak to a former recipient's otherwise private list.
+        if recipient != self.cfg["owner_id"]:
+            return sources
+        guild = str((self.config.get("connectors", {}).get("discord") or {}).get("guild_id") or "")
+        try:
+            gate = getattr(self.connector, "_hitl", None)
+            if gate is None:
+                raise RuntimeError("HITL source unavailable")
+            pending = await pending_for(gate, recipient, now)
+            sources["HITL approvals"] = [
+                {
+                    "text": r["agent_id"] + ": " + r["tool_name"],
+                    "created_at": r["created_at"],
+                    "url": digest_jump(guild, r["channel_id"], r["message_id"]),
+                }
+                for r in pending
+            ]
+        except Exception:
+            sources["HITL approvals"] = None
+            logger.warning("Morning digest HITL source unavailable", exc_info=True)
+        try:
+            admins = [str(x) for x in (self.config.get("admin_users") or {}).get("discord", [])]
+            for goal in sorted(goals.list_goals(), key=lambda g: g["updated_at"]):
+                if goal["connector"] != "discord" or goal_recipient(goal, self.config, admins) != recipient:
+                    continue
+                status, reason, message = goal["status"], "", goal["card_message_id"]
+                if status == "proposed":
+                    reason, message = "kickoff", goal["kickoff_message_id"] or message
+                elif status == "blocked_on_user":
+                    reason = "blocked"
+                elif status == "done" and not goal["verdict"]:
+                    reason, message = "verdict", goal["closing_message_id"] or message
+                elif status in goals.ACTIVE_STATUSES and goal["turns_since_human"] >= goal["turn_budget"]:
+                    reason = "check-in"
+                if status in goals.ROUTED_STATUSES:
+                    nominations = goals.list_nominations(goal["id"], "pending")
+                    if nominations and not reason:
+                        reason, message = "nominees", nominations[0]["message_id"] or message
+                if reason:
+                    sources["Goals"].append(
+                        {
+                            "text": reason + ": " + goal["title"],
+                            "created_at": goal["updated_at"],
+                            "url": digest_jump(guild, goal["channel_id"], message),
+                        }
+                    )
+        except Exception:
+            sources["Goals"] = None
+            logger.warning("Morning digest goals source unavailable", exc_info=True)
+        return sources
+
+    async def digest(self, now):
+        from src.core.morning_digest import render
+
+        local = datetime.fromtimestamp(now, self.cfg["timezone"])
+        if local.hour < self.cfg["digest_hour"]:
+            return
+        recipients = {r["recipient_id"] for r in self.store.rows()}
+        if self.cfg["owner_id"]:
+            recipients.add(self.cfg["owner_id"])
+        day = local.date().isoformat()
+        for recipient in sorted(recipients):
+            if self.store.db.execute(
+                "SELECT 1 FROM owner_ask_digests WHERE recipient_id=? AND day=?", (recipient, day)
+            ).fetchone():
+                continue
+            rows = self.store.rows(recipient=recipient)
+            sender = next((r for r in rows if r["account"] in self.ready_accounts), None)
+            if sender is None:
+                for account in sorted(self.ready_accounts):
+                    bot = self.connector.bots.get(account)
+                    if bot and bot.client.user:
+                        sender = {"account": account, "bot_id": str(bot.client.user.id), "recipient_id": recipient}
+                        break
+            if sender is None:
+                continue
+            report = render(await self.digest_sources(recipient, now), now)
+            if not report or not self.store.claim_digest(recipient, day):
+                continue
+            try:
+                await self.dm(sender, report, "digest:" + recipient + ":" + day)
+                status = "sent"
+            except Exception as exc:
+                status = "failed"
+                logger.warning("Owner ask digest not confirmed (%s)", type(exc).__name__)
+            self.store.db.execute(
+                "UPDATE owner_ask_digests SET status=? WHERE recipient_id=? AND day=?", (status, recipient, day)
+            )
+
     async def tick(self, now=None):
         now = time.time() if now is None else now
         if not self.cfg["enabled"]:
@@ -535,25 +645,7 @@ class DiscordOwnerAsks:
         for row in self.store.db.execute("SELECT id FROM owner_asks WHERE dirty=1").fetchall():
             async with self.lock(row["id"]):
                 await self.edit(row["id"])
-        local = datetime.fromtimestamp(now, self.cfg["timezone"])
-        if local.hour >= self.cfg["digest_hour"]:
-            recipients = {r["recipient_id"] for r in self.store.rows()}
-            for recipient in recipients:
-                rows = self.store.rows(recipient=recipient)
-                sender = next((r for r in rows if r["account"] in self.ready_accounts), None)
-                if sender and self.store.claim_digest(recipient, local.date().isoformat()):
-                    try:
-                        await self.dm(
-                            sender, pending_report(rows, now), "digest:" + recipient + ":" + local.date().isoformat()
-                        )
-                        status = "sent"
-                    except Exception as exc:
-                        status = "failed"
-                        logger.warning("Owner ask digest not confirmed (%s)", type(exc).__name__)
-                    self.store.db.execute(
-                        "UPDATE owner_ask_digests SET status=? WHERE recipient_id=? AND day=?",
-                        (status, recipient, local.date().isoformat()),
-                    )
+        await self.digest(now)
         for event in self.store.db.execute("SELECT * FROM owner_ask_events WHERE state='pending'").fetchall():
             if event["attempts"] >= MAX_DELIVERY_ATTEMPTS:
                 self.reject_event(event["id"], event["last_error"] or "interrupted", retryable=False)

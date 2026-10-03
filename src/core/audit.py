@@ -14,8 +14,10 @@ so loop blocking is negligible in practice.
 import atexit
 import json
 import logging
+import math
 import re
 import threading
+from collections import Counter
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -44,16 +46,70 @@ _SECRET_VALUE_PATTERNS = [
 ]
 
 
-def scrub_value(s: str) -> str:
+# Email previews are a durable disclosure surface. Their conservative mode
+# deliberately masks ambiguous hashes and assignments as well as known keys.
+# Keep this opt-in so ordinary audit output can still carry artifact hashes.
+_CONSERVATIVE_SECRET_PATTERNS = [
+    re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?"
+               r"(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\Z)", re.I),
+    re.compile(r"\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9_-]+"),
+    # Credential-bearing URLs, including a token used as the username.
+    re.compile(r"\b[a-z][a-z0-9+.-]*://[^\s/@]+@[^\s<>\"'`]+", re.I),
+    re.compile(r"https?://(?:[a-z0-9-]+\.)*discord(?:app)?\.com/"
+               r"api(?:/v[0-9]+)?/webhooks/[^\s<>\"'`]+", re.I),
+    re.compile(r"https?://hooks\.slack(?:-gov)?\.com/[^\s<>\"'`]+", re.I),
+    re.compile(r"\bSG\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
+    re.compile(r"(?<![0-9a-f])[0-9a-f]{64,}(?![0-9a-f])", re.I),
+]
+_SECRET_ASSIGNMENT = re.compile(
+    r"\b(?:[a-z0-9]+[_-])*(?:password|passwd|pwd|passphrase|secret|token|credential|"
+    r"(?:api[ _-]?|private[ _-]?|access[ _-]?)?key)[\"']?\s*(?:[:=]|\bis\b)\s*"
+    r"(?:\"(?:\\.|[^\"\\])*(?:\"|\Z)|'(?:\\.|[^'\\])*(?:'|\Z)|[^\s,;]+)", re.I | re.S)
+_SECRET_CONTEXT = re.compile(
+    r"(?<![a-z])(?:key|token|secret|password|passphrase|credential|recovery(?:[ _-]+code)?)s?(?![a-z])", re.I)
+_OPAQUE_TOKEN = re.compile(r"\S{20,}")
+
+
+def sanitize_display_text(value: str) -> str:
+    """Remove characters the card cannot display before matching credentials.
+
+    Newlines remain visible separators. Zero-width/soft-hyphen/joiner and other
+    control characters must not conceal a key until a later formatting pass.
+    """
+    return "".join(c for c in value if c.isprintable() or c == "\n")
+
+
+def _mask_context_tokens(text: str) -> str:
+    def replace(match):
+        token = match[0]
+        if not _SECRET_CONTEXT.search(text[max(0, match.start() - 80):match.end() + 80]):
+            return token
+        counts = Counter(token)
+        entropy = -sum((count / len(token)) * math.log2(count / len(token)) for count in counts.values())
+        return "[REDACTED]" if entropy >= 3.0 else token
+    return _OPAQUE_TOKEN.sub(replace, text)
+
+
+def scrub_value(s: str, *, conservative: bool = False) -> str:
     """Mask any secret-shaped substrings inside a string. Idempotent-ish."""
-    if not isinstance(s, str) or len(s) < 8:
+    if not isinstance(s, str) or (not conservative and len(s) < 8):
         return s
+    if conservative:
+        s = sanitize_display_text(s)
     for pat in _SECRET_VALUE_PATTERNS:
         s = pat.sub("[REDACTED]", s)
+    if conservative:
+        for pat in _CONSERVATIVE_SECRET_PATTERNS:
+            s = pat.sub("[REDACTED]", s)
+        # Whole credential structures first, before the fallback can mask just
+        # a URL username and leave its short password behind. Context must also
+        # be inspected before assignment redaction removes a nearby label.
+        s = _mask_context_tokens(s)
+        s = _SECRET_ASSIGNMENT.sub("[REDACTED]", s)
     return s
 
 
-def redact_secrets(obj):
+def redact_secrets(obj, *, conservative: bool = False):
     """Recursively redact secrets from any JSON-ish value.
 
     Combines key-name redaction (an argument literally named `token`) with
@@ -67,12 +123,12 @@ def redact_secrets(obj):
             if isinstance(k, str) and any(s in k.lower() for s in SENSITIVE_KEYS):
                 out[k] = "[REDACTED]"
             else:
-                out[k] = redact_secrets(v)
+                out[k] = redact_secrets(v, conservative=conservative)
         return out
     if isinstance(obj, (list, tuple)):
-        return [redact_secrets(v) for v in obj]
+        return [redact_secrets(v, conservative=conservative) for v in obj]
     if isinstance(obj, str):
-        return scrub_value(obj)
+        return scrub_value(obj, conservative=conservative)
     return obj
 
 
