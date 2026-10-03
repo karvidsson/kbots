@@ -14,6 +14,8 @@ import uuid
 
 import aiosqlite
 
+from src.core.hitl_display import MCP_PENDING_SCHEMA, email_approval_card
+
 logger = logging.getLogger(__name__)
 
 HITL_SCHEMA = """
@@ -176,8 +178,13 @@ class HITLGate:
                     f"ID: `{hitl_id}`\n\n"
                     f"React ✅ to approve or ❌ to deny."
                 )
+                if tool_name == "send_email":
+                    msg_text = email_approval_card(agent_id, hitl_id, args)
                 # This card seeds its own choices after persisting its id.
-                sent_msg = await self.connector.send(self.channel_id, msg_text, seed_decisions=False)
+                send_options = {"seed_decisions": False}
+                if tool_name == "send_email":
+                    send_options["no_shorten"] = True
+                sent_msg = await self.connector.send(self.channel_id, msg_text, **send_options)
 
                 # Store message_id and add reactions
                 if sent_msg and hasattr(sent_msg, 'id'):
@@ -311,6 +318,7 @@ class HITLGate:
     async def init_schema(self) -> None:
         """Create HITL tables if they don't exist."""
         await self.db.executescript(HITL_SCHEMA)
+        await self.db.executescript(MCP_PENDING_SCHEMA)
         await self.db.commit()
 
 

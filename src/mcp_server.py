@@ -101,6 +101,41 @@ class MCPHitlGate:
         self.remind_after = config.get("remind_after")
         self._notifier = None
         self._guild_id: str | None = None
+        # Visibility only. The existing Discord poll remains the sole decision
+        # path; a morning digest must never approve or deny an MCP request.
+        self.pending_db = None
+
+    def _record_pending(self, hitl_id, tool_name, message_id, expires_at=None):
+        if self.pending_db is None:
+            logger.warning("MCP HITL pending visibility unavailable")
+            return
+        try:
+            now = time.time()
+            self.pending_db.execute("DELETE FROM hitl_mcp_pending WHERE expires_at<=?", (now,))
+            self.pending_db.execute(
+                "INSERT INTO hitl_mcp_pending VALUES (?,?,?,?,?,?,?,?)",
+                (hitl_id, MCP_AGENT_ID, tool_name, str(self.channel_id), str(message_id),
+                 json.dumps(sorted(str(x) for x in self.approvers)), now,
+                 expires_at if expires_at is not None else now + self.timeout))
+            self.pending_db.commit()
+        except Exception:
+            try:
+                self.pending_db.rollback()
+            except Exception:
+                pass
+            logger.exception("MCP HITL pending visibility could not be recorded")
+
+    def _clear_pending(self, hitl_id):
+        if self.pending_db is not None:
+            try:
+                self.pending_db.execute("DELETE FROM hitl_mcp_pending WHERE hitl_id=?", (hitl_id,))
+                self.pending_db.commit()
+            except Exception:
+                try:
+                    self.pending_db.rollback()
+                except Exception:
+                    pass
+                logger.exception("MCP HITL pending visibility could not be cleared; expires at its deadline")
 
     @property
     def channel_id(self):
@@ -157,6 +192,9 @@ class MCPHitlGate:
             f"ID: `{hitl_id}`\n\n"
             f"React with checkmark to approve or X to deny."
         )
+        if tool_name == "send_email":
+            from src.core.hitl_display import email_approval_card
+            msg_text = email_approval_card(MCP_AGENT_ID, hitl_id, args)
 
         headers = {
             "Authorization": f"Bot {token}",
@@ -168,7 +206,7 @@ class MCPHitlGate:
         try:
             return await asyncio.wait_for(
                 self._poll_approval(api, headers, msg_text, tool_name, hitl_id,
-                                    token=token, args_display=args_display),
+                                    token=token, args_display=args_display, expires_at=time.time() + self.timeout),
                 timeout=self.timeout,
             )
         except asyncio.TimeoutError:
@@ -194,7 +232,7 @@ class MCPHitlGate:
 
     async def _poll_approval(self, api: str, headers: dict, msg_text: str,
                              tool_name: str, hitl_id: str, token: str = "",
-                             args_display: str = "") -> dict:
+                             args_display: str = "", expires_at: float | None = None) -> dict:
         """Post HITL message and poll for reactions. Called within wait_for timeout."""
         reminder = None
         # A one-element list rather than a bool, so the reminder's closure reads
@@ -215,6 +253,8 @@ class MCPHitlGate:
                         return {"status": "approved", "reason": "post failed, fail_mode=open"}
                     msg_data = await resp.json()
                     message_id = msg_data["id"]
+
+                self._record_pending(hitl_id, tool_name, message_id, expires_at)
 
                 # Add reactions
                 for emoji in ["\u2705", "\u274c"]:
@@ -263,6 +303,7 @@ class MCPHitlGate:
             # request never leaves a timer that DMs about it minutes later.
             if reminder:
                 reminder.cancel()
+            self._clear_pending(hitl_id)
 
     async def _notify_waiting(self, token: str, tool_name: str, hitl_id: str,
                               description: str, message_id: str,
@@ -479,6 +520,13 @@ def build_server(vault: FernetVault, config: dict) -> FastMCP:
     # Tool log — write to SQLite for queryable tool history
     data_dir = config.get("kbots", {}).get("data_dir", "./data")
     tool_log_db = _init_tool_log(data_dir)
+    if tool_log_db is not None:
+        from src.core.hitl_display import MCP_PENDING_SCHEMA
+        try:
+            tool_log_db.executescript(MCP_PENDING_SCHEMA)
+            hitl.pending_db = tool_log_db
+        except Exception:
+            logger.exception("MCP HITL pending visibility unavailable")
 
     # This is a separate PROCESS from the engine, so it has to pin the version
     # location for itself. platform_version and system_audit are served from
