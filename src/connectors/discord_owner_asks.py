@@ -576,6 +576,20 @@ class DiscordOwnerAsks:
             logger.warning("Morning digest goals source unavailable", exc_info=True)
         return sources
 
+    def digest_accounts(self):
+        """Ready accounts in configured order, primary first.
+
+        The digest speaks for the whole fleet, so it must not arrive from
+        whichever bot happens to sort first: a work bot delivering a summary of
+        another project's goals reads as that bot having done the work. The
+        first configured account is the deployment's primary bot, and only an
+        account nobody configured falls back to alphabetical order.
+        """
+        config = getattr(self.connector, "config", None) or {}
+        configured = list((config.get("accounts") or {}).keys())
+        ordered = [a for a in configured if a in self.ready_accounts]
+        return ordered + sorted(self.ready_accounts.difference(ordered))
+
     async def digest(self, now):
         from src.core.morning_digest import render
 
@@ -594,7 +608,7 @@ class DiscordOwnerAsks:
             rows = self.store.rows(recipient=recipient)
             sender = next((r for r in rows if r["account"] in self.ready_accounts), None)
             if sender is None:
-                for account in sorted(self.ready_accounts):
+                for account in self.digest_accounts():
                     bot = self.connector.bots.get(account)
                     if bot and bot.client.user:
                         sender = {"account": account, "bot_id": str(bot.client.user.id), "recipient_id": recipient}

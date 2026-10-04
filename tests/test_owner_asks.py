@@ -886,3 +886,27 @@ async def test_real_manager_serializes_answer_without_extra_queue_message(fixtur
     assert mgr._handle_message_inner.call_args.args[1].user_id == str(OWNER)
     assert mgr.active_turns == 0
     assert observed == [(1, [])]  # Durable ask replay replaces generic recovery.
+
+
+async def test_digest_comes_from_the_primary_bot_not_the_alphabetical_first(fixture):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    # A work bot that sorts first must not deliver a fleet-wide summary.
+    for account in ("aardvark", "example"):
+        f.service.ready_accounts.add(account)
+    f.connector.config = {"accounts": {"example": {}, "aardvark": {}}}
+    sent = []
+    for account in ("aardvark",):
+        client = SimpleNamespace(user=SimpleNamespace(id=BOT + 1), fetch_user=AsyncMock(return_value=f.owner))
+        f.connector.bots[account] = SimpleNamespace(account_name=account, client=client, connector=f.connector)
+    original = f.service.dm
+
+    async def record(sender, *args, **kwargs):
+        sent.append(sender["account"])
+        return await original(sender, *args, **kwargs)
+
+    f.service.dm = record
+    add_goal()
+    await f.service.tick(time.time())
+    assert sent == ["example"]
+    assert f.service.digest_accounts()[0] == "example"
