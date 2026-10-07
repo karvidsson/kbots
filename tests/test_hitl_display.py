@@ -436,6 +436,24 @@ def test_digest_has_bounded_lines_counts_and_tappable_links():
     assert max(len(line.encode("utf-16-le")) // 2 for line in text.split("```")[1].splitlines()) <= 68
 
 
+def test_digest_summary_line_is_bounded_and_sanitised(monkeypatch):
+    url = jump("9" * 20, "8" * 20, "7" * 20)
+    rows = [
+        {"text": f"agent: item {i}", "summary": "``` @everyone " + "😀" * 1000, "created_at": 1, "url": url}
+        for i in range(100)
+    ]
+    sources = dict.fromkeys(SOURCES, rows)
+    text = render(sources, 90000)
+    assert len(text.encode("utf-16-le")) // 2 <= 2000
+    assert "```" not in text.split("```")[1] and "@everyone" not in text
+    assert max(len(line.encode("utf-16-le")) // 2 for line in text.split("```")[1].splitlines()) <= 68
+    # The list of what is waiting survives whole; only the prose is sacrificed.
+    monkeypatch.setattr("src.core.morning_digest.MAX_CHARACTERS", 1200)
+    tight = render(sources, 90000)
+    assert "😀" not in tight
+    assert tight.count("+ 97 more") == 3 and tight.count("1d agent: item 0") == 3
+
+
 @pytest.mark.parametrize(
     "guild,channel,message",
     [

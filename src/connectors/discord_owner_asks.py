@@ -85,6 +85,26 @@ def card(row, *, legacy=False):
     return embed, plain
 
 
+def goal_summary(goal, reason):
+    """One line on what the goal decision is actually about.
+
+    "verdict: Chrome Web Store listing" names the room, not the question, so
+    the digest row reads as a nag with no subject. Each reason has the field
+    that answers it: a blocked goal has the brief it is blocked on, a closed
+    one has its close-out summary, and everything else is the goal itself.
+    """
+    fields = {
+        "blocked": ("blocked_brief", "description"),
+        "verdict": ("summary", "description"),
+        "nominees": ("description", "strategy"),
+    }.get(reason, ("description", "strategy"))
+    for field in fields:
+        value = (goal.get(field) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 async def send_report(target, report, *, ephemeral=False, nonce=None):
     kwargs = dict(allowed_mentions=discord.AllowedMentions.none())
     if ephemeral:
@@ -516,6 +536,7 @@ class DiscordOwnerAsks:
             "Asks": [
                 {
                     "text": r["agent_id"] + ": " + r["payload"]["question"],
+                    "summary": r["payload"]["context"] or ("if no reply: " + r["payload"]["default"]),
                     "created_at": r["created"],
                     "url": digest_jump(r["guild_id"], r["channel_id"], r["message_id"]) if r["message_id"] else "",
                 }
@@ -536,6 +557,8 @@ class DiscordOwnerAsks:
             pending = await pending_for(gate, recipient, now)
             sources["HITL approvals"] = [
                 {
+                    # No summary line: a gate description carries raw tool
+                    # arguments, and only the card redacts them (#136).
                     "text": r["agent_id"] + ": " + r["tool_name"],
                     "created_at": r["created_at"],
                     "url": digest_jump(guild, r["channel_id"], r["message_id"]),
@@ -567,6 +590,7 @@ class DiscordOwnerAsks:
                     sources["Goals"].append(
                         {
                             "text": reason + ": " + goal["title"],
+                            "summary": goal_summary(goal, reason),
                             "created_at": goal["updated_at"],
                             "url": digest_jump(guild, goal["channel_id"], message),
                         }
@@ -605,14 +629,12 @@ class DiscordOwnerAsks:
                 "SELECT 1 FROM owner_ask_digests WHERE recipient_id=? AND day=?", (recipient, day)
             ).fetchone():
                 continue
-            rows = self.store.rows(recipient=recipient)
-            sender = next((r for r in rows if r["account"] in self.ready_accounts), None)
-            if sender is None:
-                for account in self.digest_accounts():
-                    bot = self.connector.bots.get(account)
-                    if bot and bot.client.user:
-                        sender = {"account": account, "bot_id": str(bot.client.user.id), "recipient_id": recipient}
-                        break
+            sender = None
+            for account in self.digest_accounts():
+                bot = self.connector.bots.get(account)
+                if bot and bot.client.user:
+                    sender = {"account": account, "bot_id": str(bot.client.user.id), "recipient_id": recipient}
+                    break
             if sender is None:
                 continue
             report = render(await self.digest_sources(recipient, now), now)

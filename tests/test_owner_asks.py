@@ -424,8 +424,8 @@ async def add_hitl(f, now, *, recipient=OWNER, source="engine", status="pending"
     await db.commit()
 
 
-def add_goal(title="Review release", *, status="blocked_on_user", created_by=OWNER):
-    return goals.create_goal(title, "", "sample", str(CHANNEL), str(created_by), status=status)
+def add_goal(title="Review release", *, status="blocked_on_user", created_by=OWNER, description=""):
+    return goals.create_goal(title, description, "sample", str(CHANNEL), str(created_by), status=status)
 
 
 async def test_digest_all_three_sources_use_one_existing_claim(fixture):
@@ -910,3 +910,48 @@ async def test_digest_comes_from_the_primary_bot_not_the_alphabetical_first(fixt
     await f.service.tick(time.time())
     assert sent == ["example"]
     assert f.service.digest_accounts()[0] == "example"
+
+
+async def test_digest_comes_from_the_primary_bot_even_when_an_ask_is_open(fixture):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    # An open ask belongs to one agent; the digest still speaks for the fleet,
+    # so the ask's own bot must not become the sender of everyone's summary.
+    row = await create(f)
+    f.store.db.execute("UPDATE owner_asks SET account='aardvark' WHERE id=?", (row["id"],))
+    f.service.ready_accounts.add("aardvark")
+    f.connector.config = {"accounts": {"example": {}, "aardvark": {}}}
+    client = SimpleNamespace(user=SimpleNamespace(id=BOT + 1), fetch_user=AsyncMock(return_value=f.owner))
+    f.connector.bots["aardvark"] = SimpleNamespace(account_name="aardvark", client=client, connector=f.connector)
+    sent = []
+    original = f.service.dm
+
+    async def record(sender, *args, **kwargs):
+        sent.append(sender["account"])
+        return await original(sender, *args, **kwargs)
+
+    f.service.dm = record
+    await f.service.digest(time.time())
+    assert sent == ["example"]
+
+
+async def test_digest_rows_say_what_each_decision_is_about(fixture):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    await create(f, question="Publish it?", context="The draft quotes a customer by name.")
+    goal = add_goal(title="Review release")
+    goals.update_goal(goal["id"], "sample", blocked_brief="Pick the pricing tier before the listing goes up.")
+    await f.service.digest(time.time())
+    text = f.owner.send.call_args.args[0]
+    assert "The draft quotes a customer by name." in text
+    assert "Pick the pricing tier before the listing goes up." in text
+    # A line of prose inside the block must not break the width budget.
+    assert max(len(line.encode("utf-16-le")) // 2 for line in text.split("```")[1].splitlines()) <= 68
+
+
+async def test_digest_ask_without_context_summarises_the_silent_default(fixture):
+    f = fixture
+    f.service.cfg["digest_hour"] = 0
+    await create(f, question="Publish it?", default="Keep the draft unpublished.")
+    await f.service.digest(time.time())
+    assert "if no reply: Keep the draft unpublished." in f.owner.send.call_args.args[0]
