@@ -52,6 +52,22 @@ MIN_INTERVAL = 60
 # tool means the workspace trust / allow-list plumbing is broken.
 _DENIAL_MARKER = "haven't granted it"
 
+
+def _scratch_dirs() -> list[str]:
+    """Paths whose denials are expected and must never page anyone.
+
+    The reflector runs its own LLM call with no tools from a neutral scratch
+    dir, and its prompt names LESSONS.md, so the model sometimes tries to Write
+    that file. The CLI refuses, the reflector writes the real file itself from
+    the reply, and nothing fails — but the refusal looks exactly like a broken
+    allow-list, and it paged the owner three times before anyone traced it.
+    """
+    try:
+        from src.core.base import resolve_kbots_tmp
+        return [str(resolve_kbots_tmp() / "reflector")]
+    except Exception:  # a missing overlay must not disable denial detection
+        return []
+
 # Access levels a fix can require — surfaced verbatim in the briefing so the
 # owner knows before they start whether SSH is enough.
 ACCESS_SHELL = "remote shell (SSH) with sudo/admin rights"
@@ -67,12 +83,20 @@ def scan_stream_event(event: dict) -> list[str]:
     text is e.g. "Claude requested permissions to write to <path>, but you
     haven't granted it yet." Only that marker is treated as a failure —
     explicit human rejections must not page anyone.
+
+    Two filters keep this from crying wolf: the result must be an error (a
+    successful Read of a file that merely quotes the marker, this module
+    included, is not a denial), and a denial inside a known scratch dir is
+    expected behaviour rather than a broken allow-list.
     """
     if event.get("type") != "user":
         return []
+    scratch = _scratch_dirs()
     found: list[str] = []
     for block in (event.get("message", {}) or {}).get("content", []) or []:
         if not isinstance(block, dict) or block.get("type") != "tool_result":
+            continue
+        if not block.get("is_error"):
             continue
         content = block.get("content")
         texts: list[str] = []
@@ -81,8 +105,11 @@ def scan_stream_event(event: dict) -> list[str]:
         elif isinstance(content, list):
             texts.extend(b.get("text", "") for b in content if isinstance(b, dict))
         for t in texts:
-            if t and _DENIAL_MARKER in t.lower():
-                found.append(t.strip()[:300])
+            if not t or _DENIAL_MARKER not in t.lower():
+                continue
+            if any(d and d in t for d in scratch):
+                continue
+            found.append(t.strip()[:300])
     return found
 
 
@@ -101,13 +128,17 @@ def _fix_commands(kind: str, user: str, paths: list[str]) -> tuple[list[str], st
             cmds = [f"sudo chown -R {user} {joined}".rstrip()]
         return cmds, ACCESS_SHELL
     if kind == "tool_denied":
-        # Denials are the *symptom*; the cause is nearly always an untrusted
-        # workspace (unreadable claude config) or a missing/broken allow-list.
+        # Denials are the *symptom*. Ownership was clean on all 28 alerts to
+        # date, so leading with `sudo chown -R` sent every one of them down a
+        # dead end: the cause is nearly always the agent's own allow-list, or
+        # a tool call it was never meant to make. Diagnose, then act.
         home = str(Path.home())
         return [
-            f"find {home}/.claude.json {home}/.claude -not -user {user}   # any output = the cause",
-            f"sudo chown -R {user} {home}/.claude.json {home}/.claude",
-            "then send the affected agent any message — trust re-heals on the next turn",
+            f"find {home}/.claude.json {home}/.claude -not -user {user}   # output = ownership is the cause",
+            "# no output: not ownership. Check the denied path in the detail above",
+            "#   against that agent's agents/<id>/.claude/settings.json allow rules.",
+            "#   A path outside its project dir means the agent asked for something",
+            "#   it is not meant to have, and the denial is the gate working.",
         ], ACCESS_SHELL
     return [], ACCESS_SHELL
 

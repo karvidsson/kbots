@@ -48,7 +48,10 @@ _SYSTEM = (
     "user — never one-offs. The agent will propose these to the user as "
     "skills (see /codify).\n"
     "If a lesson contains [CORRECTION], state the corrected fact under Preferred.\n"
-    "Output ONLY the markdown body (no ``` fences, no preamble)."
+    "Output ONLY the markdown body (no ``` fences, no preamble).\n"
+    # The prompt names LESSONS.md, so a model with no tools still tried to Write
+    # it; the refusal paged the owner as a permission failure three times.
+    "Reply with the file contents as text. Do not create or write any file."
 )
 
 _EXTRACT_SYSTEM = (
