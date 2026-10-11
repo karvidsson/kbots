@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from unittest.mock import Mock
 
 from src.core.base import IncomingMessage
 from src.core.permission_watch import (
@@ -50,6 +51,50 @@ def test_ignores_normal_tool_results_and_other_events():
     }
     assert scan_stream_event(ok) == []
     assert scan_stream_event({"type": "assistant", "message": {}}) == []
+
+
+def test_ignores_successful_result_that_merely_quotes_the_marker():
+    # Reading this very module, or any log of an old alert, is not a denial.
+    event = {
+        "type": "user",
+        "message": {"content": [
+            {"type": "tool_result",
+             "content": 'the marker is "you haven\'t granted it yet."'},
+        ]},
+    }
+    assert scan_stream_event(event) == []
+
+
+def test_ignores_denial_inside_the_reflector_scratch_dir(monkeypatch):
+    from pathlib import Path
+
+    from src.core import permission_watch
+
+    monkeypatch.setattr(permission_watch, "_scratch_dirs", lambda: [str(Path("/tmp/kb/reflector"))])
+    inside = _denial_event(
+        "Claude requested permissions to write to /tmp/kb/reflector/LESSONS.md, "
+        "but you haven't granted it yet.")
+    outside = _denial_event(
+        "Claude requested permissions to write to /tmp/kb/other/LESSONS.md, "
+        "but you haven't granted it yet.")
+    assert scan_stream_event(inside) == []
+    assert len(scan_stream_event(outside)) == 1
+
+
+def test_denial_detection_survives_an_unresolvable_scratch_dir(monkeypatch):
+    from src.core import permission_watch
+
+    monkeypatch.setattr("src.core.base.resolve_kbots_tmp", Mock(side_effect=RuntimeError("no overlay")))
+    assert permission_watch._scratch_dirs() == []
+    assert len(scan_stream_event(_denial_event())) == 1
+
+
+def test_tool_denied_fix_diagnoses_before_advising_chown():
+    mgr = _FakeManager()
+    w = PermissionWatcher(mgr, _config(), alerter=None)
+    briefing = w._briefing("tool_denied", "worker", "write to /x/y.md denied", [])
+    assert "find" in briefing and "sudo chown -R" not in briefing
+    assert "settings.json" in briefing
 
 
 def test_ignores_explicit_human_rejection():
