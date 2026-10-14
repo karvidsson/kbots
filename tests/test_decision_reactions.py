@@ -38,6 +38,30 @@ def test_preserves_the_authors_explicit_pair(text, expected):
     assert decision_reactions(text) == expected
 
 
+@pytest.mark.parametrize("text, expected", [
+    # The options of a real decision are often neither approve nor reject.
+    ("**🔁 = delete the v1 post and repost v2**, so both platforms match.\n"
+     "**🛑 = leave v1 up**, and v2 goes to YouTube only.", ("🔁", "🛑")),
+    ("🚀: ship tonight\n🕗: wait for Monday", ("🚀", "🕗")),
+])
+def test_author_assigned_options_are_seeded_in_the_authors_order(text, expected):
+    assert decision_reactions(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "🔁 = delete the v1 post and repost v2",          # one option is not a choice
+    "🔁 = repost it\n🔁 = repost it again",            # the same tap twice
+    "A = repost it\nB = leave it",                     # a letter is not tappable
+    "🔁 = repost it\n\n🛑 = leave it",                 # unrelated paragraphs
+    "> 🔁 = repost it\n> 🛑 = leave it",               # a quoted legend
+    "```\n🔁 = repost it\n🛑 = leave it\n```",         # an example in code
+    "🔍 = expand this reply\n🛑 = leave it",           # the bot's own control
+    "🔁=repost it\n🛑=leave it",                       # no space: reads as prose
+])
+def test_assigned_options_that_must_not_become_controls(text):
+    assert decision_reactions(text) == ()
+
+
 @pytest.mark.parametrize("text", [
     "✅ Build passed. 🔴 One test failed.",
     "The owner approved with ✅ and can reject with 🔴.",

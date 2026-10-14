@@ -16,6 +16,25 @@ _PAIRS = (("✅", "🔴"), ("✅", "❌"), ("🟢", "🔴"))
 _YES = r"(?:go|approve|yes|godkänn|ja)"
 _NO = r"(?:no[ -]?go|reject|deny|stop|hold|no|avslå|nej)"
 
+# "🔁 = repost it" — an emoji the author assigns a meaning to, rather than one
+# of the known approve/reject pairs. A decision whose options are neither yes
+# nor no still has to be one tap on a phone, and hunting an emoji in the picker
+# to answer is exactly the work the seed exists to remove.
+_ASSIGNED = re.compile(r"^(\S{1,4}?)\s*[=:]\s+(\S.*)$")
+# The expand-shortcut is the bot's own control and must not also mean a choice.
+_RESERVED = ("🔍", "📄")
+
+
+def _assigned_emoji(line: str) -> str:
+    """The emoji a line assigns a meaning to, or "" if it does not."""
+    match = _ASSIGNED.match(line)
+    if not match:
+        return ""
+    token = match[1]
+    if token in _RESERVED or any(c.isascii() or c.isalnum() for c in token):
+        return ""
+    return token
+
 
 def decision_reactions(content: str) -> tuple[str, ...]:
     """Return the requested binary pair, or nothing for absent/ambiguous asks.
@@ -62,7 +81,11 @@ def decision_reactions(content: str) -> tuple[str, ...]:
                 matches.add(pairs[0])
             elif not any(emoji in line for pair in _PAIRS for emoji in pair):
                 matches.add(("✅", "🔴"))
-        legend = line + "\n" + (lines[index + 1] if index + 1 < len(lines) else "")
+        nxt = lines[index + 1] if index + 1 < len(lines) else ""
+        first, second = _assigned_emoji(line), _assigned_emoji(nxt)
+        if first and second and first != second:
+            matches.add((first, second))
+        legend = line + "\n" + nxt
         for yes, no in _PAIRS:
             if re.match(
                 rf"^{yes}\s*[:=]?\s*{_YES}\b[^\n]*[\n/|·,;]\s*"
