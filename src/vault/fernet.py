@@ -5,6 +5,8 @@ into an in-memory dict. Passphrase is never stored.
 """
 
 import base64
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -122,6 +124,51 @@ class FernetVault(VaultBackend):
         # Keys already reported as malformed, so a bad value is flagged once per
         # process instead of on every lookup on a hot path.
         self._warned_faults: set[str] = set()
+        # (mtime_ns, size) of the file our in-memory copy matches. The engine and
+        # every MCP tool process each hold a copy; without this, one process
+        # never sees a secret another just saved, and its next write would put
+        # its stale copy back over the file, erasing that secret.
+        self._loaded_stamp: tuple[int, int] | None = None
+
+    def _file_stamp(self) -> tuple[int, int] | None:
+        try:
+            st = self._vault_path.stat()
+        except FileNotFoundError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _refresh(self) -> None:
+        """Re-read the vault if another process changed it since we loaded.
+
+        A failed re-read (half-replaced file, wrong key after a rekey elsewhere)
+        keeps the copy we have: a stale secret beats a vault that went empty.
+        """
+        if not self._fernet:
+            return
+        stamp = self._file_stamp()
+        if stamp is None or stamp == self._loaded_stamp:
+            return
+        try:
+            self._secrets = json.loads(self._fernet.decrypt(self._vault_path.read_bytes()))
+            self._loaded_stamp = stamp
+        except (InvalidToken, json.JSONDecodeError, OSError) as exc:
+            logger.warning(f"Vault changed on disk but could not be re-read ({type(exc).__name__})")
+
+    @contextlib.contextmanager
+    def _write_lock(self):
+        """Serialise read-modify-write across processes sharing this vault.
+        Env-only and in-memory vaults never persist, so there is nothing to guard."""
+        if not self._fernet:
+            yield
+            return
+        self._vault_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self._vault_path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     @property
     def is_unlocked(self) -> bool:
@@ -186,6 +233,7 @@ class FernetVault(VaultBackend):
             try:
                 decrypted = self._fernet.decrypt(encrypted)
                 self._secrets = json.loads(decrypted)
+                self._loaded_stamp = self._file_stamp()
                 logger.info(f"Vault unlocked: {len(self._secrets)} secrets loaded")
             except InvalidToken:
                 raise ValueError("Wrong passphrase — vault decrypt failed")
@@ -240,6 +288,7 @@ class FernetVault(VaultBackend):
         vaults already hold malformed secrets that nothing has ever complained
         about.
         """
+        self._refresh()
         value = self._secrets.get(key)
         if value is not None:
             return self._checked(key, value)
@@ -293,20 +342,25 @@ class FernetVault(VaultBackend):
         for fault in describe_value_faults(value):
             logger.warning(f"Vault: value for '{key}' has {fault}. This is "
                            f"stored as given, but it is very unlikely to work.")
-        self._secrets[key] = value
-        self._warned_faults.discard(key)
-        self._persist()
+        with self._write_lock():
+            self._refresh()
+            self._secrets[key] = value
+            self._warned_faults.discard(key)
+            self._persist()
 
     def delete(self, key: str) -> bool:
         """Delete a secret. Returns True if it existed."""
-        if key in self._secrets:
+        with self._write_lock():
+            self._refresh()
+            if key not in self._secrets:
+                return False
             del self._secrets[key]
             self._persist()
             return True
-        return False
 
     def list_keys(self) -> list[str]:
         """List all secret key names (not values)."""
+        self._refresh()
         return list(self._secrets.keys())
 
     def kdf_current(self) -> bool:
@@ -335,6 +389,7 @@ class FernetVault(VaultBackend):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, self._vault_path)
+        self._loaded_stamp = self._file_stamp()
 
     def migrate_salt(self, passphrase: str) -> None:
         """Migrate from legacy hardcoded salt to per-instance random salt.
