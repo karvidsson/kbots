@@ -879,7 +879,7 @@ async def kvm_login(ctx: ToolContext, device: str = "") -> str:
 
 @tool(name="kvm_add",
       description=("Add a KVM so agents can drive the machine behind it. host: the KVM's LAN or Tailscale "
-                   "address (e.g. glkvm.tail1234.ts.net). The owner approves on a card and enters the KVM "
+                   "address (e.g. <kvm>.<tailnet>.ts.net). The owner approves on a card and enters the KVM "
                    "password in a private form; you never see it. Call kvm_devices to see when it is ready."),
       category="kvm")
 async def kvm_add(ctx: ToolContext, name: str, host: str, keymap: str = "") -> str:

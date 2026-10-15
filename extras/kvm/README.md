@@ -44,7 +44,7 @@ cp extras/kvm/kvm.py "$KBOTS_OVERLAY/tools/"
 
 ## Add a KVM from Discord
 
-Ask an agent: *"Add the KVM at glkvm.tail1234.ts.net and call it lab."*
+Ask an agent: *"Add the KVM at <kvm>.<tailnet>.ts.net and call it lab."*
 
 1. The agent calls `kvm_add`. It checks a KVM answers at that address (LAN or
    Tailscale only) and posts a card in its channel: **Add KVM 'lab' for
