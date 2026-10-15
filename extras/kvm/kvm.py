@@ -41,14 +41,18 @@ import ipaddress
 import json
 import logging
 import os
+import re
+import sqlite3
 import tempfile
+import time
+import uuid
 from pathlib import Path
 from typing import Annotated
 
 import aiohttp
 import yaml
 
-from src.core.base import KBOTS_TMP, ToolContext, resolve_config_file
+from src.core.base import KBOTS_TMP, ToolContext, resolve_config_file, resolve_data_dir
 from src.core.tools import tool
 
 logger = logging.getLogger(__name__)
@@ -94,7 +98,7 @@ _PUNCT_KEYS = {"-": "Minus", "=": "Equal", ",": "Comma", ".": "Period", "/": "Sl
 
 # ── registry ──────────────────────────────────────────────────────────
 
-def _config() -> dict:
+def _full_config() -> dict:
     cfg_file = resolve_config_file("config.yaml")
     if not cfg_file.exists():
         return {}
@@ -102,10 +106,22 @@ def _config() -> dict:
         cfg = yaml.safe_load(cfg_file.read_text()) or {}
     except yaml.YAMLError:
         return {}
-    return (cfg.get("kvm", {}) or {}) if isinstance(cfg, dict) else {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _config() -> dict:
+    return _full_config().get("kvm", {}) or {}
 
 
 def _load_devices() -> dict[str, dict]:
+    """Every usable device: config.yaml first, then owner-approved registrations."""
+    devices = _config_devices()
+    for name, spec in _registered_devices().items():
+        devices.setdefault(name, spec)
+    return devices
+
+
+def _config_devices() -> dict[str, dict]:
     """Device registry from config.yaml: name → {host, user, agents, keymap, …}."""
     raw = _config().get("devices", {}) or {}
     devices = {}
@@ -125,6 +141,10 @@ def _load_devices() -> dict[str, dict]:
             "verify_tls": bool(spec.get("verify_tls", False)),
             "public": bool(spec.get("public", False)),
             "login": _login_spec(spec.get("login")),
+            # Hand-written config is the operator's own grant: sign-in and power
+            # behave as they always did. Registered devices start with both off.
+            "source": "config", "restricted": bool(agents),
+            "allow_login": True, "allow_power": True,
         }
     return devices
 
@@ -166,22 +186,194 @@ def _norm(name: str) -> str:
 def _resolve(ctx: ToolContext, device: str) -> tuple[dict | None, str, str]:
     """(spec, canonical name, error). Unknown names list the valid ones so a
     small model self-corrects in one round."""
+    _settle()
     devices = _load_devices()
     if not devices:
-        return None, "", ("No KVM devices configured. Add them under kvm.devices in "
-                          "config.yaml (see extras/kvm/README.md).")
+        return None, "", ("No KVM devices yet. Add one with kvm_add (the owner approves it), "
+                          "or under kvm.devices in config.yaml.")
     name = device if device in devices else _norm(device)
     if name not in devices and len(devices) == 1 and not device.strip():
         name = next(iter(devices))
     spec = devices.get(name)
     if not spec:
         return None, "", f"Unknown KVM '{device}'. Configured: {', '.join(sorted(devices))}"
-    if spec["agents"] and ctx.agent_id not in spec["agents"]:
-        return None, "", f"KVM '{name}' is not assigned to agent '{ctx.agent_id}'."
+    if spec["restricted"] and ctx.agent_id not in spec["agents"]:
+        return None, "", (f"KVM '{name}' is not assigned to agent '{ctx.agent_id}'. "
+                          "Ask the owner with kvm_allow.")
     if not spec["public"] and not _reachable_privately(spec["host"]):
         return None, "", (f"KVM '{name}' host {spec['host']} is not a LAN/Tailscale address — "
                           "refusing. Reach it over a tailnet, or set public: true.")
     return spec, name, ""
+
+
+# ── registrations (owner-approved, from chat) ─────────────────────────
+#
+# kvm.db holds devices, per-agent grants and the owner decisions they wait on.
+# Nothing here becomes usable on an agent's say-so: _settle reads the answer
+# from the engine's own owner-asks.db, where only the owner's tap is recorded.
+
+_NAME = re.compile(r"^[a-z0-9_]{1,32}$")
+_SETTINGS = ("login", "power")
+_APPROVE = {"add": "Add", "grant": "Allow", "setting": "Turn on"}
+
+
+def _data_dir() -> Path:
+    return resolve_data_dir(_full_config())
+
+
+def _db() -> sqlite3.Connection:
+    path = _data_dir() / "kvm.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(path, timeout=5, isolation_level=None)
+    path.chmod(0o600)
+    db.row_factory = sqlite3.Row
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS devices (
+            name TEXT PRIMARY KEY, host TEXT NOT NULL, user TEXT NOT NULL, keymap TEXT NOT NULL,
+            login INTEGER NOT NULL DEFAULT 0, power INTEGER NOT NULL DEFAULT 0,
+            state TEXT NOT NULL, added_by TEXT NOT NULL, created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS grants (
+            device TEXT NOT NULL, agent TEXT NOT NULL, state TEXT NOT NULL,
+            PRIMARY KEY (device, agent));
+        CREATE TABLE IF NOT EXISTS pending (
+            ask_id TEXT PRIMARY KEY, kind TEXT NOT NULL, device TEXT NOT NULL,
+            agent TEXT NOT NULL, setting TEXT NOT NULL DEFAULT '', created REAL NOT NULL,
+            question TEXT NOT NULL DEFAULT '');
+    """)
+    return db
+
+
+def _registered_devices() -> dict[str, dict]:
+    path = _data_dir() / "kvm.db"
+    if not path.exists():
+        return {}
+    db = _db()
+    try:
+        out = {}
+        for row in db.execute("SELECT * FROM devices WHERE state='active'"):
+            agents = [r["agent"] for r in db.execute(
+                "SELECT agent FROM grants WHERE device=? AND state='active'", (row["name"],))]
+            out[row["name"]] = {
+                "host": row["host"], "user": row["user"], "agents": agents, "keymap": row["keymap"],
+                "verify_tls": False, "public": False, "login": _login_spec(None),
+                "source": "registered", "restricted": True,
+                "allow_login": bool(row["login"]), "allow_power": bool(row["power"]),
+            }
+        return out
+    finally:
+        db.close()
+
+
+def _owner_answer(ask_id: str, question: str) -> tuple[str, str]:
+    """(state, answer) of an owner ask, read-only from the engine's store.
+    ('missing', '') when there is no such ask, no store, or the recorded card
+    asked something else: an answer only counts for the question we posted."""
+    path = _data_dir() / "owner-asks.db"
+    if not path.exists():
+        return "missing", ""
+    try:
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            row = db.execute("SELECT state, answer, answered_by, recipient_id, payload FROM owner_asks "
+                             "WHERE id=?", (ask_id,)).fetchone()
+        finally:
+            db.close()
+    except sqlite3.Error:
+        return "missing", ""
+    if not row:
+        return "missing", ""
+    state, answer, by, recipient, payload = row
+    try:
+        asked = json.loads(payload).get("question")
+    except (ValueError, AttributeError):
+        asked = None
+    if asked != question:
+        return "missing", ""
+    if state == "answered" and by != recipient:        # the store forbids it; trust nothing else
+        return "missing", ""
+    return state, answer or ""
+
+
+def _settle() -> None:
+    """Apply every owner decision that has come in since the last tool call."""
+    path = _data_dir() / "kvm.db"
+    if not path.exists():
+        return
+    db = _db()
+    try:
+        for p in db.execute("SELECT * FROM pending").fetchall():
+            state, answer = _owner_answer(p["ask_id"], p["question"])
+            if state not in ("answered", "stale"):
+                continue
+            approved = state == "answered" and answer == _APPROVE[p["kind"]]
+            if p["kind"] == "add":
+                if approved:
+                    db.execute("UPDATE devices SET state='active' WHERE name=?", (p["device"],))
+                    db.execute("INSERT OR REPLACE INTO grants VALUES (?,?,'active')", (p["device"], p["agent"]))
+                else:
+                    db.execute("DELETE FROM devices WHERE name=? AND state='pending'", (p["device"],))
+            elif p["kind"] == "grant":
+                if approved:
+                    db.execute("INSERT OR REPLACE INTO grants VALUES (?,?,'active')", (p["device"], p["agent"]))
+            elif p["kind"] == "setting" and approved and p["setting"] in _SETTINGS:
+                db.execute(f"UPDATE devices SET {p['setting']}=1 WHERE name=?", (p["device"],))
+            db.execute("DELETE FROM pending WHERE ask_id=?", (p["ask_id"],))
+            logger.info(f"kvm {p['kind']} {p['device']}/{p['agent']} {p['setting']}: "
+                        f"{'approved' if approved else 'not approved'}")
+    finally:
+        db.close()
+
+
+def _waiting(db, kind: str, device: str, agent: str = "", setting: str = "") -> bool:
+    return db.execute("SELECT 1 FROM pending WHERE kind=? AND device=? AND agent=? AND setting=?",
+                      (kind, device, agent, setting)).fetchone() is not None
+
+
+async def _ask(ctx: ToolContext, kind: str, device: str, question: str, context: str,
+               agent: str = "", setting: str = "") -> str:
+    """Post an owner decision card and remember what it would unlock. '' on success."""
+    from src.tools.owner_asks import ask_owner
+    options = [_APPROVE[kind], "Don't"]
+    out = await ask_owner(ctx, question=question, default="Nothing changes; no access is granted.",
+                          options=options, context=context,
+                          request_key=f"kvm-{kind}-{device}-{uuid.uuid4().hex[:8]}")
+    try:
+        ask_id = json.loads(out)["id"]
+    except (ValueError, KeyError, TypeError):
+        return f"Couldn't post the owner card: {out}"
+    db = _db()
+    try:
+        db.execute("INSERT INTO pending VALUES (?,?,?,?,?,?,?)",
+                   (ask_id, kind, device, agent or ctx.agent_id, setting, time.time(), question))
+    finally:
+        db.close()
+    return ""
+
+
+async def _ask_secret(ctx: ToolContext, key: str, label: str, purpose: str) -> str:
+    """Owner types the secret into a private form; it never passes through us."""
+    try:
+        from src.tools.owner_secrets import ask_owner_secret
+    except ImportError:
+        return (f"This kbots has no ask_owner_secret yet: the owner must store it in the vault as "
+                f"{key} (vault-manage.py).")
+    out = await ask_owner_secret(ctx, key=key, label=label, purpose=purpose, request_key=f"{key}-secret")
+    try:
+        json.loads(out)["id"]
+    except (ValueError, KeyError, TypeError):
+        return f"Couldn't ask the owner for the password: {out}"
+    return ""
+
+
+async def _probe(host: str) -> bool:
+    """Does a KVM answer at host? Unauthenticated auth/check: 401/403 mean yes."""
+    url = (host if "://" in host else f"https://{host}") + "/api/auth/check"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as s:
+            async with s.get(url, ssl=False) as resp:
+                return resp.status in (200, 401, 403)
+    except (aiohttp.ClientError, TimeoutError):
+        return False
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────
@@ -384,12 +576,11 @@ def _parse_combo(combo: str) -> tuple[list[str], str]:
       description="List the KVM-attached machines this agent can drive, with video/keyboard status.",
       category="kvm")
 async def kvm_devices(ctx: ToolContext) -> str:
+    _settle()
     devices = _load_devices()
-    if not devices:
-        return "No KVM devices configured. Add them under kvm.devices in config.yaml."
     lines = []
     for name, spec in sorted(devices.items()):
-        if spec["agents"] and ctx.agent_id not in spec["agents"]:
+        if spec["restricted"] and ctx.agent_id not in spec["agents"]:
             continue
         _, _, err = _resolve(ctx, name)
         if err:
@@ -410,9 +601,30 @@ async def kvm_devices(ctx: ToolContext) -> str:
         live = online and source.get("real_resolution") != "no_signal"
         video = (f"{res.get('width')}x{res.get('height')}" if live
                  else "no signal reported (display may be asleep; kvm_screen wakes it)")
+        extras = "" if spec["source"] == "config" else (
+            f", sign-in {'on' if spec['allow_login'] else 'off'}, power {'on' if spec['allow_power'] else 'off'}")
         lines.append(f"{name}: video {video}, keyboard {'ok' if kb else 'offline'}, "
-                     f"mouse {'ok' if mouse else 'offline'}")
-    return "\n".join(lines) or f"No KVMs are assigned to agent '{ctx.agent_id}'."
+                     f"mouse {'ok' if mouse else 'offline'}{extras}")
+    lines += _pending_lines()
+    if not lines:
+        return (f"No KVMs are assigned to agent '{ctx.agent_id}'. Add one with kvm_add, or ask for "
+                "access to an existing one with kvm_allow.")
+    return "\n".join(lines)
+
+
+def _pending_lines() -> list[str]:
+    if not (_data_dir() / "kvm.db").exists():
+        return []
+    db = _db()
+    try:
+        out = []
+        for p in db.execute("SELECT * FROM pending ORDER BY created"):
+            what = {"add": "to be added", "grant": f"access for {p['agent']}",
+                    "setting": f"{p['setting']} on"}[p["kind"]]
+            out.append(f"{p['device']}: waiting for the owner ({what})")
+        return out
+    finally:
+        db.close()
 
 
 @tool(name="kvm_screen",
@@ -573,6 +785,9 @@ async def kvm_power(ctx: ToolContext, action: Annotated[str, {"choices": [
     spec, name, err = _resolve(ctx, device)
     if err:
         return err
+    if action != "status" and not spec["allow_power"]:
+        return (f"Power control is off for '{name}'. Ask the owner to turn it on with "
+                f"kvm_settings('{name}', 'power', 'on').")
     if action == "status":
         atx, err = await _json(ctx, name, spec, "GET", "/atx")
         if err:
@@ -602,6 +817,9 @@ async def kvm_login(ctx: ToolContext, device: str = "") -> str:
     spec, name, err = _resolve(ctx, device)
     if err:
         return err
+    if not spec["allow_login"]:
+        return (f"Sign-in is off for '{name}'. Ask the owner to turn it on with "
+                f"kvm_settings('{name}', 'login', 'on').")
     key = f"kvm_{name}_login"
     password = None
     if ctx.vault:
@@ -655,3 +873,169 @@ async def kvm_login(ctx: ToolContext, device: str = "") -> str:
     logger.info(f"kvm_login device={name} by agent={ctx.agent_id}")
     return (f"Entered the stored login for '{name}' and pressed Enter. Take a kvm_screen "
             "to confirm it unlocked.")
+
+
+# ── self-service: add devices and grant rights, owner-approved ────────
+
+@tool(name="kvm_add",
+      description=("Add a KVM so agents can drive the machine behind it. host: the KVM's LAN or Tailscale "
+                   "address (e.g. glkvm.tail1234.ts.net). The owner approves on a card and enters the KVM "
+                   "password in a private form; you never see it. Call kvm_devices to see when it is ready."),
+      category="kvm")
+async def kvm_add(ctx: ToolContext, name: str, host: str, keymap: str = "") -> str:
+    """Register a KVM. Nothing is usable until the owner taps Add."""
+    _settle()
+    name = _norm(name)
+    host = host.strip().rstrip("/")
+    if not _NAME.match(name):
+        return "name must be 1-32 lowercase letters, digits or '_', e.g. 'lab' or 'mac_mini'."
+    if not _reachable_privately(host):
+        return (f"{host} is not a LAN or Tailscale address. Put the KVM on your tailnet and use its "
+                "*.ts.net name.")
+    if name in _config_devices():
+        return f"'{name}' is already set up in config.yaml."
+    db = _db()
+    try:
+        row = db.execute("SELECT state FROM devices WHERE name=?", (name,)).fetchone()
+        if row and row["state"] == "active":
+            return f"'{name}' is already added. Use kvm_allow to give another agent access."
+        if row and _waiting(db, "add", name, ctx.agent_id):
+            return f"'{name}' is already waiting for the owner to approve."
+        if row:
+            return f"'{name}' is being added by another agent. Pick a different name."
+    finally:
+        db.close()
+    if not await _probe(host):
+        return f"No KVM answers at {host}. Is it on, and is this host on the same LAN or tailnet?"
+    db = _db()
+    try:
+        db.execute("INSERT INTO devices (name,host,user,keymap,state,added_by,created) "
+                   "VALUES (?,?,?,?,'pending',?,?)",
+                   (name, host, "admin", keymap.strip(), ctx.agent_id, time.time()))
+    finally:
+        db.close()
+    err = await _ask(
+        ctx, "add", name,
+        question=f"Add KVM '{name}' ({host}) for {ctx.agent_id}?",
+        context=(f"{ctx.agent_id} will see that machine's screen and use its keyboard and mouse. "
+                 "Sign-in and power control stay off unless you turn them on."))
+    if err:
+        db = _db()
+        try:
+            db.execute("DELETE FROM devices WHERE name=? AND state='pending'", (name,))
+        finally:
+            db.close()
+        return err
+    note = await _ask_secret(
+        ctx, f"kvm_{name}", f"KVM password for {name}"[:45],
+        f"The web login of the KVM at {host}, so {ctx.agent_id} can see and control the machine behind it.")
+    asked = "Asked the owner to approve on a card" + ("" if note else " and to enter the KVM password in a "
+                                                                        "private form")
+    return f"{asked}. '{name}' becomes usable once they tap Add." + (f" {note}" if note else "")
+
+
+@tool(name="kvm_allow",
+      description="Ask the owner to let an agent use a KVM-attached machine. The owner approves on a card.",
+      category="kvm")
+async def kvm_allow(ctx: ToolContext, device: str, agent: str) -> str:
+    """Request access for an agent; granted only when the owner taps Allow."""
+    _settle()
+    device, agent = _norm(device), agent.strip()
+    if not agent:
+        return "agent is required."
+    spec = _registered_devices().get(device)
+    if not spec:
+        if device in _config_devices():
+            return f"'{device}' is set up in config.yaml; edit its agents: list there."
+        return f"No added KVM called '{device}'."
+    if agent in spec["agents"]:
+        return f"{agent} can already use '{device}'."
+    db = _db()
+    try:
+        if _waiting(db, "grant", device, agent):
+            return f"Already waiting for the owner to allow {agent} on '{device}'."
+    finally:
+        db.close()
+    err = await _ask(ctx, "grant", device, agent=agent,
+                     question=f"Let {agent} use KVM '{device}'?",
+                     context=f"{agent} will see that machine's screen and use its keyboard and mouse.")
+    return err or f"Asked the owner. {agent} can use '{device}' once they tap Allow."
+
+
+@tool(name="kvm_revoke",
+      description="Stop an agent from using a KVM-attached machine. Takes effect immediately.",
+      category="kvm")
+async def kvm_revoke(ctx: ToolContext, device: str, agent: str) -> str:
+    """Removing access needs no approval: it only ever reduces what an agent can do."""
+    _settle()                     # apply earlier approvals first, or they would re-grant after this
+    device, agent = _norm(device), agent.strip()
+    if device in _config_devices():
+        return f"'{device}' is set up in config.yaml; edit its agents: list there."
+    if not (_data_dir() / "kvm.db").exists():
+        return f"No added KVM called '{device}'."
+    db = _db()
+    try:
+        removed = db.execute("DELETE FROM grants WHERE device=? AND agent=?", (device, agent)).rowcount
+        db.execute("DELETE FROM pending WHERE kind='grant' AND device=? AND agent=?", (device, agent))
+    finally:
+        db.close()
+    logger.info(f"kvm_revoke device={device} agent={agent} by {ctx.agent_id}")
+    return f"{agent} can no longer use '{device}'." if removed else f"{agent} had no access to '{device}'."
+
+
+_LOGIN_PURPOSE = "The password of the computer behind KVM '{}', so agents can sign in at its lock screen."
+
+
+@tool(name="kvm_settings",
+      description=("Turn sign-in ('login': type the machine's stored password) or power control ('power') "
+                   "on or off for an added KVM. Turning one on asks the owner; turning one off is immediate."),
+      category="kvm")
+async def kvm_settings(ctx: ToolContext, device: str,
+                       setting: Annotated[str, {"choices": ["login", "power"]}],
+                       value: Annotated[str, {"choices": ["on", "off"]}]) -> str:
+    """Off is immediate (less authority); on waits for the owner's tap."""
+    _settle()
+    device = _norm(device)
+    if setting not in _SETTINGS or value not in ("on", "off"):
+        return "setting must be 'login' or 'power', value 'on' or 'off'."
+    spec = _registered_devices().get(device)
+    if not spec:
+        if device in _config_devices():
+            return f"'{device}' is set up in config.yaml, where sign-in and power are always available."
+        return f"No added KVM called '{device}'."
+    if ctx.agent_id not in spec["agents"]:
+        return f"KVM '{device}' is not assigned to agent '{ctx.agent_id}'."
+    what = "sign-in" if setting == "login" else "power control"
+    if value == "off":
+        db = _db()
+        try:
+            db.execute(f"UPDATE devices SET {setting}=0 WHERE name=?", (device,))
+            db.execute("DELETE FROM pending WHERE kind='setting' AND device=? AND setting=?", (device, setting))
+        finally:
+            db.close()
+        return f"Turned {what} off for '{device}'."
+    login_key = f"kvm_{device}_login"
+    if spec["allow_login" if setting == "login" else "allow_power"]:
+        if setting == "login" and not (ctx.vault and ctx.vault.get(login_key)):
+            note = await _ask_secret(ctx, login_key, f"Login password for {device}"[:45],
+                                     _LOGIN_PURPOSE.format(device))
+            return f"Sign-in is on for '{device}'. " + (note or "Asked the owner for the computer's password.")
+        return f"{what.capitalize()} is already on for '{device}'."
+    db = _db()
+    try:
+        if _waiting(db, "setting", device, ctx.agent_id, setting):
+            return f"Already waiting for the owner to turn {what} on for '{device}'."
+    finally:
+        db.close()
+    context = ("Agents will be able to type the computer's stored password at its lock screen. It types into "
+               "whatever has focus." if setting == "login" else
+               "Agents will be able to power the machine on, off and reset it. Each use still needs your tap.")
+    err = await _ask(ctx, "setting", device, setting=setting,
+                     question=f"Turn {what} on for KVM '{device}'?", context=context)
+    if err:
+        return err
+    if setting != "login":
+        return f"Asked the owner to turn {what} on for '{device}'."
+    note = await _ask_secret(ctx, login_key, f"Login password for {device}"[:45], _LOGIN_PURPOSE.format(device))
+    return (f"Asked the owner to turn {what} on for '{device}'"
+            + (f". {note}" if note else " and to enter the computer's password in a private form."))

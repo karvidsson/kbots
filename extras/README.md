@@ -39,7 +39,7 @@ their creator until `promote_tool`. That path is unchanged.
 | `monitoring/` | rss_read, web_watch, weather | none |
 | `news/` | news_search, news_feeds | `monitoring/` installed |
 | `shelly/` | smart-home switch/dim/cover control | devices on LAN |
-| `kvm/` | drive a physical machine through an IP-KVM: screen, mouse, keyboard, ATX power, sign-in (8) | PiKVM-compatible KVM on LAN or tailnet |
+| `kvm/` | drive a physical machine through an IP-KVM: screen, mouse, keyboard, ATX power, sign-in, owner-approved setup from chat (12) | PiKVM-compatible KVM on LAN or tailnet |
 | `stagehand/` | `smart_browser` — natural-language browser automation (act/observe/extract) | `uv sync --extra stagehand`; local model endpoint (or API key) |
 
 ## Installing an extra

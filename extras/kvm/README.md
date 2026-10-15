@@ -5,7 +5,7 @@ Comet/GLKVM, PiKVM, …) captures a machine's HDMI and acts as its USB keyboard
 and mouse, so an agent can operate **any machine plugged into it**: any OS,
 BIOS, installers. Nothing is installed on the target.
 
-Eight tools:
+Twelve tools. Driving the machine:
 
 | Tool | Does |
 |---|---|
@@ -17,6 +17,15 @@ Eight tools:
 | `kvm_scroll` | scroll the wheel, optionally over a point |
 | `kvm_power` | ATX power: status/on/off/off_hard/reset_hard. **HITL-gated** |
 | `kvm_login` | sign in to the target's lock screen with a vault password |
+
+Setting up, from chat (see [Add a KVM from Discord](#add-a-kvm-from-discord)):
+
+| Tool | Does |
+|---|---|
+| `kvm_add` | register a KVM; the owner approves and enters its password |
+| `kvm_allow` | ask the owner to let another agent use a device |
+| `kvm_revoke` | take an agent's access away, immediately |
+| `kvm_settings` | turn sign-in or power control on (owner approves) or off (immediate) |
 
 The loop is screenshot → act → screenshot. `kvm_screen` wakes a sleeping
 target first (display sleep, a laptop with its lid closed) by nudging the
@@ -33,7 +42,36 @@ them to the KVM's absolute axis, so they land exactly at any target resolution.
 cp extras/kvm/kvm.py "$KBOTS_OVERLAY/tools/"
 ```
 
-## Configure
+## Add a KVM from Discord
+
+Ask an agent: *"Add the KVM at glkvm.tail1234.ts.net and call it lab."*
+
+1. The agent calls `kvm_add`. It checks a KVM answers at that address (LAN or
+   Tailscale only) and posts a card in its channel: **Add KVM 'lab' for
+   atlas?**, with **Add** / **Don't**.
+2. A second card asks for the KVM's web password. Tap **Enter**, type it in the
+   private form, and it goes straight to the vault as `kvm_lab`. The agent
+   never sees it. (Needs `ask_owner_secret`; on older kbots, store it with
+   `vault-manage.py`.)
+3. Once you tap **Add**, `lab` works for that agent. `kvm_devices` shows what
+   is ready and what is still waiting for you.
+
+Everything starts locked down:
+
+- **Only the agent that added it** can use the device. `kvm_allow(lab, nova)`
+  posts **Let nova use KVM 'lab'?**, and `kvm_revoke` takes access away
+  immediately.
+- **Sign-in and power control start off.** `kvm_settings(lab, login, on)`
+  asks you to approve, and asks for the computer's login password in a private
+  form (`kvm_lab_login`). Turning a setting off is immediate.
+
+A tap counts only if the engine recorded it from you, on the card the tool
+posted, for the exact question it asked. The tool reads that record from
+`owner-asks.db`; an agent cannot approve its own request. Registrations live in
+`data/kvm.db`.
+
+## Configure in config.yaml (alternative)
+
 
 Register KVMs in the overlay's `config/config.yaml`. **The model never supplies
 a host**: it picks a name, and the name maps to one KVM.
@@ -110,6 +148,10 @@ internet.
 - Every tool is non-safe, so access control limits them to owner/admin senders.
 - `agents:` pins a machine to the agents allowed to drive it. Other agents
   don't even see it in `kvm_devices`.
+- Devices added from chat are closed by default: one agent, sign-in off,
+  power off. Each widening needs the owner's tap; each narrowing is immediate.
+  Like every kbots store, `kvm.db` and `owner-asks.db` rely on agents having no
+  write access to the data directory.
 - `kvm_power` is HITL-gated by default because a hard off loses the target's
   unsaved work. `kvm_login` is not (see above). To approve every action instead, add `kvm_click`/`kvm_type`/
   `kvm_key` to `security.hitl.gated_tools`. Anything an agent can type on the
