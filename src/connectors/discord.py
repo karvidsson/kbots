@@ -1007,6 +1007,9 @@ class DiscordBot:
         owner_asks = getattr(self.connector, "_owner_asks", None)
         if owner_asks:
             await owner_asks.start(self)
+        owner_secrets = getattr(self.connector, "_owner_secrets", None)
+        if owner_secrets:
+            await owner_secrets.start(self)
 
         # Record this bot's Discord identity in the roster so other agents recognize
         # it as a teammate (resolve_discord_user / user-context) rather than an

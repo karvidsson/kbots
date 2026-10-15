@@ -215,3 +215,5 @@ email through the existing gate, including any content beyond the preview.
 There is no second approval or editing workflow. To change the email, deny it
 on that card and ask the agent for a revised email. Existing gate permissions,
 timeouts, individual HITL notifications and failure policy are unchanged.
+
+For a password, token or key, use `ask_owner_secret` instead. See [OWNER_SECRETS.md](OWNER_SECRETS.md).

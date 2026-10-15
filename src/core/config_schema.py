@@ -107,6 +107,11 @@ _SCHEMA: dict[str, tuple] = {
         "janitor_tick_seconds": (int, False, None, None),
     }),
     "admin_users": (dict, False, None, None),
+    # Owner-entered secrets (src/core/owner_secrets.py): vault key prefixes an
+    # agent may ask the owner to fill through the private Discord form.
+    "owner_secrets": (dict, False, None, {
+        "allowed_prefixes": (list, False, None, None),
+    }),
     "agents": (dict, False, None, None),
     # Browser janitor (quit the shared debug Chrome after hours of idleness)
     "browser": (dict, False, None, {
