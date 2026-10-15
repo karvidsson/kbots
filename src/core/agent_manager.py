@@ -1104,6 +1104,22 @@ class AgentManager:
                     round_num = 0  # fresh budget for the fallback provider
                     continue
 
+                # The router keeps a human's message local because it judged it
+                # simple, not because it judged it unworthy of an answer. A local
+                # model that abstains anyway leaves the person talking to a bot
+                # that never replies: the owner's first DM to a new agent got
+                # exactly that. Hand the same turn to the agent's own provider.
+                if (session.routed_local and not fell_back and message.source == "user"
+                        and not response.tool_calls and is_no_reply(response.content)):
+                    logger.warning(f"[{agent_id}] local tier abstained on a human "
+                                   f"message — escalating to the default provider")
+                    llm, llm_model = default_llm, default_model
+                    session.routed_local = False
+                    fell_back = True
+                    self._bump("router.escalated")
+                    round_num = 0
+                    continue
+
                 # No tool calls — we're done
                 if not response.tool_calls:
                     break
