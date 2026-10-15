@@ -126,7 +126,7 @@ def test_single_device_is_the_default(tmp_path, monkeypatch):
 
 
 def test_no_config():
-    assert "No KVM devices configured" in kvm._resolve(_ctx(), "x")[2]
+    assert "No KVM devices yet" in kvm._resolve(_ctx(), "x")[2]
 
 
 # ── geometry & keys ───────────────────────────────────────────────────
