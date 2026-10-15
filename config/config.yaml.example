@@ -59,6 +59,12 @@ waiting_on_you:
   remind_after: 14400         # seconds, one reminder attempt after 4 hours
   stale_after: 604800         # seconds, 7 days; never auto-approve
 
+# Secrets an agent may ask the owner to enter (ask_owner_secret). The owner types
+# the value in a private Discord form; it goes straight to the vault and the agent
+# never sees it. Only vault keys under these prefixes can be requested.
+owner_secrets:
+  allowed_prefixes: [kvm_]
+
 defaults:
   # USD per million tokens, by provider registry name and exact reported model.
   # Empty intentionally: unpriced calls stay unknown. See docs/SPEND.md.

@@ -492,6 +492,21 @@ async def main() -> None:
         except Exception as exc:
             logger.error("Waiting list unavailable (%s)", type(exc).__name__)
 
+    # Owner-entered secrets: a private Discord form writes straight to the vault.
+    owner_secrets = None
+    if "discord" in active_connectors:
+        from src.connectors.discord_owner_secrets import DiscordOwnerSecrets
+        from src.core.base import resolve_data_dir
+        try:
+            owner_secrets = DiscordOwnerSecrets(active_connectors["discord"], agent_manager, config,
+                                                resolve_data_dir(config) / "owner-secrets.db")
+            active_connectors["discord"]._owner_secrets = owner_secrets
+            agent_manager._owner_secrets = owner_secrets
+        except ValueError as exc:
+            logger.error("Secret requests disabled: %s", exc)
+        except Exception as exc:
+            logger.error("Secret requests unavailable (%s)", type(exc).__name__)
+
     # --- Start connectors ---
     for conn_name, connector in active_connectors.items():
         try:
@@ -786,6 +801,8 @@ async def main() -> None:
     logger.info("Shutting down...")
     if owner_asks:
         await owner_asks.stop()
+    if owner_secrets:
+        await owner_secrets.stop()
     for conn_name, connector in active_connectors.items():
         try:
             await connector.stop()
