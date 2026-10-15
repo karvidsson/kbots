@@ -8,7 +8,7 @@ Devices are registered in config.yaml (overlay), never supplied by the model:
 
     kvm:
       devices:
-        lab: glkvm.tail1234.ts.net                       # shorthand
+        lab: <kvm>.<tailnet>.ts.net                      # shorthand
         bench:
           host: 100.101.102.103                          # Tailscale IP
           user: admin                                    # default: admin

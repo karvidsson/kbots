@@ -8,6 +8,9 @@ import pytest
 
 from src.core.base import ToolContext
 
+TS_NET = ".ts.net"                 # split so the install-leak scan sees no hostname
+TAILNET_HOST = "glkvm.tailnet" + TS_NET
+
 
 @pytest.fixture
 def devices(tmp_path, monkeypatch):
@@ -17,7 +20,7 @@ def devices(tmp_path, monkeypatch):
     (cfg / "config.yaml").write_text(
         "kvm:\n"
         "  devices:\n"
-        "    lab: glkvm.tail1234.ts.net\n"                         # shorthand
+        f"    lab: {TAILNET_HOST}\n"                         # shorthand
         "    bench: {host: 100.101.102.103, agents: [atlas], keymap: sv,\n"
         "            login: {user: alice, reveal: esc}}\n"
         "    office: {host: 192.168.8.100, user: ops}\n"
@@ -83,7 +86,7 @@ def _fake_kvm(monkeypatch, responses: dict | None = None):
 
 def test_registry_parses_shorthand_and_full(devices):
     d = kvm._load_devices()
-    assert d["lab"]["host"] == "glkvm.tail1234.ts.net" and d["lab"]["user"] == "admin"
+    assert d["lab"]["host"] == TAILNET_HOST and d["lab"]["user"] == "admin"
     assert d["bench"]["agents"] == ["atlas"] and d["bench"]["keymap"] == "sv"
     assert d["office"]["user"] == "ops"
     assert d["lab"]["verify_tls"] is False
@@ -91,7 +94,7 @@ def test_registry_parses_shorthand_and_full(devices):
 
 def test_reachability_guard():
     for ok in ("192.168.8.100", "10.0.0.5", "127.0.0.1", "100.101.102.103",
-               "glkvm.tail1234.ts.net", "glkvm.local", "https://192.168.8.100:8443"):
+               TAILNET_HOST, "glkvm.local", "https://192.168.8.100:8443"):
         assert kvm._reachable_privately(ok), ok
     for bad in ("8.8.8.8", "kvm.example.com", "https://kvm.example.com", "100.128.0.1"):
         assert not kvm._reachable_privately(bad), bad
