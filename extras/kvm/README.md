@@ -79,7 +79,7 @@ a host**: it picks a name, and the name maps to one KVM.
 ```yaml
 kvm:
   devices:
-    lab: glkvm.tail1234.ts.net                 # shorthand
+    lab: <kvm>.<tailnet>.ts.net                # shorthand
     bench:
       host: 100.101.102.103                    # Tailscale IP
       user: admin                              # default: admin
