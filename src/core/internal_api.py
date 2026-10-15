@@ -61,6 +61,7 @@ class InternalAPI:
         app.router.add_post("/agent-message", self._handle_agent_message)
         app.router.add_post("/graph", self._handle_graph)
         app.router.add_post("/owner-ask", self._handle_owner_ask)
+        app.router.add_post("/owner-secret", self._handle_owner_secret)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         site = web.TCPSite(self._runner, self.host, self.port)
@@ -111,6 +112,28 @@ class InternalAPI:
             return web.json_response(
                 {"error": "Ask delivery unconfirmed; retry unchanged with the same request_key"}, status=503
             )
+
+    async def _handle_owner_secret(self, request: web.Request) -> web.Response:
+        """Creation only. The value arrives solely through the owner's Discord form."""
+        if not self._authed(request):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        service = getattr(self.mgr, "_owner_secrets", None)
+        if not service:
+            return web.json_response({"error": "Secret requests unavailable"}, status=503)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or not body.keys() <= {
+                "agent_id", "key", "label", "purpose", "request_key"
+            }:
+                raise ValueError("Invalid secret request fields")
+            return web.json_response(await service.request(**body))
+        except (TypeError, ValueError) as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.warning("Secret request not confirmed (%s)", type(exc).__name__)
+            return web.json_response(
+                {"error": "Secret request delivery unconfirmed; retry unchanged with the same request_key"},
+                status=503)
 
     async def _handle_graph(self, request: web.Request) -> web.Response:
         """Execute a graph-memory call for a tool subprocess (GraphClient).
