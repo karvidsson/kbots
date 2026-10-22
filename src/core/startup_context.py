@@ -210,7 +210,8 @@ def _build_platform_version() -> str | None:
     return f"<platform-version>\n{line}\n</platform-version>"
 
 
-async def build_startup_context(agent_id: str, memory=None, project_dir=None) -> str | None:
+async def build_startup_context(agent_id: str, memory=None, project_dir=None,
+                                repo_dirs=None) -> str | None:
     """Assemble startup context for a new agent session.
 
     Returns a context string to prepend to the first message, or None.
@@ -254,6 +255,17 @@ async def build_startup_context(agent_id: str, memory=None, project_dir=None) ->
                     blocks.append("\n".join(lines))
         except Exception as e:
             logger.debug(f"Pinned memory fetch failed: {e}")
+
+    # Project facts: layout, how it ships and which hosts answer, read from the
+    # repos this agent works in. Never fatal: a broken probe must not cost the
+    # agent the rest of its context.
+    try:
+        from src.core.project_facts import build_block
+        facts = await build_block(repo_dirs)
+        if facts:
+            blocks.append(facts)
+    except Exception as e:
+        logger.debug(f"Project facts failed: {e}")
 
     # Codex index (awareness of available business knowledge, shared + own)
     codex = _build_codex_index(project_dir)
