@@ -754,7 +754,8 @@ class AgentManager:
                 from src.core.startup_context import build_startup_context
                 memory = self._get_agent_memory(agent_id)
                 startup_ctx = await build_startup_context(
-                    agent_id, memory, project_dir=self._get_project_dir(agent_id))
+                    agent_id, memory, project_dir=self._get_project_dir(agent_id),
+                    repo_dirs=(self.agent_configs.get(agent_id) or {}).get("extra_dirs"))
                 if startup_ctx:
                     context_blocks.append(startup_ctx)
             except Exception as e:
