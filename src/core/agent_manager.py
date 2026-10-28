@@ -187,6 +187,8 @@ class AgentManager:
         # local model triages requests; clearly-simple ones stay local.
         from src.core.model_router import ModelRouter
         self._model_router = ModelRouter(self.llm_providers)
+        from src.core.agent_mail_budget import PairBudget
+        self._pair_budget = PairBudget()
 
     def _validate_project_dirs(self) -> None:
         """Validate that no non-privileged agent's project_dir is an ancestor of another's.
@@ -1466,8 +1468,19 @@ class AgentManager:
         Falls back to the invisible internal side-session only when no home
         channel resolves (e.g. a connector-less target).
 
-        Returns {"delivery": "channel"|"internal", "channel_id": str|None}.
+        Returns {"delivery": "channel"|"internal"|"rejected", "channel_id":
+        str|None, "reason": str (rejected only)}.
+
+        Every send path ends here, so the loop guard lives here: a per-pair
+        hourly budget and a repeat filter (src/core/agent_mail_budget.py).
+        The hop counter is reset for the receiving turn, because a send does
+        not nest; it only still guards ask_agent chains started from that turn.
         """
+        refused = self._pair_budget.admit(from_agent, target, content)
+        if refused:
+            logger.warning(f"Inter-agent send refused {from_agent} -> {target}: {refused}")
+            return {"delivery": "rejected", "channel_id": None, "reason": refused}
+        depth = 0
         home = await self._resolve_home_channel(target)
         if home:
             connector_name, channel_id, bot_account = home

@@ -38,7 +38,9 @@ async def _loopback_agent_call(
         return "No agent manager available — inter-agent communication not supported."
 
     depth = _env_depth()
-    if depth >= MAX_INTER_AGENT_DEPTH:
+    # Only a waiting ask nests. Sends are loop-guarded per agent pair in the
+    # main process instead (src/core/agent_mail_budget.py).
+    if wait and depth >= MAX_INTER_AGENT_DEPTH:
         return (
             f"Inter-agent call depth limit reached ({MAX_INTER_AGENT_DEPTH}). "
             f"Cannot reach {agent_name} — this prevents infinite agent loops."
@@ -60,6 +62,8 @@ async def _loopback_agent_call(
                 headers={"Authorization": f"Bearer {token}"},
             ) as resp:
                 data = await resp.json(content_type=None)
+                if resp.status == 429 and not wait:
+                    return data.get("error") or "Not delivered: inter-agent send budget reached."
                 if resp.status != 200:
                     if "available" in data:
                         return (f"Unknown agent '{agent_name}'. "
@@ -228,13 +232,6 @@ async def send_to_agent(ctx: ToolContext, agent_name: str, message: str) -> str:
         # MCP subprocess — route through the loopback API in the main process.
         return await _loopback_agent_call(ctx, agent_name, message, wait=False)
 
-    # Depth check
-    if ctx.inter_agent_depth >= MAX_INTER_AGENT_DEPTH:
-        return (
-            f"Inter-agent call depth limit reached ({MAX_INTER_AGENT_DEPTH}). "
-            f"Cannot send to {agent_name} — this prevents infinite agent loops."
-        )
-
     # Verify target agent exists
     if agent_name not in ctx.agent_manager.agent_configs:
         available = list(ctx.agent_manager.agent_configs.keys())
@@ -244,12 +241,11 @@ async def send_to_agent(ctx: ToolContext, agent_name: str, message: str) -> str:
     if agent_name == ctx.agent_id:
         return "Cannot send to yourself — use a different agent."
 
-    logger.info(
-        f"Inter-agent send: {ctx.agent_id} -> {agent_name} "
-        f"(depth {ctx.inter_agent_depth + 1}/{MAX_INTER_AGENT_DEPTH})"
-    )
+    logger.info(f"Inter-agent send: {ctx.agent_id} -> {agent_name}")
 
     result = await ctx.agent_manager.deliver_inter_agent_message(
         agent_name, ctx.agent_id, message, ctx.inter_agent_depth + 1)
+    if result.get("delivery") == "rejected":
+        return result["reason"]
     return _format_send_result(
         agent_name, result.get("delivery"), result.get("channel_id"))

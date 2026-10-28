@@ -138,7 +138,9 @@ async def test_send_falls_back_to_internal_session(tmp_path):
     assert stub.sent == []  # internal turns post nothing
 
 
-async def test_channel_delivery_threads_depth(tmp_path):
+async def test_send_does_not_carry_the_hop_count(tmp_path):
+    # A send does not nest, so a working thread no longer stalls at its fourth
+    # message; the receiving turn starts its own ask_agent chain from zero.
     mgr, _, _ = _mgr(tmp_path, {"routing": {"stub": {
         "account": "beta-bot", "channels": ["555"]}}})
     seen = {}
@@ -148,9 +150,49 @@ async def test_channel_delivery_threads_depth(tmp_path):
         seen["sender"] = message._inter_agent_sender
 
     mgr.handle_message = spy
-    await mgr.deliver_inter_agent_message("beta", "alpha", "hi", 2)
+    await mgr.deliver_inter_agent_message("beta", "alpha", "hi", 7)
     await _drain(mgr)
-    assert seen == {"depth": 2, "sender": "alpha"}
+    assert seen == {"depth": 0, "sender": "alpha"}
+
+
+async def test_a_long_working_thread_is_delivered_until_the_pair_budget(tmp_path):
+    from src.core.agent_mail_budget import PAIR_LIMIT
+
+    mgr, _, _ = _mgr(tmp_path, {"routing": {"stub": {
+        "account": "beta-bot", "channels": ["555"]}}})
+
+    async def spy(agent_id, message):
+        return None
+
+    mgr.handle_message = spy
+    mgr.handle_internal_message = spy
+    results = []
+    for i in range(PAIR_LIMIT + 1):
+        # Alternate direction: a conversation, not one agent shouting.
+        sender, target = ("alpha", "beta") if i % 2 == 0 else ("beta", "alpha")
+        results.append(await mgr.deliver_inter_agent_message(target, sender, f"step {i}", i))
+    await _drain(mgr)
+    # Well past the old three-hop wall, every message of the thread lands...
+    assert all(r["delivery"] in ("channel", "internal") for r in results[:PAIR_LIMIT])
+    # ...until the pair has used its hourly budget, and the sender is told why.
+    assert results[-1]["delivery"] == "rejected" and "last hour" in results[-1]["reason"]
+
+
+async def test_an_exact_repeat_is_not_delivered_twice(tmp_path):
+    mgr, _, _ = _mgr(tmp_path, {"routing": {"stub": {
+        "account": "beta-bot", "channels": ["555"]}}})
+    delivered = []
+
+    async def spy(agent_id, message):
+        delivered.append(message.content)
+
+    mgr.handle_message = spy
+    first = await mgr.deliver_inter_agent_message("beta", "alpha", "Takes are in presenter/", 1)
+    again = await mgr.deliver_inter_agent_message("beta", "alpha", "takes are in   presenter/", 1)
+    await _drain(mgr)
+    assert first["delivery"] == "channel"
+    assert again["delivery"] == "rejected" and "exact message" in again["reason"]
+    assert delivered == ["Takes are in presenter/"]
 
 
 async def test_concurrent_asks_serialize_on_internal_session(tmp_path):
