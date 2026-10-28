@@ -132,6 +132,29 @@ async def test_tool_depth_guard_from_env(api, monkeypatch):
     assert mgr.calls == []
 
 
+async def test_send_past_the_hop_limit_is_still_delivered(api, monkeypatch):
+    # The hop cap guards nested asks only; a send at any depth goes through.
+    a, mgr = api
+    status, _ = await _post(a, {"target": "beta", "content": "step 9", "from_agent": "alpha",
+                                "depth": MAX_INTER_AGENT_DEPTH + 5, "wait": False})
+    assert status == 200
+    _env(monkeypatch, a, depth=MAX_INTER_AGENT_DEPTH)
+    out = await send_to_agent(ToolContext(agent_id="alpha"), "beta", "step 10")
+    assert "NOT returned to you" in out
+    assert [c[1] for c in mgr.calls] == ["step 9", "step 10"]
+
+
+async def test_a_refused_send_tells_the_sender_why(api, monkeypatch):
+    a, mgr = api
+
+    async def refuse(target, from_agent, content, depth):
+        return {"delivery": "rejected", "channel_id": None, "reason": "Not delivered: budget."}
+    mgr.deliver_inter_agent_message = refuse
+    _env(monkeypatch, a)
+    out = await send_to_agent(ToolContext(agent_id="alpha"), "beta", "again")
+    assert out == "Not delivered: budget."
+
+
 async def test_tool_without_env_keeps_legacy_error(monkeypatch):
     monkeypatch.delenv("KBOTS_INTERNAL_API", raising=False)
     monkeypatch.delenv("KBOTS_INTERNAL_TOKEN", raising=False)

@@ -8,7 +8,8 @@ inter-agent calls back across the process boundary.
 
 Auth is a per-boot bearer token handed to the CLI subprocess via env
 (never written to disk, never in .mcp.json). The inter-agent depth guard is
-enforced on both sides: the client reads its own depth from
+enforced on both sides for ask_agent (sends are budgeted per agent pair
+instead, in AgentManager.deliver_inter_agent_message): the client reads its own depth from
 KBOTS_INTER_AGENT_DEPTH (threaded into the target's subprocess env by the
 claude_code provider), and the server re-checks it before dispatching.
 """
@@ -188,7 +189,7 @@ class InternalAPI:
         if not target or not content or not from_agent:
             return web.json_response(
                 {"error": "target, content and from_agent are required"}, status=400)
-        if depth >= MAX_INTER_AGENT_DEPTH:
+        if wait and depth >= MAX_INTER_AGENT_DEPTH:
             return web.json_response(
                 {"error": f"inter-agent depth limit reached ({MAX_INTER_AGENT_DEPTH})"},
                 status=429)
@@ -227,4 +228,6 @@ class InternalAPI:
         # side-session whose outcome nobody reads is how sends get "lost".
         result = await self.mgr.deliver_inter_agent_message(
             target, from_agent, content, depth + 1)
+        if result.get("delivery") == "rejected":
+            return web.json_response({"error": result["reason"]}, status=429)
         return web.json_response({"status": "dispatched", **result})
