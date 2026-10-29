@@ -490,6 +490,14 @@ class ClaudeCodeProvider(LLMProvider):
                 if response.usage is not None:
                     response.usage["fresh_session"] = "--resume" not in args
 
+                if getattr(proc, "kbots_stopped", False):
+                    # Killed on purpose by /stop or /hold. Not a crash: retrying
+                    # here started a fresh process seconds after the owner
+                    # stopped the agent, which then carried on with the turn.
+                    logger.info(f"{tag}stopped by request — not retrying")
+                    return LLMResponse(content="", stop_reason="aborted", model=model,
+                                       session_id=response.session_id)
+
                 if proc.returncode != 0:
                     # Try to extract error from JSON stdout (Claude Code sometimes returns errors there)
                     error_detail = ""
