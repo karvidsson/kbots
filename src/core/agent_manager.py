@@ -1877,6 +1877,9 @@ class AgentManager:
         if not proc:
             return {"held": False, "reason": "No running process for this agent."}
 
+        # Marked before the kill so the provider reads the exit as a request,
+        # not a crash to retry.
+        proc.kbots_stopped = True  # type: ignore[attr-defined]
         try:
             proc.terminate()
             try:
@@ -1902,6 +1905,9 @@ class AgentManager:
         if not proc:
             return {"stopped": False, "reason": "No running process for this agent."}
 
+        # Marked before the kill so the provider reads the exit as a request,
+        # not a crash to retry.
+        proc.kbots_stopped = True  # type: ignore[attr-defined]
         try:
             proc.terminate()
             try:
