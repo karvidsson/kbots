@@ -35,6 +35,33 @@ def test_regenerate_mcp_json_keeps_identity(tmp_path, monkeypatch):
     assert env["KBOTS_PROJECT_DIR"] == str(agent_dir)
 
 
+def test_regenerate_mcp_json_keeps_the_agents_google_identity(tmp_path, monkeypatch):
+    # Hand-set in .mcp.json, KBOTS_GOOGLE_ACCOUNT was dropped by the next
+    # regeneration and the agent fell back to the install's default mailbox.
+    from src.core.digest import regenerate_mcp_json
+
+    overlay = tmp_path / "ov"
+    (overlay / "config").mkdir(parents=True)
+    (overlay / "config" / "mcp.yaml").write_text(
+        "servers:\n  kbots-tools:\n    transport: stdio\n    command: py\n"
+    )
+    own, plain = overlay / "agents" / "owner", overlay / "agents" / "plain"
+    own.mkdir(parents=True)
+    plain.mkdir(parents=True)
+    (overlay / "config" / "agents.yaml").write_text(
+        f"agents:\n  owner:\n    project_dir: {own}\n    google_account: pixel-fox\n"
+        f"  plain:\n    project_dir: {plain}\n"
+    )
+    monkeypatch.setenv("KBOTS_OVERLAY", str(overlay))
+
+    regenerate_mcp_json()
+
+    env = lambda d: json.loads((d / ".mcp.json").read_text())["mcpServers"]["kbots-tools"]["env"]  # noqa: E731
+    assert env(own)["KBOTS_GOOGLE_ACCOUNT"] == "pixel-fox"
+    # No key means the install default: the variable is absent, never empty.
+    assert "KBOTS_GOOGLE_ACCOUNT" not in env(plain)
+
+
 async def test_create_tool_refuses_fallback_identity(tmp_path, monkeypatch):
     monkeypatch.setenv("KBOTS_OVERLAY", str(tmp_path))
 

@@ -14,6 +14,7 @@ named identity via KBOTS_GOOGLE_ACCOUNT in their .mcp.json env.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -39,6 +40,7 @@ REDIRECT_URI = "http://localhost:8085"
 
 def main():
     import argparse
+    sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser()
     ap.add_argument("--account", default="",
                     help="store consent as a named identity (GOOGLE_REFRESH_TOKEN__<name>)")
@@ -55,7 +57,13 @@ def main():
     # Get existing credentials
     creds_json = vault.get("secrets/google-api-credentials.json")
     if not creds_json:
-        print("ERROR: No Google credentials in vault")
+        # The usual cause is not a missing credential but the wrong vault:
+        # without KBOTS_OVERLAY the script opens the core default, not the
+        # install's overlay vault, and finds nothing in it.
+        hint = ("" if os.environ.get("KBOTS_OVERLAY") else
+                " (KBOTS_OVERLAY is not set, so this opened the default vault, not the"
+                " install's; re-run with KBOTS_OVERLAY=<overlay dir>)")
+        print("ERROR: No Google credentials in vault" + hint)
         sys.exit(1)
 
     creds = json.loads(creds_json) if isinstance(creds_json, str) else creds_json

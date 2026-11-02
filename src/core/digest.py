@@ -459,8 +459,9 @@ def _build_mcp_json(servers: dict, agent_env: dict | None = None) -> dict:
 def regenerate_mcp_json() -> list[Path]:
     """Regenerate .mcp.json files for all agents from mcp.yaml.
 
-    Injects per-agent env vars (KBOTS_PROFILE, KBOTS_BOT_ACCOUNT) into
-    stdio servers from agent config.
+    Injects per-agent env vars (KBOTS_PROFILE, KBOTS_BOT_ACCOUNT, and
+    KBOTS_GOOGLE_ACCOUNT from an agent's `google_account:`) into stdio
+    servers from agent config.
 
     Returns list of paths that were updated.
     """
@@ -489,6 +490,13 @@ def regenerate_mcp_json() -> list[Path]:
             agent_env["KBOTS_BOT_ACCOUNT"] = bot_account
         if profile:
             agent_env["KBOTS_PROFILE"] = profile
+        # The agent's own Google identity (vault GOOGLE_*__<account>, made by
+        # scripts/google-reauth.py --account). Hand-set in .mcp.json it was
+        # silently dropped by the next regeneration, putting the agent back
+        # on the install's default mailbox.
+        google_account = str(agent_cfg.get("google_account") or "").strip()
+        if google_account:
+            agent_env["KBOTS_GOOGLE_ACCOUNT"] = google_account
 
         mcp_json = _build_mcp_json(servers, agent_env=agent_env)
         target = agent_dir / ".mcp.json"
