@@ -52,6 +52,9 @@ Pick exactly one of three shapes.
    one choice ends and the next begins, which is exactly the work this block
    exists to save.
 
+   Each option gets a letter reaction: a 🇦 tap means option A.
+   Never ✅/🔴 for a pick-one.
+
    Everything above the question is at most {DECISION_WORD_BUDGET} words.
    Evidence, reasoning and alternatives go BELOW that block, or in a file you
    name so they can be opened on demand. Never make the owner read the
