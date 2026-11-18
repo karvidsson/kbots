@@ -67,7 +67,6 @@ def test_assigned_options_that_must_not_become_controls(text):
     "The owner approved with ✅ and can reject with 🔴.",
     "We will pre-add ✅ and 🔴 to approval prompts.",
     "Go/no-go checks passed yesterday.",
-    "DECISION: Pick a colour.\nA: red\nB: blue",
     "````markdown\n```\n" + PROMPT + "\n```\n````",
     "~~~\n" + PROMPT + "\n~~~",
     "```\n" + PROMPT,
@@ -83,6 +82,44 @@ def test_assigned_options_that_must_not_become_controls(text):
 ])
 def test_status_quotes_examples_and_ambiguous_requests_have_no_controls(text):
     assert decision_reactions(text) == ()
+
+
+DECISION_BLOCK = (
+    "DECISION: where papers live\n\nOPTIONS:\nA - Cloudflare D1\nB - Supabase Pro\n\n"
+    "I'D PICK: A, it never sleeps.\nIF NO REPLY: nothing moves."
+)
+
+
+@pytest.mark.parametrize("text, expected", [
+    # Pick-one questions get letter tiles, not yes/no icons that confuse them.
+    (DECISION_BLOCK, ("🇦", "🇧")),
+    ("**DECISION:** x\n\n**OPTIONS:**\n- A - one\n- B - two\n- C - three", ("🇦", "🇧", "🇨")),
+    ("OPTIONS:\nA: ship\nB: wait", ("🇦", "🇧")),
+    # Previously asserted to get no controls, so it never got ✅/🔴. It still
+    # does not; it gets the letters its options are named by.
+    ("DECISION: Pick a colour.\nA: red\nB: blue", ("🇦", "🇧")),
+])
+def test_lettered_options_get_one_letter_tile_each(text, expected):
+    assert decision_reactions(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "Plan A - ship now\nPlan B - wait",                       # no decision heading
+    "Steps:\nA - do this\nB - then that",                      # a list, not a question
+    "DECISION: x\nA - one",                                     # one option is not a choice
+    "DECISION: x\nA - one\nC - two",                           # out of order
+    "DECISION: x\nB - one\nC - two",                           # must start at A
+    "DECISION: x\nA - one\nB - two\n\nDECISION: y\nA - three\nB - four",  # two questions
+    "```\nDECISION: x\nA - one\nB - two\n```",               # an example in code
+])
+def test_lettered_lists_that_are_not_one_decision_get_nothing(text):
+    assert decision_reactions(text) == ()
+
+
+def test_reply_contract_tells_agents_what_the_tiles_mean():
+    from src.core.startup_context import _build_reply_contract
+    contract = _build_reply_contract()
+    assert "🇦" in contract and "option A" in contract
 
 
 @pytest.fixture

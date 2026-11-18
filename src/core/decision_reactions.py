@@ -25,6 +25,35 @@ _ASSIGNED = re.compile(r"^(\S{1,4}?)\s*[=:]\s+(\S.*)$")
 _RESERVED = ("🔍", "📄")
 
 
+# The reply contract's DECISION block lists its choices as "A - ..." lines.
+# Approve/reject icons on a pick-one question read as yes/no and confused the
+# owner, so lettered options get letter tiles instead: one per option, A first.
+_LETTER_OPTION = re.compile(r"^([A-E])\s*[-–:.)]\s+\S")
+_LETTER_TILES = {c: chr(0x1F1E6 + i) for i, c in enumerate("ABCDE")}
+_DECISION_HEADING = re.compile(r"^(?:decision|options)\b", re.I)
+
+
+def _letter_options(lines: list[str]) -> tuple[str, ...]:
+    """Tiles for an "A - / B - ..." run under a DECISION or OPTIONS heading."""
+    if not any(_DECISION_HEADING.match(line) for line in lines):
+        return ()
+    runs = []
+    for start, line in enumerate(lines):
+        m = _LETTER_OPTION.match(line)
+        if not m or m[1] != "A":
+            continue
+        letters = []
+        for nxt in lines[start:]:
+            m = _LETTER_OPTION.match(nxt)
+            if not m or m[1] != "ABCDE"[len(letters)]:
+                break
+            letters.append(m[1])
+        if len(letters) >= 2:
+            runs.append(tuple(_LETTER_TILES[c] for c in letters))
+    # Two separate option lists in one message are two questions: no controls.
+    return runs[0] if len(runs) == 1 else ()
+
+
 def _assigned_emoji(line: str) -> str:
     """The emoji a line assigns a meaning to, or "" if it does not."""
     match = _ASSIGNED.match(line)
@@ -69,6 +98,10 @@ def decision_reactions(content: str) -> tuple[str, ...]:
         line = re.sub(r"^<@!?\d+>\s*", "", line)
         line = re.sub(r"^[#*\-\s]+", "", line).replace("**", "").replace("__", "")
         lines.append(line)
+
+    lettered = _letter_options(lines)
+    if lettered:
+        return lettered
 
     matches = set()
     for index, line in enumerate(lines):
